@@ -2964,7 +2964,23 @@ object ChatController {
   private var uiSnapshotPending = false
   private var uiOwnerRecoveryPending = false
 
+  internal fun requiresUISnapshot(event: CR?): Boolean = when (event) {
+    null, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
+    is CR.NewRemoteHost, is CR.RemoteCtrlStopped, is CR.RemoteCtrlFound,
+    is CR.RemoteCtrlSessionCode, is CR.RemoteCtrlConnected, is CR.CallInvitation,
+    is CR.CallOffer, is CR.CallAnswer, is CR.CallExtraInfo, is CR.CallEnded,
+    is CR.StorePurchaseCredited, is CR.StorePurchaseRefused -> false
+    else -> true
+  }
+
   private suspend fun processReceivedMsg(msg: API) {
+    // A failed resnapshot must not resume counter/item deltas from a stream
+    // with gaps. Lifecycle, call and settlement callbacks remain actionable so
+    // disconnect/revocation can still release the session during recovery.
+    if (uiSnapshotPending && requiresUISnapshot(msg.result)) {
+      reconcileUI(chatModel.remoteHostId())
+      if (uiSnapshotPending) return
+    }
     val shared = msg.result is CR.UIStateChanged ||
       (msg.rhId == chatModel.remoteHostId() &&
         (msg.rhId != null || chatModel.remoteCtrlSession.value?.active == true))
