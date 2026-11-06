@@ -53,7 +53,7 @@ fun ConnectDesktopView(close: () -> Unit) {
   val ntfModeService = remember { chatModel.controller.appPrefs.notificationsMode.get() == NotificationsMode.SERVICE }
   DisposableEffect(Unit) {
     withBGApi {
-      if (!ntfModeService) platform.androidServiceStart()
+      platform.androidServiceStart(remoteSession = true)
     }
     onDispose {
       if (!ntfModeService && chatModel.remoteCtrlSession.value == null) platform.androidServiceSafeStop()

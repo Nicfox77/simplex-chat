@@ -1,192 +1,162 @@
-# Simultaneous Android and desktop UI: partial implementation
+# Simultaneous Android phone and Linux desktop UI
 
-Status: core foundations and remote-session correctness fixes.
-**Simultaneous UI is not enabled.** The
-existing linked desktop mode still routes eligible events exclusively to the
-desktop, and closing the Android connection modal still disconnects it.
+Status: implemented behind the negotiated UI protocol 1, enabled by the Kotlin
+apps at core startup. PR #2 remains draft for native builds and physical testing.
 
-The phone remains the sole owner of the encrypted chat database, agent,
-cryptographic sessions and network communication. The desktop continues using
-the authenticated remote-control protocol. There is no database sharing,
-profile replication, encryption change, iOS change, or new reconnect mechanism.
+The Android phone is the only owner of the database, ratchets, agent and network
+connections. The Linux desktop uses authenticated, encrypted XRCP commands,
+events and file transfer. There is no second synchronized database, shared
+SQLite file, new cryptographic scheme, or change to network reconnection policy.
+Both devices need the core and Kotlin code from this branch. An old native
+library fails the startup capability check; a peer without UI protocol 1 fails
+pairing. Updating just the APK/JAR sources with release native libraries is not
+sufficient.
 
-## Implemented
+## Delivery and reconciliation
 
-- Local and paired-controller profile creation commands reaching
-  `execChatCommand'` use one controller-owned `profileCreationGate`. The
-  duplicate-name check and agent/store allocation span transactions; the gate
-  prevents two simultaneous requests from allocating duplicate agent users
-  before one fails its store insert. This is separate from existing chat/entity
-  locks. Exceptions and cancellation release the gate. Other commands and
-  custom-response hooks retain their existing execution behavior. Broad command
-  serialization must wait for a nonblocking local subscriber contract: a local
-  event reader can itself issue commands, creating a wait cycle if a command
-  holds a global gate while filling that reader's blocking `outputQ`.
-- Remote events use a bounded `EventBuffer`. Producers never wait for space.
-  Overflow invalidates the entire reader and wakes the session monitor, which
-  stops the HTTP2 server and linked session. A consumer cannot continue with a
-  missing read, deletion or file event. Explicit disposal also closes the buffer
-  and wakes pending readers. Each new session gets a fresh buffer.
-- `writeEventBuffers` provides atomic, ordered delivery to independent bounded
-  subscriber buffers. Tests cover both directions of a paused reader. This
-  primitive is **not yet connected to the phone's `outputQ`**. That existing
-  queue still has its original blocking behavior.
-- Pairing, session lifecycle and platform-store settlement callbacks remain
-  local. Only the phone can finish its Android store transactions; sending the
-  settlement callback to desktop left the transaction unfinished. Badge state
-  changes remain eligible for remote delivery. Command responses still return
-  only through their request channel.
-- Revoking a hosted controller closes its event buffer in the same STM
-  transaction that removes the session. After authenticated request parsing,
-  command/file admission checks this lifetime token without waiting for
-  transport cancellation. Reply preparation also checks it and suppresses
-  payloads and file attachments from revoked sessions. Already admitted work
-  may have committed before revocation; this is not transaction rollback.
-  Long polling and command/file execution do not share a command gate.
-- Controller shutdown unpublishes the remote hosts and current-host selection
-  before cancelling transports, as normal explicit disconnect already does.
-  Disconnect callbacks cannot recursively cancel the same published session
-  during shutdown. Hosted-controller admission is revoked in this same STM
-  transaction. Tests stop both the owner and viewer cores with a live session.
-- Terminal automatic reads retain the event's remote host ID and execute on
-  the owning phone through XRCP. Previously remote item IDs were used against
-  the desktop's own database, potentially marking unrelated local items read.
-  Local reads retain their original dispatch path. This fixes terminal read
-  ownership; it does not add phone/desktop UI read-state broadcasts.
-- Kotlin distinguishes viewing a remote phone from hosting a desktop. Hosting
-  a desktop does not cause the Android owner to use remote file downloads or
-  remote paths. Reopening connection controls preserves an existing session;
-  the explicit close confirmation still checks the hosted-controller session.
+The phone's local receiver and the authenticated desktop session have independent
+bounded event queues. Eligible asynchronous events are fanned out atomically to
+both; they never compete to read the same queue. Platform-store callbacks,
+pairing/lifecycle events and call signalling stay on the phone. Command replies
+and errors return only through the initiating request. Successful send, edit,
+delete, read/unread, reaction, contact/group and file acceptance mutations publish
+`uiStateChanged` invalidations with protocol version, revision and explicit
+`local`/`remote` origin. Both frontends reconcile their projections; the reply
+payload is never broadcast as an unsolicited notification.
 
-## Required before enabling simultaneous UI
+`/_ui enable` opts a Kotlin frontend into protocol 1 before pairing. Legacy
+terminal sessions without this capability retain exclusive event routing.
+`/_ui snapshot [chat-ref] count=N` returns the active user, users and unread
+counts, chat previews and read/manual-unread counters, tags and optional loaded
+chat items in one store transaction. Its revision is sampled before the
+transaction. Events committed during or after that snapshot remain queued.
+Snapshots replace items and counters, rather than appending items or adding
+unread counts. Older snapshot revisions and responses from an earlier
+core/host-selection generation are rejected. Secondary support/report views
+are refreshed too. A deleted open chat cannot prevent refreshing the chat list.
 
-1. Introduce a versioned frontend subscription/snapshot contract, including a
-   watermark or equivalent ordering barrier. Subscribe before taking a snapshot
-   and reconcile events without duplicating items or counters. When a local
-   reader pauses or overflows, detach/invalidate it and require a fresh snapshot
-   before resuming. Do not fan out into two blocking `writeTBQueue` operations.
-2. Mirror successful mutations to the *other* UI. Send, edit, delete, reaction,
-   contact/group changes and file acceptance often exist only as command
-   responses. Map an explicit set of successful results to state events without
-   echoing them back to the initiating UI. Preserve route-specific events and
-   errors. Blindly broadcasting every response leaks request-specific results
-   and duplicates updates already performed by the caller.
-3. Add read/unread state events for item reads, chat reads, user reads and
-   manually marked-unread chats. Both frontends must update loaded items,
-   counts, notifications and timed-item state idempotently. A command gate
-   alone cannot reconcile two UI models.
-4. Define and implement shared active-profile behavior. The core still has one
-   `currentUser`. Serialize selection with commands, then either publish and
-   apply the profile change to both frontends or prohibit changes while linked.
-   Validate stale user-scoped commands and remote file requests. Never allow a
-   stale UI to execute an implicit-user operation under another profile.
-5. Give automatic file acceptance and notification side effects one owner.
-   Currently both Kotlin event handlers would automatically accept media and
-   show alerts if given the same incoming event. Sent items mirrored from the
-   other UI must not produce received-message notifications. File bytes remain
-   on the phone; the desktop fetches them using the existing encrypted protocol.
-6. Bind Android's receiver/service lifetime to the active session rather than
-   the modal. Remove close/dispose disconnection only after event delivery,
-   snapshots and profile state are safe. Remove handoff reloads and stop closing
-   unrelated modals when a desktop disconnects. Keep explicit Disconnect.
-7. Test on Android and Linux with a real paired session: concurrent sends,
-   edits/deletes/reactions, read propagation, foreground/background transitions,
-   stopped receivers, file transfer and profile changes. Coordinate protocol
-   version/capability negotiation before shipping with older frontends.
+The receiver reconciles after shared events and mutation invalidations. While
+linked, an idle receiver also reconciles every five seconds: an initiating
+coroutine can apply its optimistic result after the event receiver already
+processed a newer peer mutation. This sweep repairs that command-response/event
+race. Normal peer updates are event driven. This implementation deliberately
+trades additional snapshot traffic for convergence without a global command
+lock; large chats and file-progress bursts need performance testing.
 
-## Validation
+A paused phone receiver cannot block core commands or the remote subscriber.
+Local overflow atomically discards stale deltas and inserts an explicit
+`overflow` invalidation. The resumed receiver resnapshots before continuing its
+normal projection, recovers hosted-session state and pending call invitations,
+and rechecks unfinished platform-store transactions. Snapshot failures remain
+pending and retry on idle receives. A remote subscriber overflow invalidates
+that session, revokes its admission token and disconnects it. A newly verified
+session takes a fresh snapshot before normal viewing, including messages received
+while it was away. There is no transparent reconnect in this change.
 
-The small suite also runs inside the regular `simplex-chat-test` suite:
+Profile identity is frozen from hosted pairing admission through disconnect:
+creation, selection and deletion return `remoteCtrl busy` while linked. A narrow
+profile/pairing gate makes the admission check safe against profile selection.
+Ordinary commands, snapshots, file requests and long polling do not acquire it.
+Disconnect first to switch profiles. This conservative restriction prevents
+implicit-user commands or stale file requests from operating under a different
+profile. Existing per-chat/entity/store locking remains in use.
 
-```sh
-cabal test simultaneous-ui-core-test
-```
+## Side effects and Android lifecycle
 
-Without building the database/network dependency tree:
+- The phone owns background message/contact notifications. The desktop viewer
+  does not emit a second background notification or create notification actions
+  against its own database. Mirrored sent items never create received-message
+  notifications. Authoritative read snapshots cancel phone notifications for
+  chats whose unread count is zero.
+- The phone alone automatically accepts incoming media using its preferences.
+  The desktop can request file acceptance explicitly over XRCP. File bytes and
+  paths remain on the phone, and the viewer fetches them through encrypted XRCP.
+  Hosting a controller does not make the phone use remote paths. Viewer events
+  do not run cleanup against desktop-local paths.
+- The phone owns WebRTC calls; remote call commands and call signalling are not
+  admitted/routed to the viewer. Desktop call controls are disabled while
+  viewing a phone. Transferring a live call between UIs is outside this protocol.
+- The connection modal starts the Android foreground messaging service. Closing
+  it leaves the verified session and phone chat UI running. Service safe-stop
+  refuses to stop while a hosted session exists, including when the ordinary
+  notification mode is off. Explicit remote-service start is allowed when chat
+  notification display is disabled. Disconnect/unlink clears session state and
+  releases this service requirement. Disconnect does not reload the phone model
+  as a handoff or close unrelated modals. Android force-stop/process death ends
+  the in-process session; pair again after restarting.
+- Unlinking the active controller revokes its queue/admission token before
+  transport cleanup and deletes its pairing. The phone continues receiving.
+  Already admitted commands may have committed before revocation; this is not
+  transaction rollback. Crypto/session keys and request authentication retain
+  the existing XRCP implementation.
 
-```sh
-ghc -threaded -Wall -Werror -isrc -itests \
-  -outputdir /tmp/simplex-ui-tests tests/ConcurrentMain.hs \
-  -o /tmp/simplex-ui-core-test
-/tmp/simplex-ui-core-test +RTS -N2
-```
+## Validation and remaining physical checks
 
-This needs GHC plus `stm`, `async` and `hspec`. Twelve examples cover concurrent
-mutations, caller-specific results, failure/cancellation, exact ordered delivery
-to two buffers, stalled readers, overflow, disposal and fresh-session isolation.
-They exercise the shared primitives, not a complete Android/desktop UI flow.
+Validated locally on 2026-11-06:
 
-`RemoteTests` additionally checks local-only route policy, request admission
-after revocation, long-poll closure, live session shutdown and snapshot recovery
-on overflow, unlinking and stale cleanup, and races real local and remote
-commands against the same phone store. Read-ownership tests distinguish the
-desktop's own unread items from the remote phone's unread items. These are
-core/terminal integration tests, not proof of simultaneous Android UI behavior.
-`RemoteSessionModelTest`
-checks Kotlin file-routing semantics for each role. These require the full core
-and Kotlin build environments respectively; record their actual run results
-separately from the focused primitive tests.
+- The complete Haskell library compiles with GHC 9.6.6.
+- The remote suite passed 41 active examples, zero failures, excluding multicast
+  discovery on this container. There were 66 pending examples from the three
+  upstream-disabled compression variants. These include real encrypted XRCP
+  uploads/downloads, concurrent sends/read ownership and session shutdown.
+- Three protocol-1 simultaneous cases now pass: both event receivers active
+  during sends, edits/deletes and reads/manual unread; a paused local subscriber
+  overflowing without blocking remote delivery; and remote overflow followed by
+  a new session/snapshot while the phone keeps receiving. The third case was
+  added after the full remote run above and passed in a focused rerun.
+- Common/desktop Kotlin compilation and 259 tests passed before the last
+  reconciliation refinements. The snapshot tests cover item/counter idempotence,
+  edits/deletes/reads and wire decoding. Additional revision/generation and
+  delayed-command-result tests are included for CI.
+- Android compilation reached the common Android Kotlin compiler, then failed
+  for insufficient memory. A subsequent process exited 137. The shared cgroup
+  records an OOM kill; concurrent builds were running. No Android APK/native
+  link success is claimed. Local high-memory retries were stopped. CI Gradle
+  steps now use one worker and a single 3 GB compiler JVM.
 
-Validation on 2026-11-06, continuing from the initial draft:
-
-- GHC 9.6.6 compiled the complete chat library and integration-test executable.
-  The standalone suite above passed all 12 examples with `-Wall -Werror`.
-  `cabal build exe:simplex-chat --ghc-options=-O0` also linked the CLI successfully.
-- The remote suite passed **39 active examples, zero failures**, with 60
-  pending examples in the three upstream-disabled compression variants. The
-  invocation below excludes multicast discovery, which failed in this
-  container; discovery/networking code was not changed. Real encrypted XRCP
-  sessions, file upload/download, profile changes, both core-stop paths and the
-  new concurrency/recovery cases ran. Disposable test databases used tmpfs to
-  avoid slow migration fsyncs on this host; the concurrent send/read test also
-  passed on the normal filesystem (97 seconds including fixture creation).
-- After initializing the pinned NanoHTTPD submodule, Gradle's invocation below
-  compiled the common/desktop sources and passed **255 JUnit tests**, including
-  both `RemoteSessionModelTest` cases. The default Gradle configuration still
-  requires an Android SDK; configuration on demand permits desktop testing
-  without it. Unrelated background coroutines logged native `UnsatisfiedLinkError`
-  exceptions despite the passing JUnit result. This does not establish JNI or
-  Android application runtime correctness.
-- Android builds and a real Android/desktop paired UI session remain unverified.
-  The missing frontend subscription/snapshot and lifecycle work listed above
-  remains unimplemented. Simultaneous UI must stay disabled.
-
-Core/remote validation:
+Core tests can use separate fixture ports so independent worktrees do not
+collide:
 
 ```sh
-cabal test simplex-chat-test --ghc-options=-O0 \
+SIMPLEX_TEST_PORT_BASE=17000 cabal test simplex-chat-test --ghc-options=-O0 \
   --test-option=-m --test-option='/Remote/' \
   --test-option=--skip --test-option='connects with multicast discovery' \
   --test-option=--jobs=2
+cabal test simultaneous-ui-core-test
 ```
 
-Kotlin validation (from `apps/multiplatform`):
+The regular `build.yml` CI compiles/tests Haskell and Kotlin, including Android
+Kotlin and desktop sources. This does **not** establish Android native linking
+or APK assembly. The manually dispatched `android-emu.yml` and
+`desktop-linux.yml` workflows build branch-native libraries, package apps and
+run individual app smoke tests. They produce `android-app` and `desktop-app`
+artifacts for physical testing. These smoke tests do not pair the two GUIs.
 
-```sh
-./gradlew :common:desktopTest --configure-on-demand --console=plain
-```
+Required physical acceptance with those matching builds:
 
-The narrowed production gate covers only `CreateActiveUser`; inspection found
-no UI-event emission or recursive command dispatch in that path. It does not
-hold `chatLock`, and ordinary reader-issued commands do not acquire it. The
-focused tests verify release after exceptions and both executing/waiting
-command cancellation. Frontend integration and Android lifecycle validation
-remain required before considering simultaneous UI ready to enable.
+1. Pair/verify, close phone connection settings, then send concurrently from
+   both UIs and a third peer. Edit/delete/react from each UI; inspect both loaded
+   chats and chat-list previews/counters.
+2. Read individual items, whole chats and whole users on each side; toggle
+   manual unread. Include timed messages, hidden/multiple profiles (switching
+   must be rejected while linked), secondary scopes and scrolled history.
+3. Pause/resume the phone receiver and interrupt the desktop transport. Verify
+   resnapshot, missed messages and notification cancellation. Reconnect after a
+   remote overflow; do not treat a still-disconnected viewer as current.
+4. Test screen-off/background, normal notification modes including off, denied
+   notification permission, service restart and process death. Confirm the
+   phone remains usable while the desktop is connected. Device/OS battery
+   restrictions cannot be established by JVM tests.
+5. Send/receive images, voice and ordinary files in both directions, explicitly
+   accept a file on the desktop, open/download it, and confirm files/cleanup stay
+   in the correct device's storage. Check one phone notification per incoming
+   message and phone-owned calls without a desktop duplicate.
+6. Disconnect and unlink from settings, including while requests/files are in
+   flight; confirm the old desktop session is revoked and the phone continues.
 
-## Changed files
-
-- `src/Simplex/Chat/Controller/Concurrent.hs`
-- `src/Simplex/Chat/Controller.hs`
-- `src/Simplex/Chat.hs`
-- `src/Simplex/Chat/Library/Commands.hs`
-- `src/Simplex/Chat/Remote.hs`
-- `src/Simplex/Chat/Terminal/Output.hs`
-- `simplex-chat.cabal`
-- `tests/ConcurrentTests.hs`
-- `tests/ConcurrentMain.hs`
-- `tests/RemoteTests.hs`
-- `tests/Test.hs`
-- `apps/multiplatform/common/src/commonMain/kotlin/chat/simplex/common/model/ChatModel.kt`
-- `apps/multiplatform/common/src/commonMain/kotlin/chat/simplex/common/views/remote/ConnectDesktopView.kt`
-- `apps/multiplatform/common/src/commonTest/kotlin/chat/simplex/app/RemoteSessionModelTest.kt`
-- `docs/rfcs/2026-11-06-simultaneous-device-ui.md`
+Snapshot detail is bounded to 10,000 items; preserving arbitrary older paging,
+scroll position and very large-chat performance need physical validation.
+Notifications and in-progress call signalling lost during local overflow are
+not a durable event replay: snapshots restore persisted state and pending
+invitations, not already expired platform alerts or WebRTC signalling history.
+Do not mark the draft ready based only on core/terminal or model tests.

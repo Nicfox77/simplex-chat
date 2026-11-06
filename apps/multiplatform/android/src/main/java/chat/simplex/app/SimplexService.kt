@@ -331,7 +331,7 @@ class SimplexService: Service() {
       workManager.enqueueUniqueWork(WORK_NAME_ONCE, ExistingWorkPolicy.KEEP, startServiceRequest) // Unique avoids races!
     }
 
-    suspend fun start() = serviceAction(Action.START)
+    suspend fun start(remoteSession: Boolean = false) = serviceAction(Action.START, remoteSession)
 
     /**
      * If there is a need to stop the service, use this function only. It makes sure that the service will be stopped without an
@@ -349,8 +349,10 @@ class SimplexService: Service() {
       }
     }
 
-    private suspend fun serviceAction(action: Action) {
-      if (!NtfManager.areNotificationsEnabledInSystem()) {
+    private suspend fun serviceAction(action: Action, remoteSession: Boolean = false) {
+      // Remote messaging needs a foreground service even if chat notification
+      // display is disabled. Android still requires the service notification.
+      if (!remoteSession && !NtfManager.areNotificationsEnabledInSystem()) {
         Log.d(TAG, "SimplexService serviceAction: ${action.name}. Notifications are not enabled in OS yet, not starting service")
         return
       }

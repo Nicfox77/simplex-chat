@@ -184,6 +184,7 @@ runRemoteTests = do
   describe "simultaneous UI" $ do
     it "keeps both receivers live and shares sends, edits, deletes and read state through snapshots" simultaneousMessagesTest
     it "does not block the owner when a local subscriber overflows" simultaneousLocalOverflowTest
+    it "resnapshots a fresh protocol-1 session after overflow while the phone keeps receiving" simultaneousRecoveryTest
   describe "single owner concurrency" $ do
     it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
     it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
@@ -282,6 +283,34 @@ uiSnapshot command = command "/_ui snapshot @2 count=100" >>= \case
   r -> fail $ "invalid UI snapshot: " <> show r
   where
     isOwnerChat (AChat _ Chat {chatInfo}) = chatInfoToRef chatInfo == Just (ChatRef CTDirect 2 Nothing)
+
+simultaneousRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+simultaneousRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
+  ownerCommand mobile Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  startRemote compress mobile desktop
+  contactBob desktop bob
+  mobile <## "bob (Bob): contact is connected"
+  let cc = chatController mobile
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $
+    writeEventBuffer oldEvents $ Right $ Controller.CEvtCustomChatEvent Nothing "burst"
+  eventually 3 $ mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  bob #> "@alice received while viewer was away"
+  mobile <# "bob> received while viewer was away"
+  startRemoteStored compress mobile desktop
+  (_, items, unread, _) <- uiSnapshot $ ownerCommand desktop $ Controller.CSRemoteHost 1
+  map snd items `shouldContain` ["received while viewer was away"]
+  unread `shouldBe` 1
+  rejected <- withRemoteSession oldEvents $ pure ()
+  rejected `shouldSatisfy` \case
+    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    _ -> False
+  bob #> "@alice both after resnapshot"
+  mobile <# "bob> both after resnapshot"
+  desktop <# "bob> both after resnapshot"
+  stopDesktop mobile desktop
 
 -- Replace only the test frontend queues. The real cores and transports stay
 -- alive; the tested routing function writes to independent bounded subscribers.

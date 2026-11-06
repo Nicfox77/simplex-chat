@@ -90,6 +90,18 @@ class SimultaneousUIStateTest {
   }
 
   @Test
+  fun repeatedSnapshotRepairsAnOptimisticUpdateFromADelayedCommandReply() {
+    val newer = sent.copy(meta = sent.meta.copy(itemText = "newer peer edit", itemEdited = true))
+    val state = snapshot(conversation.copy(chatItems = listOf(received, newer)), 10)
+    chatModel.applyUIState(null, state, conversation.id)
+    // The initiating coroutine returns after the receiver's snapshot and
+    // applies its older result. A reconciliation sweep must restore the owner.
+    chatModel.chatsContext.applyUIItems(listOf(received, sent))
+    chatModel.applyUIState(null, state, conversation.id)
+    assertEquals("newer peer edit", chatModel.chatsContext.chatItems.value.last().meta.itemText)
+  }
+
+  @Test
   fun wireFormatDecodesInvalidationAndSnapshotWithoutLocalRoutingFields() {
     val event = json.decodeFromString<API>("""{"result":{"type":"uiStateChanged","uiVersion":1,"revision":12,"origin":"remote"}}""")
     assertEquals("remote", (event.result as CR.UIStateChanged).origin)

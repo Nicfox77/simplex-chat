@@ -18,7 +18,7 @@ import kotlinx.coroutines.Job
 import java.io.Closeable
 
 interface PlatformInterface {
-  suspend fun androidServiceStart() {}
+  suspend fun androidServiceStart(remoteSession: Boolean = false) {}
   fun androidServiceSafeStop() {}
   fun androidCallServiceSafeStop() {}
   fun androidNotificationsModeChanged(mode: NotificationsMode) {}

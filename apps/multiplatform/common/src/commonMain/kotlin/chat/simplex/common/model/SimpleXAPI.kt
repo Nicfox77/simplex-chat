@@ -859,7 +859,12 @@ object ChatController {
           }
           val msg = recvMsg(ctrl)
           releaseLock = getWakeLock(timeout = 60000)
-          if (msg == null && uiSnapshotPending) reconcileUI(chatModel.remoteHostId())
+          // A slow command caller may finish its optimistic model update after
+          // the event receiver already applied a newer snapshot. Periodic
+          // reconciliation while linked also repairs that response/event race.
+          if (msg == null && (uiSnapshotPending || chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true)) {
+            reconcileUI(chatModel.remoteHostId())
+          }
           if (msg != null) {
             val finishedWithoutTimeout = withTimeoutOrNull(60_000L) {
               processReceivedMsg(msg)
@@ -1015,7 +1020,9 @@ object ChatController {
 
   // Spec: spec/api.md#recvMsg
   fun recvMsg(ctrl: ChatCtrl): API? {
-    val rStr = chatRecvMsgWait(ctrl, if (uiSnapshotPending) 1_000_000 else MESSAGE_TIMEOUT)
+    val linked = chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true
+    val wait = if (uiSnapshotPending) 1_000_000 else if (linked) 5_000_000 else MESSAGE_TIMEOUT
+    val rStr = chatRecvMsgWait(ctrl, wait)
     return if (rStr == "") {
       null
     } else {
@@ -2411,7 +2418,7 @@ object ChatController {
     val chatItem = apiCancelFile(rh, fileId)
     if (chatItem != null) {
       chatItemSimpleUpdate(rh, user, chatItem)
-      cleanupFile(chatItem)
+      cleanupFile(rh, chatItem)
     }
   }
 
@@ -2985,10 +2992,26 @@ object ChatController {
     val response = sendCmd(rhId, CC.UIState(ref, maxOf(100, ctx.chatItems.value.size + 100)), log = false)
     val state = response.result as? CR.UIState ?: return
     check(state.uiVersion == 1) { "Unsupported UI snapshot version" }
+    val secondary = chatModel.secondaryChatsContext.value
+    val secondaryInfo = state.chats.firstOrNull { it.id == chatId }?.chatInfo
+    val secondaryItems = if (secondary != null && secondaryInfo != null) {
+      val scope = secondary.groupScopeInfo?.toChatScope()
+      if (secondary.contentTag != null) {
+        apiGetChat(rhId, secondaryInfo.chatType, secondaryInfo.apiId, scope, secondary.contentTag,
+          ChatPagination.Last(maxOf(100, secondary.chatItems.value.size + 100)))?.first?.chatItems
+      } else {
+        val scopedRef = CC.chatRef(secondaryInfo.chatType, secondaryInfo.apiId, scope)
+        (sendCmd(rhId, CC.UIState(scopedRef, maxOf(100, secondary.chatItems.value.size + 100)), log = false)
+          .result as? CR.UIState)?.openChat?.chatItems
+      }
+    } else null
     var applied = false
     withContext(Dispatchers.Main) {
       if (!chatModel.applyUIState(rhId, state, chatId, generation)) return@withContext
       applied = true
+      if (secondaryItems != null && secondary === chatModel.secondaryChatsContext.value && chatModel.chatId.value == chatId) {
+        secondary?.applyUIItems(secondaryItems)
+      }
       if (rhId == null) {
         state.chats.filter { it.chatStats.unreadCount == 0 }.forEach {
           ntfManager.cancelNotificationsForChat(it.id)
@@ -3448,7 +3471,7 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.RcvFileSndCancelled -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        if (rhId == null) cleanupFile(r.chatItem)
+        cleanupFile(rhId, r.chatItem)
       }
       is CR.RcvFileProgressXFTP -> {
         if (r.chatItem_ != null) {
@@ -3458,7 +3481,7 @@ object ChatController {
       is CR.RcvFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          if (rhId == null) cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.RcvFileWarning -> {
@@ -3470,12 +3493,12 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.SndFileComplete -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        cleanupDirectFile(r.chatItem)
+        cleanupDirectFile(rhId, r.chatItem)
       }
       is CR.SndFileRcvCancelled -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          if (rhId == null) cleanupDirectFile(r.chatItem_)
+          cleanupDirectFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileProgressXFTP -> {
@@ -3489,7 +3512,7 @@ object ChatController {
       is CR.SndFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          if (rhId == null) cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileWarning -> {
@@ -3726,13 +3749,16 @@ object ChatController {
     }
   }
 
-  private fun cleanupDirectFile(aChatItem: AChatItem) {
+  private fun cleanupDirectFile(rhId: Long?, aChatItem: AChatItem) {
     if (aChatItem.chatInfo.chatType == ChatType.Direct) {
-      cleanupFile(aChatItem)
+      cleanupFile(rhId, aChatItem)
     }
   }
 
-  private fun cleanupFile(aChatItem: AChatItem) {
+  private fun cleanupFile(rhId: Long?, aChatItem: AChatItem) {
+    // All cleanup entry points, including command replies, carry the owner.
+    // A phone-relative file name must never remove a desktop-local file.
+    if (rhId != null) return
     val cItem = aChatItem.chatItem
     val mc = cItem.content.msgContent
     val fileName = cItem.file?.fileName
