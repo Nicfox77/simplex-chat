@@ -55,6 +55,7 @@ import Numeric.Natural
 import qualified Paths_simplex_chat as SC
 import Simplex.Chat.AppSettings
 import Simplex.Chat.Call
+import Simplex.Chat.Controller.Concurrent
 import Simplex.Chat.Delivery
 import Simplex.Chat.Messages
 import Simplex.Chat.Messages.CIContent
@@ -317,6 +318,7 @@ data ChatController = ChatController
     eventSeq :: TVar Int,
     inputQ :: TBQueue String,
     outputQ :: TBQueue (Maybe RemoteHostId, Either ChatError ChatEvent),
+    profileCreationGate :: CommandGate, -- protect name check + agent/store allocation
     subscriptionMode :: TVar SubscriptionMode,
     processServiceRequests :: TVar Bool,
     chatLock :: Lock,
@@ -1698,7 +1700,7 @@ data RemoteCtrlSession
         tls :: TLS 'TClient,
         rcsSession :: RCCtrlSession,
         http2Server :: Async (),
-        remoteOutputQ :: TBQueue (Either ChatError ChatEvent),
+        remoteOutputQ :: EventBuffer (Either ChatError ChatEvent),
         ctrlAppInfo :: CtrlAppInfo
       }
 
@@ -1800,7 +1802,7 @@ toView_ ev = do
   atomically $
     readTVar session >>= \case
       Just (_, RCSessionConnected {remoteOutputQ})
-        | either (const True) allowRemoteEvent event -> writeTBQueue remoteOutputQ event
+        | either (const True) allowRemoteEvent event -> writeEventBuffer remoteOutputQ event
       -- TODO potentially, it should hold some events while connecting
       _ -> writeTBQueue localQ (Nothing, event)
 

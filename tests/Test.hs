@@ -19,6 +19,7 @@ import ChatClient
 import ChatTests
 import ChatTests.DBUtils
 import ChatTests.Utils (xdescribe'')
+import ConcurrentTests (concurrentTests)
 import Control.Logger.Simple
 import Data.Time.Clock.System
 import BadgeTests
@@ -87,6 +88,7 @@ main = do
         badgeStripeTests
         badgeStoreVerifierTests
       describe "SimpleX chat markdown" markdownTests
+      concurrentTests
       describe "JSON Tests" jsonTests
       describe "Member relations" memberRelationsTests
       describe "SimpleX chat view" viewTests

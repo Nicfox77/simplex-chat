@@ -26,7 +26,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.simplex.common.model.*
 import chat.simplex.common.model.ChatController.switchToLocalSession
-import chat.simplex.common.model.ChatModel.connectedToRemote
 import chat.simplex.common.model.ChatModel.controller
 import chat.simplex.common.platform.*
 import chat.simplex.common.ui.theme.*
@@ -46,7 +45,7 @@ import kotlinx.coroutines.withContext
 fun ConnectDesktopView(close: () -> Unit) {
   val deviceName = remember { controller.appPrefs.deviceNameForRemoteAccess.state }
   val closeWithAlert = {
-    if (!connectedToRemote()) {
+    if (chatModel.remoteCtrlSession.value?.active != true) {
       close()
     } else {
       showDisconnectDesktopAlert(close)
@@ -108,9 +107,8 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
     updateRemoteCtrls(remoteCtrls)
     val useMulticast = useMulticast(remoteCtrls)
     showConnectScreen.value = !useMulticast
-    if (chatModel.remoteCtrlSession.value != null) {
-      disconnectDesktop()
-    } else if (useMulticast) {
+    // Opening the session controls must not tear down an existing connection.
+    if (chatModel.remoteCtrlSession.value == null && useMulticast) {
       findKnownDesktop(showConnectScreen)
     }
   }

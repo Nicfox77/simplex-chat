@@ -1291,8 +1291,10 @@ object ChatModel {
     terminalItems.value += item
   }
 
-  val connectedToRemote: Boolean @Composable get() = currentRemoteHost.value != null || remoteCtrlSession.value?.active == true
-  fun connectedToRemote(): Boolean = currentRemoteHost.value != null || remoteCtrlSession.value?.active == true
+  // Only a UI viewing a remote host needs remote file paths and downloads.
+  // Hosting a desktop UI does not move this phone's files or database elsewhere.
+  val connectedToRemote: Boolean @Composable get() = currentRemoteHost.value != null
+  fun connectedToRemote(): Boolean = currentRemoteHost.value != null
 }
 
 data class ShowingInvitation(

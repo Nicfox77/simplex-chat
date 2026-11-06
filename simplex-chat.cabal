@@ -49,6 +49,7 @@ library
       Simplex.Chat.Names
       Simplex.Chat.Call
       Simplex.Chat.Controller
+      Simplex.Chat.Controller.Concurrent
       Simplex.Chat.Delivery
       Simplex.Chat.Files
       Simplex.Chat.Image
@@ -441,6 +442,23 @@ library
       , template-haskell ==2.16.*
       , text >=1.2.4.0 && <1.3
 
+-- Fast tests for the controller's concurrency primitives, without the agent,
+-- database or network test harness. Also included in simplex-chat-test.
+test-suite simultaneous-ui-core-test
+  type: exitcode-stdio-1.0
+  main-is: ConcurrentMain.hs
+  hs-source-dirs: tests src
+  other-modules:
+      ConcurrentTests
+      Simplex.Chat.Controller.Concurrent
+  build-depends:
+      base >=4.7 && <5
+    , async ==2.2.*
+    , hspec >=2.7 && <3
+    , stm ==2.5.*
+  ghc-options: -Wall -threaded -rtsopts
+  default-language: Haskell2010
+
 executable simplex-badge-service
   if flag(client_library)
       buildable: False
@@ -727,6 +745,7 @@ test-suite simplex-chat-test
       ChatTests.Names
       ChatTests.Profiles
       ChatTests.Utils
+      ConcurrentTests
       ImageTests
       JSONFixtures
       JSONTests

@@ -69,6 +69,7 @@ import Simplex.Chat.Badges.StorePlan (storePlan)
 import Simplex.Chat.Names (SimplexDomainProof (..), SimplexDomainClaim (..), claimDomain, mkDomainClaim)
 import Simplex.Chat.Call
 import Simplex.Chat.Controller
+import Simplex.Chat.Controller.Concurrent (withCommandGate)
 import Simplex.Chat.Delivery (DeliveryJobScope (..), DeliveryJobSpec (..), DeliveryWorkerScope (..))
 import Simplex.Chat.Files
 import Simplex.Chat.Image (cropToSquare, decodeResizable, resizeImageDataUri)
@@ -450,9 +451,19 @@ execChatCommand src s retryNum =
         Nothing -> execChatCommand' cmd retryNum
 
 execChatCommand' :: ChatCommand -> Int -> CM' (Either ChatError ChatResponse)
-execChatCommand' cmd retryNum = handleCommandError $ do
-  cxt <- chatStoreCxt
-  processChatCommand cxt (NRMInteractive' retryNum) cmd
+execChatCommand' cmd retryNum = case cmd of
+  -- The duplicate-name check and agent/store allocation span transactions.
+  -- Serialize profile creation from either UI before allocating an agent user.
+  -- Do not serialize every command here: local event consumers can themselves
+  -- issue commands, and outputQ still applies blocking backpressure.
+  CreateActiveUser {} -> do
+    gate <- asks profileCreationGate
+    withRunInIO $ \run -> withCommandGate gate $ run execute
+  _ -> execute
+  where
+    execute = handleCommandError $ do
+      cxt <- chatStoreCxt
+      processChatCommand cxt (NRMInteractive' retryNum) cmd
 
 execRemoteCommand :: RemoteHostId -> ChatCommand -> ByteString -> Int -> CM' (Either ChatError ChatResponse)
 execRemoteCommand rhId cmd s retryNum = handleCommandError $ getRemoteHostClient rhId >>= \rh -> processRemoteCommand rhId rh cmd s retryNum

@@ -12,20 +12,23 @@ import ChatTests.Utils
 import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Except (runExceptT)
+import Control.Monad.Reader (runReaderT)
 import qualified Data.Aeson as J
 import qualified Data.ByteString as B
 import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LB
 import Data.List (find, isPrefixOf)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as M
 import Data.Word (Word32)
 import Simplex.Chat.Controller (ChatCommand (..), ChatConfig (..), versionNumber)
 import Simplex.Chat.Files (safeFileNameStr)
-import Simplex.Chat.Library.Commands (parseChatCommand)
+import Simplex.Chat.Library.Commands (execChatCommand, parseChatCommand)
 import qualified Simplex.Chat.Controller as Controller
+import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, newEventBuffer, writeEventBuffer)
 import Simplex.Chat.Mobile.File
-import Simplex.Chat.Remote (remoteFilesFolder, validRemoteFileName)
-import Simplex.Chat.Remote.Protocol (encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
+import Simplex.Chat.Remote (handleRecv, remoteFilesFolder, validRemoteFileName)
+import Simplex.Chat.Remote.Protocol (RemoteResponse (..), encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
 import Simplex.Chat.Remote.Types
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFileArgs (..))
@@ -37,6 +40,7 @@ import Simplex.Messaging.Transport.HTTP2 (HTTP2BodyChunk (..), getHTTP2Body)
 import Simplex.Messaging.Util
 import Simplex.RemoteControl.Types (RCCtrlAddress (..))
 import System.FilePath (takeFileName, (</>))
+import qualified System.Timeout as Timeout
 import Test.Hspec hiding (it)
 import UnliftIO
 import UnliftIO.Concurrent
@@ -44,6 +48,27 @@ import UnliftIO.Directory
 
 remoteTests :: SpecWith TestParams
 remoteTests = describe "Remote" $ do
+  describe "event routes" $ do
+    it "keeps suspension and pairing events local" $ \_ -> do
+      Controller.allowRemoteEvent Controller.CEvtChatSuspended `shouldBe` False
+      Controller.allowRemoteEvent (Controller.CEvtRemoteCtrlSessionCode Nothing "private code") `shouldBe` False
+      Controller.allowRemoteEvent (Controller.CEvtRemoteHostSessionCode Nothing "private code") `shouldBe` False
+    it "permits shared application events" $ \_ ->
+      Controller.allowRemoteEvent (Controller.CEvtCustomChatEvent Nothing "event") `shouldBe` True
+  describe "event receive lifecycle" $ do
+    it "reports an empty open buffer as a long-poll timeout" $ \_ -> do
+      events <- atomically $ newEventBuffer 1
+      result <- handleRecv 1000 events
+      result `shouldSatisfy` \case
+        RRChatEvent Nothing -> True
+        _ -> False
+    it "reports a closed buffer as a protocol failure, not an empty poll" $ \_ -> do
+      events <- atomically $ newEventBuffer 1
+      atomically $ closeEventBuffer events EBDetached
+      result <- handleRecv 1000000 events
+      result `shouldSatisfy` \case
+        RRProtocolError (RPEInvalidBody _) -> True
+        _ -> False
   describe "/start remote host parser" $ do
     it "parses iface name with a space followed by port=" $ \_ ->
       parseChatCommand "/start remote host new addr=192.168.1.5 iface=\"Ethernet 2\" port=12345"
@@ -116,6 +141,8 @@ runRemoteTests = do
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
   it "sends messages" remoteMessageTest
+  it "serializes concurrent phone and desktop profile creation" concurrentOwnerCommandsTest
+  it "stops a session whose event reader overflows" remoteEventOverflowTest
   describe "remote files" $ do
     it "store/get/send/receive files" remoteStoreFileTest
     it "should send files from CLI without /store" remoteCLIFileTest
@@ -124,6 +151,40 @@ runRemoteTests = do
   it "works with multiple profiles" multipleProfilesTest
 
 -- * Chat commands
+
+remoteEventOverflowTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  let cc = chatController mobile
+      session = Controller.remoteCtrlSession cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readTVarIO session
+  -- Publish the burst in one transaction so the live desktop reader cannot
+  -- drain it halfway through and hide the overflow. The producer must return.
+  Timeout.timeout 1000000 (atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $
+    writeEventBuffer events $ Right $ Controller.CEvtCustomChatEvent Nothing "burst")
+    `shouldReturn` Just ()
+  Timeout.timeout 5000000 (atomically $ readTVar session >>= check . isNothing)
+    `shouldReturn` Just ()
+  mobile <## "remote controller stopped"
+
+concurrentOwnerCommandsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+concurrentOwnerCommandsTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  -- Both commands target the phone's store through the real local/remote
+  -- dispatch paths. One creates the profile; the other must observe it before
+  -- allocating an agent user or attempting a duplicate store insert.
+  let command = "/create user concurrent_owner"
+  (localResponse, remoteResponse) <- concurrently
+    (runReaderT (execChatCommand Controller.CSLocal command 0) $ chatController mobile)
+    (runReaderT (execChatCommand (Controller.CSRemoteHost 1) command 0) $ chatController desktop)
+  let responses = [localResponse, remoteResponse]
+      created (Right Controller.CRActiveUser {}) = True
+      created _ = False
+      alreadyExists (Left (Controller.ChatError (Controller.CEUserExists _))) = True
+      alreadyExists _ = False
+  length (filter created responses) `shouldBe` 1
+  length (filter alreadyExists responses) `shouldBe` 1
+  stopDesktop mobile desktop
 
 remoteHandshakeTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
 remoteHandshakeTest viaDesktop = testRemote $ \compress mobile desktop -> do

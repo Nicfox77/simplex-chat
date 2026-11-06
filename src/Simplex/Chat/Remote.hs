@@ -38,6 +38,7 @@ import qualified Network.HTTP.Types as N
 import Network.HTTP2.Server (responseStreaming)
 import qualified Paths_simplex_chat as SC
 import Simplex.Chat.Controller
+import Simplex.Chat.Controller.Concurrent
 import Simplex.Chat.Files
 import Simplex.Chat.Messages (chatNameStr)
 import Simplex.Chat.Remote.AppVersion
@@ -505,7 +506,7 @@ parseCtrlAppInfo :: JT.Value -> CM CtrlAppInfo
 parseCtrlAppInfo ctrlAppInfo = do
   liftEitherWith (const $ ChatErrorRemoteCtrl RCEBadInvitation) $ JT.parseEither J.parseJSON ctrlAppInfo
 
-handleRemoteCommand :: (ByteString -> Int -> CM' (Either ChatError ChatResponse)) -> RemoteCrypto -> TBQueue (Either ChatError ChatEvent) -> HTTP2Request -> CM' ()
+handleRemoteCommand :: (ByteString -> Int -> CM' (Either ChatError ChatResponse)) -> RemoteCrypto -> EventBuffer (Either ChatError ChatEvent) -> HTTP2Request -> CM' ()
 handleRemoteCommand execCC encryption remoteOutputQ HTTP2Request {request, reqBody, sendResponse} = do
   logDebug "handleRemoteCommand"
   liftIO (tryAllErrors' parseRequest) >>= \case
@@ -557,10 +558,13 @@ handleSend execCC command retryNum = do
   -- convert errors thrown in execCC into error responses to prevent aborting the protocol wrapper
   RRChatResponse . eitherToResult <$> execCC (encodeUtf8 command) retryNum
 
-handleRecv :: Int -> TBQueue (Either ChatError ChatEvent) -> IO RemoteResponse
+handleRecv :: Int -> EventBuffer (Either ChatError ChatEvent) -> IO RemoteResponse
 handleRecv time events = do
   logDebug $ "Recv: " <> tshow time
-  RRChatEvent . fmap eitherToResult <$> (timeout time . atomically $ readTBQueue events)
+  timeout time (atomically $ readEventBuffer events) >>= \case
+    Nothing -> pure $ RRChatEvent Nothing
+    Just (Right event) -> pure $ RRChatEvent $ Just $ eitherToResult event
+    Just (Left _) -> pure $ RRProtocolError $ RPEInvalidBody "event stream closed; a new session and snapshot are required"
 
 -- TODO this command could remember stored files and return IDs to allow removing files that are not needed.
 -- Also, there should be some process removing unused files uploaded to remote host (possibly, all unused files).
@@ -637,14 +641,16 @@ verifyRemoteCtrlSession execCC sessCode' = do
     unless verified $ throwError $ ChatErrorRemoteCtrl $ RCEProtocolError PRESessionCode
     (rcsSession@RCCtrlSession {tls, sessionKeys}, rcCtrlPairing) <- timeoutThrow (ChatErrorRemoteCtrl RCETimeout) networkIOTimeout $ takeRCStep vars
     rc@RemoteCtrl {remoteCtrlId} <- upsertRemoteCtrl ctrlName rcCtrlPairing
-    remoteOutputQ <- asks (tbqSize . config) >>= newTBQueueIO
+    remoteOutputQ <- asks (tbqSize . config) >>= atomically . newEventBuffer
     encryption@RemoteCrypto {compression} <- mkCtrlRemoteCrypto sessionKeys (tlsUniq tls) =<< getRemoteCtrlAppInfo sseq
     cc <- ask
     http2Server <- liftIO . async $ attachHTTP2Server tls $ \req -> handleRemoteCommand execCC encryption remoteOutputQ req `runReaderT` cc
-    void . forkIO $ monitor sseq http2Server
     updateRemoteCtrlSession sseq $ \case
       RCSessionPendingConfirmation {ctrlAppInfo} -> Right RCSessionConnected {remoteCtrlId, rcsClient = client, rcsSession, tls, http2Server, remoteOutputQ, ctrlAppInfo}
       _ -> Left $ ChatErrorRemoteCtrl RCEBadState
+    -- Start after publishing the session, so early closure cannot be missed by
+    -- cancelActiveRemoteCtrl. A new session always gets a fresh event buffer.
+    void . forkIO $ monitor sseq http2Server remoteOutputQ
     let remoteCtrl = remoteCtrlInfo rc $ Just RCSConnected {sessionCode = tlsSessionCode tls}
     pure CRRemoteCtrlConnected {remoteCtrl, compression}
   where
@@ -657,9 +663,15 @@ verifyRemoteCtrlSession execCC sessCode' = do
           let dhPrivKey' = dhPrivKey rcCtrlPairing
           liftIO $ updateRemoteCtrl db rc ctrlName dhPrivKey'
           pure rc {ctrlDeviceName = ctrlName, ctrlPairing = ctrlPairing {dhPrivKey = dhPrivKey'}}
-    monitor :: SessionSeq -> Async () -> CM ()
-    monitor sseq server = do
-      res <- waitCatch server
+    monitor :: SessionSeq -> Async () -> EventBuffer (Either ChatError ChatEvent) -> CM ()
+    monitor sseq server events = do
+      res <- race (waitCatch server) (atomically $ waitEventBufferClosed events)
+      -- Buffer overflow is terminal. Continuing after losing even one read,
+      -- deletion or file event would leave the controller's UI inconsistent.
+      -- Cancel the HTTP2 server here: the error cleanup assumes it has stopped.
+      case res of
+        Right _ -> cancel server
+        Left _ -> pure ()
       logInfo $ "HTTP2 server stopped: " <> tshow res
       cancelActiveRemoteCtrl $ Just (sseq, RCSRDisconnected)
 
@@ -702,7 +714,8 @@ cancelRemoteCtrl handlingError = \case
     unless handlingError $ uninterruptibleCancel rcsWaitSession
     cancelCtrlClient rcsClient
     closeConnection tls
-  RCSessionConnected {rcsClient, tls, http2Server} -> do
+  RCSessionConnected {rcsClient, tls, http2Server, remoteOutputQ} -> do
+    atomically $ closeEventBuffer remoteOutputQ EBDetached
     unless handlingError $ uninterruptibleCancel http2Server
     cancelCtrlClient rcsClient
     closeConnection tls
