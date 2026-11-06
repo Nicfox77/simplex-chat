@@ -511,9 +511,13 @@ handleRemoteCommand execCC encryption remoteOutputQ HTTP2Request {request, reqBo
   logDebug "handleRemoteCommand"
   liftIO (tryAllErrors' parseRequest) >>= \case
     Right (rfKN, getNext, rc) -> do
-      chatReadVar' currentUser >>= \case
-        Nothing -> replyError $ ChatError CENoActiveUser
-        Just user -> processCommand user rfKN getNext rc `catchAllErrors'` replyError
+      -- Decryption can wait for body data while this session is revoked. Check
+      -- admission after parsing, before executing commands or receiving files.
+      admitted <- withRemoteSession remoteOutputQ $
+        chatReadVar' currentUser >>= \case
+          Nothing -> replyError $ ChatError CENoActiveUser
+          Just user -> processCommand user rfKN getNext rc `catchAllErrors'` replyError
+      either reply pure admitted
     Left e -> reply $ RRProtocolError e
   where
     parseRequest :: ExceptT RemoteProtocolError IO (C.SbKeyNonce, GetChunk, RemoteCommand)
@@ -531,11 +535,15 @@ handleRemoteCommand execCC encryption remoteOutputQ HTTP2Request {request, reqBo
     reply = (`replyWith` \_ _ -> pure ())
     replyWith :: Respond
     replyWith rr attach = do
+      closed <- atomically $ eventBufferClosed remoteOutputQ
+      let (response, attachment) = case closed of
+            Nothing -> (rr, attach)
+            Just _ -> (remoteSessionClosed, \_ _ -> pure ())
       (corrId, cmdKN, sfKN) <- atomically $ getRemoteSndKeys encryption
-      liftIO (tryAllErrors' . encryptEncodeHTTP2Body corrId cmdKN encryption $ J.encode rr) >>= \case
+      liftIO (tryAllErrors' . encryptEncodeHTTP2Body corrId cmdKN encryption $ J.encode response) >>= \case
         Right resp -> liftIO . sendResponse . responseStreaming N.status200 [] $ \send flush -> do
           send resp
-          attach sfKN send
+          attachment sfKN send
           flush
         Left e -> eToView' $ ChatErrorRemoteCtrl $ RCEProtocolError e
 
@@ -564,7 +572,22 @@ handleRecv time events = do
   timeout time (atomically $ readEventBuffer events) >>= \case
     Nothing -> pure $ RRChatEvent Nothing
     Just (Right event) -> pure $ RRChatEvent $ Just $ eitherToResult event
-    Just (Left _) -> pure $ RRProtocolError $ RPEInvalidBody "event stream closed; a new session and snapshot are required"
+    Just (Left _) -> pure remoteSessionClosed
+
+-- | An event stream is also the lifetime token of its authenticated session.
+-- This is an admission check, not a global command lock. Already admitted
+-- requests are cancelled by the HTTP2 server shutdown; they may have committed
+-- before revocation. In particular, never hold an STM transaction or a command
+-- gate while reading an upload, waiting for an event, or writing a response.
+withRemoteSession :: MonadIO m => EventBuffer a -> m b -> m (Either RemoteResponse b)
+withRemoteSession events action = do
+  closed <- liftIO . atomically $ eventBufferClosed events
+  case closed of
+    Just _ -> pure $ Left remoteSessionClosed
+    Nothing -> Right <$> action
+
+remoteSessionClosed :: RemoteResponse
+remoteSessionClosed = RRProtocolError $ RPEInvalidBody "event stream closed; a new session and snapshot are required"
 
 -- TODO this command could remember stored files and return IDs to allow removing files that are not needed.
 -- Also, there should be some process removing unused files uploaded to remote host (possibly, all unused files).
@@ -689,18 +712,28 @@ handleCtrlError sseq mkReason name action =
 cancelActiveRemoteCtrl :: Maybe (SessionSeq, RemoteCtrlStopReason) -> CM ()
 cancelActiveRemoteCtrl handlerInfo_ = handleAny (logError . tshow) $ do
   var <- asks remoteCtrlSession
-  session_ <-
-    atomically $
-      readTVar var >>= \case
-        Nothing -> pure Nothing
-        Just (oldSeq, _) | (maybe False ((oldSeq /=) . fst) handlerInfo_) -> pure Nothing
-        Just (_, s) -> Just s <$ writeTVar var Nothing
+  session_ <- atomically $ takeRemoteCtrlSession var (fst <$> handlerInfo_)
   forM_ session_ $ \session -> do
     liftIO $ cancelRemoteCtrl handlingError session
     forM_ (snd <$> handlerInfo_) $ \rcStopReason ->
       toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason}
   where
     handlingError = isJust handlerInfo_
+
+-- Revoke request admission in the same transaction as unpublishing the
+-- session, before asynchronous transport cleanup can yield. The owner-core
+-- stop path must use this too. A stale monitor must not revoke a new session.
+takeRemoteCtrlSession :: TVar (Maybe (SessionSeq, RemoteCtrlSession)) -> Maybe SessionSeq -> STM (Maybe RemoteCtrlSession)
+takeRemoteCtrlSession var expectedSeq =
+  readTVar var >>= \case
+    Nothing -> pure Nothing
+    Just (oldSeq, _) | maybe False (oldSeq /=) expectedSeq -> pure Nothing
+    Just (_, s) -> do
+      case s of
+        RCSessionConnected {remoteOutputQ} -> closeEventBuffer remoteOutputQ EBDetached
+        _ -> pure ()
+      writeTVar var Nothing
+      pure $ Just s
 
 cancelRemoteCtrl :: Bool -> RemoteCtrlSession -> IO ()
 cancelRemoteCtrl handlingError = \case

@@ -1,6 +1,7 @@
 # Simultaneous Android and desktop UI: partial implementation
 
-Status: safe core foundations only. **Simultaneous UI is not enabled.** The
+Status: core foundations and remote-session correctness fixes.
+**Simultaneous UI is not enabled.** The
 existing linked desktop mode still routes eligible events exclusively to the
 desktop, and closing the Android connection modal still disconnects it.
 
@@ -30,9 +31,28 @@ profile replication, encryption change, iOS change, or new reconnect mechanism.
   subscriber buffers. Tests cover both directions of a paused reader. This
   primitive is **not yet connected to the phone's `outputQ`**. That existing
   queue still has its original blocking behavior.
-- Route authorization (`allowRemoteEvent`) is unchanged. Pairing and session
-  lifecycle events remain local. Command responses still return only through
-  their request channel; they are not blindly copied into an event stream.
+- Pairing, session lifecycle and platform-store settlement callbacks remain
+  local. Only the phone can finish its Android store transactions; sending the
+  settlement callback to desktop left the transaction unfinished. Badge state
+  changes remain eligible for remote delivery. Command responses still return
+  only through their request channel.
+- Revoking a hosted controller closes its event buffer in the same STM
+  transaction that removes the session. After authenticated request parsing,
+  command/file admission checks this lifetime token without waiting for
+  transport cancellation. Reply preparation also checks it and suppresses
+  payloads and file attachments from revoked sessions. Already admitted work
+  may have committed before revocation; this is not transaction rollback.
+  Long polling and command/file execution do not share a command gate.
+- Controller shutdown unpublishes the remote hosts and current-host selection
+  before cancelling transports, as normal explicit disconnect already does.
+  Disconnect callbacks cannot recursively cancel the same published session
+  during shutdown. Hosted-controller admission is revoked in this same STM
+  transaction. Tests stop both the owner and viewer cores with a live session.
+- Terminal automatic reads retain the event's remote host ID and execute on
+  the owning phone through XRCP. Previously remote item IDs were used against
+  the desktop's own database, potentially marking unrelated local items read.
+  Local reads retain their original dispatch path. This fixes terminal read
+  ownership; it does not add phone/desktop UI read-state broadcasts.
 - Kotlin distinguishes viewing a remote phone from hosting a desktop. Hosting
   a desktop does not cause the Android owner to use remote file downloads or
   remote paths. Reopening connection controls preserves an existing session;
@@ -96,35 +116,62 @@ mutations, caller-specific results, failure/cancellation, exact ordered delivery
 to two buffers, stalled readers, overflow, disposal and fresh-session isolation.
 They exercise the shared primitives, not a complete Android/desktop UI flow.
 
-`RemoteTests` additionally checks local-only route policy, long-poll closure,
-live session shutdown on overflow, and races real local and remote profile
-creation against the same phone store. `RemoteSessionModelTest`
+`RemoteTests` additionally checks local-only route policy, request admission
+after revocation, long-poll closure, live session shutdown and snapshot recovery
+on overflow, unlinking and stale cleanup, and races real local and remote
+commands against the same phone store. Read-ownership tests distinguish the
+desktop's own unread items from the remote phone's unread items. These are
+core/terminal integration tests, not proof of simultaneous Android UI behavior.
+`RemoteSessionModelTest`
 checks Kotlin file-routing semantics for each role. These require the full core
 and Kotlin build environments respectively; record their actual run results
 separately from the focused primitive tests.
 
-Recorded validation for this draft: the standalone GHC command above passed
-all 12 examples with `-Wall -Werror` on GHC 9.6.6. Gradle's online
-`:common:desktopTest` invocation resolved plugins, then stopped during Android
-project configuration because no Android SDK location was available. Kotlin
-tests and Android/Linux application builds are not verified by that invocation.
-The full core build successfully resolved and built dependencies up to the
-`simplexmq` library. It was stopped while compiling that library to bound draft
-preparation time; the chat library and real remote integration tests have **not**
-been compiled/run. Resume validation with:
+Validation on 2026-11-06, continuing from the initial draft:
+
+- GHC 9.6.6 compiled the complete chat library and integration-test executable.
+  The standalone suite above passed all 12 examples with `-Wall -Werror`.
+  `cabal build exe:simplex-chat --ghc-options=-O0` also linked the CLI successfully.
+- The remote suite passed **39 active examples, zero failures**, with 60
+  pending examples in the three upstream-disabled compression variants. The
+  invocation below excludes multicast discovery, which failed in this
+  container; discovery/networking code was not changed. Real encrypted XRCP
+  sessions, file upload/download, profile changes, both core-stop paths and the
+  new concurrency/recovery cases ran. Disposable test databases used tmpfs to
+  avoid slow migration fsyncs on this host; the concurrent send/read test also
+  passed on the normal filesystem (97 seconds including fixture creation).
+- After initializing the pinned NanoHTTPD submodule, Gradle's invocation below
+  compiled the common/desktop sources and passed **255 JUnit tests**, including
+  both `RemoteSessionModelTest` cases. The default Gradle configuration still
+  requires an Android SDK; configuration on demand permits desktop testing
+  without it. Unrelated background coroutines logged native `UnsatisfiedLinkError`
+  exceptions despite the passing JUnit result. This does not establish JNI or
+  Android application runtime correctness.
+- Android builds and a real Android/desktop paired UI session remain unverified.
+  The missing frontend subscription/snapshot and lifecycle work listed above
+  remains unimplemented. Simultaneous UI must stay disabled.
+
+Core/remote validation:
 
 ```sh
-cp scripts/cabal.project.local.linux cabal.project.local
 cabal test simplex-chat-test --ghc-options=-O0 \
-  --test-option=-m --test-option='/Remote/'
+  --test-option=-m --test-option='/Remote/' \
+  --test-option=--skip --test-option='connects with multicast discovery' \
+  --test-option=--jobs=2
+```
+
+Kotlin validation (from `apps/multiplatform`):
+
+```sh
+./gradlew :common:desktopTest --configure-on-demand --console=plain
 ```
 
 The narrowed production gate covers only `CreateActiveUser`; inspection found
 no UI-event emission or recursive command dispatch in that path. It does not
 hold `chatLock`, and ordinary reader-issued commands do not acquire it. The
 focused tests verify release after exceptions and both executing/waiting
-command cancellation. Full integration validation remains required before
-considering this draft ready to merge.
+command cancellation. Frontend integration and Android lifecycle validation
+remain required before considering simultaneous UI ready to enable.
 
 ## Changed files
 
@@ -133,6 +180,7 @@ considering this draft ready to merge.
 - `src/Simplex/Chat.hs`
 - `src/Simplex/Chat/Library/Commands.hs`
 - `src/Simplex/Chat/Remote.hs`
+- `src/Simplex/Chat/Terminal/Output.hs`
 - `simplex-chat.cabal`
 - `tests/ConcurrentTests.hs`
 - `tests/ConcurrentMain.hs`

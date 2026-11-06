@@ -11,6 +11,7 @@ module Simplex.Chat.Controller.Concurrent
     writeEventBuffers,
     readEventBuffer,
     closeEventBuffer,
+    eventBufferClosed,
     waitEventBufferClosed,
   )
 where
@@ -80,4 +81,10 @@ closeEventBuffer (EventBuffer queue closed) reason = do
       writeTVar closed $ Just reason
 
 waitEventBufferClosed :: EventBuffer a -> STM EventBufferClosed
-waitEventBufferClosed (EventBuffer _ closed) = readTVar closed >>= maybe retry pure
+waitEventBufferClosed buffer = eventBufferClosed buffer >>= maybe retry pure
+
+-- | Inspect revocation without consuming an event or waiting for a producer.
+-- Request admission must also check this flag: waking a monitor does not mean
+-- that its asynchronous transport cancellation has completed yet.
+eventBufferClosed :: EventBuffer a -> STM (Maybe EventBufferClosed)
+eventBufferClosed (EventBuffer _ closed) = readTVar closed

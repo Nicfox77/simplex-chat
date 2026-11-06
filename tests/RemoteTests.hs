@@ -8,7 +8,9 @@ module RemoteTests where
 
 import ChatClient
 import ChatTests.DBUtils
+import qualified ChatTests.DBUtils as DBU
 import ChatTests.Utils
+import Control.Concurrent.STM (check)
 import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Except (runExceptT)
@@ -16,20 +18,29 @@ import Control.Monad.Reader (runReaderT)
 import qualified Data.Aeson as J
 import qualified Data.ByteString as B
 import Data.ByteString.Builder (toLazyByteString)
+import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy.Char8 as LB
-import Data.List (find, isPrefixOf)
-import Data.Maybe (isNothing)
+import Data.Int (Int64)
+import Data.List (find, isPrefixOf, sort)
+import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as M
+import Data.Maybe (isNothing)
+import Data.Text (Text)
 import Data.Word (Word32)
+import Simplex.Chat.Badges.Types (BadgeIssueFailure (BIFServiceTimeout))
 import Simplex.Chat.Controller (ChatCommand (..), ChatConfig (..), versionNumber)
 import Simplex.Chat.Files (safeFileNameStr)
 import Simplex.Chat.Library.Commands (execChatCommand, parseChatCommand)
 import qualified Simplex.Chat.Controller as Controller
-import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, newEventBuffer, writeEventBuffer)
+import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, eventBufferClosed, newEventBuffer, writeEventBuffer)
 import Simplex.Chat.Mobile.File
-import Simplex.Chat.Remote (handleRecv, remoteFilesFolder, validRemoteFileName)
+import Simplex.Chat.Messages (AChat (..), AChatItem (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), CIMeta (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
+import Simplex.Chat.Options (ChatOpts (..))
+import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, validRemoteFileName, withRemoteSession)
 import Simplex.Chat.Remote.Protocol (RemoteResponse (..), encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
 import Simplex.Chat.Remote.Types
+import Simplex.Chat.Terminal.Output (markChatItemRead, remoteReadCommand)
+import Simplex.Chat.Types (User (..))
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFileArgs (..))
 import Simplex.Messaging.Encoding (smpEncode)
@@ -39,6 +50,7 @@ import Simplex.Messaging.Transport (TSbChainKeys (..))
 import Simplex.Messaging.Transport.HTTP2 (HTTP2BodyChunk (..), getHTTP2Body)
 import Simplex.Messaging.Util
 import Simplex.RemoteControl.Types (RCCtrlAddress (..))
+import System.Environment (lookupEnv)
 import System.FilePath (takeFileName, (</>))
 import qualified System.Timeout as Timeout
 import Test.Hspec hiding (it)
@@ -69,6 +81,34 @@ remoteTests = describe "Remote" $ do
       result `shouldSatisfy` \case
         RRProtocolError (RPEInvalidBody _) -> True
         _ -> False
+    forM_ [EBDetached, EBOverflow] $ \reason ->
+      it ("rejects command and file work after " <> show reason <> " before transport shutdown") $ \_ -> do
+        events <- atomically $ newEventBuffer 1
+        executed <- newIORef False
+        atomically $ closeEventBuffer events reason
+        result <- withRemoteSession events $ writeIORef executed True
+        result `shouldSatisfy` \case
+          Left (RRProtocolError (RPEInvalidBody _)) -> True
+          _ -> False
+        readIORef executed `shouldReturn` False
+    it "does not serialize a long poll with command admission" $ \_ -> do
+      events <- atomically $ newEventBuffer 1
+      withAsync (handleRecv 5000000 events) $ \poller -> do
+        result <- Timeout.timeout 1000000 $ withRemoteSession events $ pure True
+        result `shouldSatisfy` \case
+          Just (Right True) -> True
+          _ -> False
+        atomically $ closeEventBuffer events EBDetached
+        result' <- Timeout.timeout 1000000 $ wait poller
+        result' `shouldSatisfy` \case
+          Just (RRProtocolError (RPEInvalidBody _)) -> True
+          _ -> False
+  describe "remote read routing" $
+    forM_ [ChatRef CTDirect 2 Nothing, ChatRef CTGroup 3 Nothing, ChatRef CTGroup 3 (Just $ GCSMemberSupport Nothing), ChatRef CTGroup 3 (Just $ GCSMemberSupport $ Just 4)] $ \ref ->
+      it ("preserves the chat and scope when encoding a read: " <> show ref) $ \_ ->
+        parseChatCommand (remoteReadCommand ref 7) `shouldSatisfy` \case
+          Right (APIChatItemsRead ref' ids) -> ref' == ref && ids == 7 :| []
+          _ -> False
   describe "/start remote host parser" $ do
     it "parses iface name with a space followed by port=" $ \_ ->
       parseChatCommand "/start remote host new addr=192.168.1.5 iface=\"Ethernet 2\" port=12345"
@@ -141,8 +181,16 @@ runRemoteTests = do
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
   it "sends messages" remoteMessageTest
-  it "serializes concurrent phone and desktop profile creation" concurrentOwnerCommandsTest
-  it "stops a session whose event reader overflows" remoteEventOverflowTest
+  describe "single owner concurrency" $ do
+    it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
+    it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
+    it "serializes concurrent phone and desktop profile creation" concurrentOwnerCommandsTest
+    it "stops a session whose event reader overflows" remoteEventOverflowTest
+    it "recovers an overflow with a new session and an authoritative snapshot" remoteEventRecoveryTest
+    it "keeps app-local events on the phone during a live remote session" remoteLocalEventsTest
+    it "revokes an explicitly disconnected session before unlinking and ignores stale cleanup" remoteUnlinkTest
+    it "revokes the hosted controller when the owner core stops" remoteOwnerStopTest
+    it "stops a viewer core with an active remote session without recursive cancellation" remoteViewerStopTest
   describe "remote files" $ do
     it "store/get/send/receive files" remoteStoreFileTest
     it "should send files from CLI without /store" remoteCLIFileTest
@@ -166,6 +214,7 @@ remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
   Timeout.timeout 5000000 (atomically $ readTVar session >>= check . isNothing)
     `shouldReturn` Just ()
   mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
 
 concurrentOwnerCommandsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 concurrentOwnerCommandsTest = testRemote $ \compress mobile desktop -> do
@@ -185,6 +234,208 @@ concurrentOwnerCommandsTest = testRemote $ \compress mobile desktop -> do
   length (filter created responses) `shouldBe` 1
   length (filter alreadyExists responses) `shouldBe` 1
   stopDesktop mobile desktop
+
+-- These exercise actual local dispatch and encrypted XRCP dispatch, rather than
+-- a simulated command gate. UI event fan-out is deliberately not enabled: the
+-- snapshots below demonstrate store consistency, not automatic model updates.
+concurrentOwnerMessagesTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+concurrentOwnerMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
+  startRemote compress mobile desktop
+  contactBob desktop bob
+  let local = ownerCommand mobile Controller.CSLocal
+      remote = ownerCommand desktop (Controller.CSRemoteHost 1)
+  results <- Timeout.timeout 10000000 $ concurrently
+    (local "@bob from phone")
+    (remote "@bob from desktop")
+  (phoneId, desktopId) <- case results of
+    Just (Right (Controller.CRNewChatItems _ [phoneItem]), Right (Controller.CRNewChatItems _ [desktopItem])) -> do
+      ownerItemText phoneItem `shouldBe` "from phone"
+      ownerItemText desktopItem `shouldBe` "from desktop"
+      pure (aChatItemId phoneItem, aChatItemId desktopItem)
+    _ -> fail $ "concurrent send failed or deadlocked: " <> show results
+  phoneId `shouldNotBe` desktopId
+  received <- replicateM 2 $ dropTime <$> getTermLine bob
+  sort received `shouldBe` ["alice> from desktop", "alice> from phone"]
+  (items, _, _) <- ownerSnapshot remote
+  map snd (filter (\(i, _) -> i `elem` [phoneId, desktopId]) items)
+    `shouldMatchList` ["from phone", "from desktop"]
+  ownerSnapshot local `shouldReturn` (items, 0, False)
+
+  -- Read state and manual unread state belong to the phone's store, regardless
+  -- of which caller executes the mutation. Neither response is an event today.
+  bob #> "@alice unread message"
+  desktop <# "bob> unread message"
+  (_, unread, _) <- ownerSnapshot local
+  unread `shouldBe` 1
+  remote "/_read chat @2" >>= expectOwnerOK
+  (_, readCount, _) <- ownerSnapshot local
+  readCount `shouldBe` 0
+  local "/_unread chat @2 on" >>= expectOwnerOK
+  (_, _, marked) <- ownerSnapshot remote
+  marked `shouldBe` True
+  remote "/_unread chat @2 off" >>= expectOwnerOK
+  ownerSnapshot local >>= \(_, _, marked') -> marked' `shouldBe` False
+  stopDesktop mobile desktop
+
+remoteReadOwnershipTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteReadOwnershipTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
+  connectUsers desktop bob
+  bob #> "@alice_desktop local unread"
+  desktop <# "bob> local unread"
+  startRemote compress mobile desktop
+  contactBob desktop bob
+  bob #> "@alice remote unread"
+  desktop <# "bob> remote unread"
+  let localDesktop = ownerCommand desktop Controller.CSLocal
+      phone = ownerCommand mobile Controller.CSLocal
+      remote = ownerCommand desktop (Controller.CSRemoteHost 1)
+  (_, localUnread, _) <- ownerSnapshot localDesktop
+  localUnread `shouldBe` 1
+  (_, phoneUnread, _) <- ownerSnapshot phone
+  phoneUnread `shouldBe` 1
+  remote "/_get chat @2 count=100" >>= \case
+    Right (Controller.CRApiChat user remoteChat _) ->
+      case find ((== "remote unread") . ownerItemText) $ aChatItems remoteChat of
+        Just item -> markChatItemRead (chatController desktop) (Just 1) user item
+        _ -> fail "missing remote item"
+    r -> fail $ "remote snapshot failed: " <> show r
+  (_, localUnread', _) <- ownerSnapshot localDesktop
+  localUnread' `shouldBe` 1
+  (_, phoneUnread', _) <- ownerSnapshot phone
+  phoneUnread' `shouldBe` 0
+  stopDesktop mobile desktop
+
+remoteEventRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteEventRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
+  startRemote compress mobile desktop
+  contactBob desktop bob
+  let cc = chatController mobile
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $
+    writeEventBuffer oldEvents $ Right $ Controller.CEvtCustomChatEvent Nothing "burst"
+  eventually 3 $ mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  bob #> "@alice while desktop was away"
+  mobile <# "bob> while desktop was away"
+  startRemoteStored compress mobile desktop
+  oldRequest <- withRemoteSession oldEvents $ pure ()
+  oldRequest `shouldSatisfy` \case
+    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    _ -> False
+  let local = ownerCommand mobile Controller.CSLocal
+      remote = ownerCommand desktop (Controller.CSRemoteHost 1)
+  snapshot@(items, unread, _) <- ownerSnapshot remote
+  map snd items `shouldContain` ["while desktop was away"]
+  unread `shouldBe` 1
+  ownerSnapshot local `shouldReturn` snapshot
+  -- A fresh stream must deliver new events as well as retain the missed data.
+  bob #> "@alice after recovery"
+  desktop <# "bob> after recovery"
+  stopDesktop mobile desktop
+
+ownerCommand :: TestCC -> Controller.CommandSource -> String -> IO (Either Controller.ChatError Controller.ChatResponse)
+ownerCommand cc source command = do
+  trace <- (== Just "1") <$> lookupEnv "SIMPLEX_OWNER_TEST_TRACE"
+  when trace $ putStrLn $ "owner command: " <> command
+  result <- Timeout.timeout 30000000 $ runReaderT (execChatCommand source (BC.pack command) 0) $ chatController cc
+  when trace $ putStrLn $ "owner response: " <> command
+  maybe (fail $ "owner command timed out: " <> command) pure result
+
+ownerSnapshot :: (String -> IO (Either Controller.ChatError Controller.ChatResponse)) -> IO ([(Int64, Text)], Int, Bool)
+ownerSnapshot command = command "/_get chat @2 count=100" >>= \case
+  Right (Controller.CRApiChat User {userId} ownerChat _) -> do
+    -- Paged chat responses deliberately use emptyChatStats. Unread counters
+    -- and the manually-unread flag come from the chat-list snapshot instead.
+    command ("/_get chats " <> show userId) >>= \case
+      Right (Controller.CRApiChats _ previews) -> case find isOwnerChat previews of
+        Just (AChat _ Chat {chatStats = ChatStats {unreadCount, unreadChat}}) ->
+          pure ([(aChatItemId item, ownerItemText item) | item <- aChatItems ownerChat], unreadCount, unreadChat)
+        _ -> fail "owner chat missing from chat list"
+      result -> fail $ "owner chat-list snapshot failed: " <> show result
+  result -> fail $ "owner snapshot failed: " <> show result
+  where
+    isOwnerChat (AChat _ Chat {chatInfo}) = chatInfoToRef chatInfo == Just (ChatRef CTDirect 2 Nothing)
+
+ownerItemText :: AChatItem -> Text
+ownerItemText (AChatItem _ _ _ ChatItem {meta = CIMeta {itemText}}) = itemText
+
+expectOwnerOK :: HasCallStack => Either Controller.ChatError Controller.ChatResponse -> IO ()
+expectOwnerOK result = result `shouldSatisfy` \case
+  Right Controller.CRCmdOk {} -> True
+  _ -> False
+
+remoteLocalEventsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteLocalEventsTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  let cc = chatController mobile
+  Just user <- readTVarIO $ Controller.currentUser cc
+  let credited = Controller.CEvtStorePurchaseCredited user "local-invoice"
+      refused = Controller.CEvtStorePurchaseRefused user "local-invoice" BIFServiceTimeout
+  Controller.allowRemoteEvent credited `shouldBe` False
+  Controller.allowRemoteEvent refused `shouldBe` False
+  Controller.allowRemoteEvent (Controller.CEvtBadgeChanged user Nothing) `shouldBe` True
+  runReaderT (Controller.toView' Controller.CEvtChatSuspended) cc
+  runReaderT (Controller.toView' credited) cc
+  runReaderT (Controller.toView' refused) cc
+  runReaderT (Controller.toView' $ Controller.CEvtCustomChatEvent Nothing "shared marker") cc
+  desktop <## "shared marker"
+  mobile <## "chat suspended"
+  mobile <## "store purchase credited: invoice local-invoice"
+  mobile <## ("store purchase refused: invoice local-invoice, " <> BC.unpack (strEncode BIFServiceTimeout))
+  stopDesktop mobile desktop
+
+remoteUnlinkTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteUnlinkTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  let cc = chatController mobile
+      local = ownerCommand mobile Controller.CSLocal
+  Just (sseq, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  -- A monitor left over from an earlier connection must not revoke this one.
+  result <- runReaderT (runExceptT $ cancelActiveRemoteCtrl $ Just (sseq - 1, Controller.RCSRDisconnected)) cc
+  result `shouldSatisfy` \case
+    Right () -> True
+    _ -> False
+  atomically (eventBufferClosed oldEvents) `shouldReturn` Nothing
+  local "/delete remote ctrl 1" >>= \r -> r `shouldSatisfy` \case
+    Left (Controller.ChatErrorRemoteCtrl Controller.RCEBusy) -> True
+    _ -> False
+  stopMobile mobile desktop
+  atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBDetached
+  -- Revocation also protects a command that would change the owning database.
+  usersBefore <- local "/users"
+  rejected <- withRemoteSession oldEvents $ ownerCommand mobile Controller.CSRemoteCtrl "/create user revoked_controller"
+  rejected `shouldSatisfy` \case
+    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    _ -> False
+  usersAfter <- local "/users"
+  show usersAfter `shouldBe` show usersBefore
+  local "/delete remote ctrl 1" >>= expectOwnerOK
+  local "/list remote ctrls" >>= \r -> r `shouldSatisfy` \case
+    Right (Controller.CRRemoteCtrlList []) -> True
+    _ -> False
+
+remoteOwnerStopTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteOwnerStopTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  let cc = chatController mobile
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  ownerCommand mobile Controller.CSLocal "/_stop" >>= \r -> r `shouldSatisfy` \case
+    Right Controller.CRChatStopped -> True
+    _ -> False
+  isNothing <$> readTVarIO (Controller.remoteCtrlSession cc) `shouldReturn` True
+  atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBDetached
+  eventually 3 $ desktop <## "remote host 1 stopped"
+
+remoteViewerStopTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remoteViewerStopTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  ownerCommand desktop Controller.CSLocal "/_stop" >>= \r -> r `shouldSatisfy` \case
+    Right Controller.CRChatStopped -> True
+    _ -> False
+  let cc = chatController desktop
+  M.null <$> readTVarIO (Controller.remoteHostSessions cc) `shouldReturn` True
+  readTVarIO (Controller.currentRemoteHost cc) `shouldReturn` Nothing
+  eventually 3 $ mobile <## "remote controller stopped"
 
 remoteHandshakeTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
 remoteHandshakeTest viaDesktop = testRemote $ \compress mobile desktop -> do
@@ -663,12 +914,24 @@ multipleProfilesTest = testRemote4 $ \compress mobile desktop bob cath -> do
 -- * Utils
 
 testRemote :: HasCallStack => (String -> TestCC -> TestCC -> IO()) -> ((Bool, Bool), TestParams) -> IO ()
-testRemote test ((mobileCompression, desktopCompression), ps) =
-  withNewTestChatCfg ps testCfg {remoteCompression = mobileCompression} "mobile" aliceProfile $ \mobile ->
-    withNewTestChatCfg ps testCfg {remoteCompression = desktopCompression} "desktop" aliceDesktopProfile $ \desktop ->
+testRemote = testRemoteWithOpts testOpts
+
+testRemoteWithOpts :: HasCallStack => ChatOpts -> (String -> TestCC -> TestCC -> IO ()) -> ((Bool, Bool), TestParams) -> IO ()
+testRemoteWithOpts opts test ((mobileCompression, desktopCompression), ps) = do
+  trace <- (== Just "1") <$> lookupEnv "SIMPLEX_OWNER_TEST_TRACE"
+  let ps' = if trace then ps {DBU.printOutput = True} else ps
+  withNewTestChatCfgOpts ps' testCfg {remoteCompression = mobileCompression} opts "mobile" aliceProfile $ \mobile ->
+    withNewTestChatCfgOpts ps' testCfg {remoteCompression = desktopCompression} opts "desktop" aliceDesktopProfile $ \desktop ->
       let compress = " (" <> (if mobileCompression && desktopCompression then "with" else "no") <> " compression)"
        in test compress mobile desktop
-  
+
+-- Keep terminal rendering from marking incoming messages read before the test
+-- can check the authoritative read counters and explicitly issue the read.
+testRemote3ManualRead :: HasCallStack => (String -> TestCC -> TestCC -> TestCC -> IO ()) -> ((Bool, Bool), TestParams) -> IO ()
+testRemote3ManualRead test ps =
+  testRemoteWithOpts testOpts {markRead = False}
+    (\compress mobile desktop -> withNewTestChat (snd ps) "bob" bobProfile $ test compress mobile desktop)
+    ps
 
 testRemote3 :: HasCallStack => (String -> TestCC -> TestCC -> TestCC -> IO()) -> ((Bool, Bool), TestParams) -> IO ()
 testRemote3 test ps =

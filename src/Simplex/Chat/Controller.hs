@@ -1121,6 +1121,10 @@ data DeletedRcvQueue = DeletedRcvQueue
 allowRemoteEvent :: ChatEvent -> Bool
 allowRemoteEvent = \case
   CEvtChatSuspended -> False
+  -- Only the app that owns the platform-store transaction can finish it.
+  -- Badge state still travels to the remote UI through CEvtBadgeChanged.
+  CEvtStorePurchaseCredited {} -> False
+  CEvtStorePurchaseRefused {} -> False
   CEvtRemoteHostSessionCode {} -> False
   CEvtNewRemoteHost _ -> False
   CEvtRemoteHostConnected {} -> False

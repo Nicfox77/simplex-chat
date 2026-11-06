@@ -385,9 +385,16 @@ restoreCalls = do
   atomically $ writeTVar calls callsMap
 
 stopChatController :: ChatController -> IO ()
-stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, remoteHostSessions, remoteCtrlSession, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
-  readTVarIO remoteHostSessions >>= mapM_ (cancelRemoteHost False . snd)
-  atomically (stateTVar remoteCtrlSession (,Nothing)) >>= mapM_ (cancelRemoteCtrl False . snd)
+stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, currentRemoteHost, remoteHostSessions, remoteCtrlSession, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
+  (hosts, ctrl) <- atomically $ do
+    hosts <- swapTVar remoteHostSessions M.empty
+    writeTVar currentRemoteHost Nothing
+    ctrl <- takeRemoteCtrlSession remoteCtrlSession Nothing
+    pure (hosts, ctrl)
+  -- Unpublish before cancellation: closing HTTP2 invokes the disconnect
+  -- callback, which must not recursively cancel the same published session.
+  mapM_ (cancelRemoteCtrl False) ctrl
+  mapM_ (cancelRemoteHost False . snd) hosts
   disconnectAgentClient smpAgent
   readTVarIO s >>= mapM_ (\(a1, a2) -> uninterruptibleCancel a1 >> mapM_ uninterruptibleCancel a2)
   cancelAsync cleanupManagerAsync
