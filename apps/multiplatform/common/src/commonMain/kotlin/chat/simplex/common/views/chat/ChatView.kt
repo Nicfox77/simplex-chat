@@ -1248,7 +1248,7 @@ fun BoxScope.ChatInfoToolbar(
   val activeCall by remember { chatModel.activeCall }
 
   val showContentFilterButton = availableContent.value.isNotEmpty()
-  val canStartCall = chatInfo is ChatInfo.Direct &&
+  val canStartCall = !chatModel.connectedToRemote() && chatInfo is ChatInfo.Direct &&
     chatInfo.contact.mergedPreferences.calls.enabled.forUser &&
     chatInfo.contact.ready &&
     chatInfo.contact.active &&

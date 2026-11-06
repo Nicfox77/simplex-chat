@@ -44,14 +44,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ConnectDesktopView(close: () -> Unit) {
   val deviceName = remember { controller.appPrefs.deviceNameForRemoteAccess.state }
-  val closeWithAlert = {
-    if (chatModel.remoteCtrlSession.value?.active != true) {
-      close()
-    } else {
-      showDisconnectDesktopAlert(close)
-    }
-  }
-  ModalView(close = closeWithAlert, cardScreen = true) {
+  ModalView(close = close, cardScreen = true) {
     ConnectDesktopLayout(
       deviceName = deviceName.value!!,
       close
@@ -63,7 +56,7 @@ fun ConnectDesktopView(close: () -> Unit) {
       if (!ntfModeService) platform.androidServiceStart()
     }
     onDispose {
-      if (!ntfModeService) platform.androidServiceSafeStop()
+      if (!ntfModeService && chatModel.remoteCtrlSession.value == null) platform.androidServiceSafeStop()
     }
   }
 }
@@ -110,14 +103,6 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
     // Opening the session controls must not tear down an existing connection.
     if (chatModel.remoteCtrlSession.value == null && useMulticast) {
       findKnownDesktop(showConnectScreen)
-    }
-  }
-  DisposableEffect(Unit) {
-    onDispose {
-      if (chatModel.remoteCtrlSession.value != null) {
-        showConnectScreen.value = false
-        disconnectDesktop()
-      }
     }
   }
 }
@@ -549,11 +534,8 @@ private fun useMulticast(remoteCtrls: List<RemoteCtrlInfo>): Boolean =
 private fun disconnectDesktop(close: (() -> Unit)? = null) {
   withBGApi {
     controller.stopRemoteCtrl()
-    if (chatModel.remoteCtrlSession.value?.sessionState is UIRemoteCtrlSessionState.Connected) {
-      switchToLocalSession()
-    } else {
-      chatModel.remoteCtrlSession.value = null
-    }
+    chatModel.remoteCtrlSession.value = null
+    if (controller.appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
     close?.invoke()
   }
 }
@@ -573,16 +555,6 @@ private fun showUnlinkDesktopAlert(remoteCtrls: SnapshotStateList<RemoteCtrlInfo
     onConfirm = {
       unlinkDesktop(remoteCtrls, rc)
     }
-  )
-}
-
-private fun showDisconnectDesktopAlert(close: (() -> Unit)?) {
-  AlertManager.shared.showAlertDialog(
-    title = generalGetString(MR.strings.disconnect_desktop_question),
-    text = generalGetString(MR.strings.only_one_device_can_work_at_the_same_time),
-    confirmText = generalGetString(MR.strings.disconnect_remote_host),
-    destructive = true,
-    onConfirm = { disconnectDesktop(close) }
   )
 }
 
