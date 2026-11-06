@@ -2965,7 +2965,7 @@ object ChatController {
   private var uiOwnerRecoveryPending = false
 
   internal fun requiresUISnapshot(event: CR?): Boolean = when (event) {
-    null, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
+    null, is CR.UIStateChanged, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
     is CR.NewRemoteHost, is CR.RemoteCtrlStopped, is CR.RemoteCtrlFound,
     is CR.RemoteCtrlSessionCode, is CR.RemoteCtrlConnected, is CR.CallInvitation,
     is CR.CallOffer, is CR.CallAnswer, is CR.CallExtraInfo, is CR.CallEnded,

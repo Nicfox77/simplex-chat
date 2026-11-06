@@ -104,6 +104,7 @@ class SimultaneousUIStateTest {
   @Test
   fun recoveryBlocksStateDeltasButAllowsSessionAndStoreCallbacks() {
     assertTrue(ChatController.requiresUISnapshot(CR.NewChatItems(UserRef(1), emptyList())))
+    assertFalse(ChatController.requiresUISnapshot(CR.UIStateChanged(1, 10, "overflow")))
     assertFalse(ChatController.requiresUISnapshot(CR.RemoteHostSessionCode(null, "code")))
     assertFalse(ChatController.requiresUISnapshot(CR.StorePurchaseCredited(UserRef(1), "invoice")))
     assertFalse(ChatController.requiresUISnapshot(null)) // errors still reach the handler
