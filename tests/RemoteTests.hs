@@ -32,7 +32,7 @@ import Simplex.Chat.Controller (ChatCommand (..), ChatConfig (..), versionNumber
 import Simplex.Chat.Files (safeFileNameStr)
 import Simplex.Chat.Library.Commands (execChatCommand, parseChatCommand)
 import qualified Simplex.Chat.Controller as Controller
-import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, eventBufferClosed, newEventBuffer, writeEventBuffer)
+import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, eventBufferClosed, newEventBuffer, readEventBuffer, writeEventBuffer)
 import Simplex.Chat.Mobile.File
 import Simplex.Chat.Messages (AChat (..), AChatItem (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), CIMeta (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
 import Simplex.Chat.Options (ChatOpts (..))
@@ -181,6 +181,9 @@ runRemoteTests = do
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
   it "sends messages" remoteMessageTest
+  describe "simultaneous UI" $ do
+    it "keeps both receivers live and shares sends, edits, deletes and read state through snapshots" simultaneousMessagesTest
+    it "does not block the owner when a local subscriber overflows" simultaneousLocalOverflowTest
   describe "single owner concurrency" $ do
     it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
     it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
@@ -215,6 +218,107 @@ remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
     `shouldReturn` Just ()
   mobile <## "remote controller stopped"
   eventually 3 $ desktop <## "remote host 1 stopped"
+
+-- Exercises protocol-1 negotiation and the frontend snapshot contract over
+-- encrypted XRCP, with both terminal event subscribers running throughout.
+simultaneousMessagesTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+simultaneousMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
+  let local = ownerCommand mobile Controller.CSLocal
+      remote = ownerCommand desktop (Controller.CSRemoteHost 1)
+  local "/_ui enable" >>= expectOwnerOK
+  ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  startRemote compress mobile desktop
+  contactBob desktop bob
+  mobile <## "bob (Bob): contact is connected"
+  (phoneSend, desktopSend) <- concurrently (local "@bob phone simultaneous") (remote "@bob desktop simultaneous")
+  phoneId <- sentId phoneSend
+  desktopId <- sentId desktopSend
+  replicateM_ 2 $ getTermLine bob
+  (_, items1, _, _) <- uiSnapshot remote
+  map snd items1 `shouldContain` ["phone simultaneous", "desktop simultaneous"]
+  (_, localItems, localUnread, localMarked) <- uiSnapshot local
+  (localItems, localUnread, localMarked) `shouldBe` (items1, 0, False)
+  local ("/_update item @2 " <> show phoneId <> " text edited phone") >>= \r -> r `shouldSatisfy` \case
+    Right Controller.CRChatItemUpdated {} -> True
+    _ -> False
+  bob <# "alice> [edited] edited phone"
+  (_, edited, _, _) <- uiSnapshot remote
+  lookup phoneId edited `shouldBe` Just "edited phone"
+  remote ("/_delete item @2 " <> show desktopId <> " internal") >>= \r -> r `shouldSatisfy` \case
+    Right Controller.CRChatItemsDeleted {} -> True
+    _ -> False
+  (_, deleted, _, _) <- uiSnapshot local
+  lookup desktopId deleted `shouldBe` Nothing
+  bob #> "@alice both readers"
+  desktop <# "bob> both readers"
+  mobile <# "bob> both readers"
+  (_, _, unread, _) <- uiSnapshot remote
+  unread `shouldBe` 1
+  remote "/_read chat @2" >>= expectOwnerOK
+  (_, _, readCount, _) <- uiSnapshot local
+  readCount `shouldBe` 0
+  local "/_unread chat @2 on" >>= expectOwnerOK
+  (_, _, _, marked) <- uiSnapshot remote
+  marked `shouldBe` True
+  forM_ [local, remote] $ \command ->
+    command "/create user forbidden_while_linked" >>= \r -> r `shouldSatisfy` \case
+      Left (Controller.ChatErrorRemoteCtrl Controller.RCEBusy) -> True
+      _ -> False
+  local "/delete remote ctrl 1" >>= expectOwnerOK
+  mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  bob #> "@alice phone continues"
+  mobile <# "bob> phone continues"
+  where
+    sentId (Right (Controller.CRNewChatItems _ [item])) = pure $ aChatItemId item
+    sentId r = fail $ "send failed: " <> show r
+
+uiSnapshot :: (String -> IO (Either Controller.ChatError Controller.ChatResponse)) -> IO (Int64, [(Int64, Text)], Int, Bool)
+uiSnapshot command = command "/_ui snapshot @2 count=100" >>= \case
+  Right (Controller.CRUiState 1 rev _ _ previews (Just ownerChat) _) -> case find isOwnerChat previews of
+    Just (AChat _ Chat {chatStats = ChatStats {unreadCount, unreadChat}}) ->
+      pure (rev, [(aChatItemId item, ownerItemText item) | item <- aChatItems ownerChat], unreadCount, unreadChat)
+    _ -> fail "snapshot lacks chat preview"
+  r -> fail $ "invalid UI snapshot: " <> show r
+  where
+    isOwnerChat (AChat _ Chat {chatInfo}) = chatInfoToRef chatInfo == Just (ChatRef CTDirect 2 Nothing)
+
+-- Replace only the test frontend queues. The real cores and transports stay
+-- alive; the tested routing function writes to independent bounded subscribers.
+simultaneousLocalOverflowTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+simultaneousLocalOverflowTest = testRemote $ \compress mobile desktop -> do
+  ownerCommand mobile Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  startRemote compress mobile desktop
+  let owner = chatController mobile
+  Just (seqNo, session@Controller.RCSessionConnected {}) <- readTVarIO $ Controller.remoteCtrlSession owner
+  (localQueue, remoteQueue, sessionVar) <- atomically $ do
+    l <- newTBQueue 1
+    r <- newEventBuffer 8
+    v <- newTVar $ Just (seqNo, session {Controller.remoteOutputQ = r})
+    pure (l, r, v)
+  let cc = owner {Controller.outputQ = localQueue, Controller.remoteCtrlSession = sessionVar}
+      emit txt = runReaderT (Controller.toView' $ Controller.CEvtCustomChatEvent Nothing txt) cc
+  Timeout.timeout 1000000 (emit "first" >> emit "second") `shouldReturn` Just ()
+  atomically (readTBQueue localQueue) >>= \r -> r `shouldSatisfy` \case
+    (_, Right (Controller.CEvtUiStateChanged 1 _ "overflow")) -> True
+    _ -> False
+  forM_ ["first", "second"] $ \txt ->
+    atomically (readEventBuffer remoteQueue) >>= \r -> r `shouldSatisfy` \case
+      Right (Right (Controller.CEvtCustomChatEvent Nothing txt')) -> txt' == txt
+      _ -> False
+  runReaderT (Controller.invalidateUI Controller.CSRemoteCtrl) cc
+  atomically (readTBQueue localQueue) >>= \r -> r `shouldSatisfy` \case
+    (_, Right (Controller.CEvtUiStateChanged 1 _ "remote")) -> True
+    _ -> False
+  atomically (readEventBuffer remoteQueue) >>= \r -> r `shouldSatisfy` \case
+    Right (Right (Controller.CEvtUiStateChanged 1 _ "remote")) -> True
+    _ -> False
+  -- The owner can answer snapshots even if its UI never resumes.
+  ownerCommand mobile Controller.CSLocal "/_ui snapshot count=100" >>= \r -> r `shouldSatisfy` \case
+    Right (Controller.CRUiState 1 _ _ _ _ Nothing _) -> True
+    _ -> False
+  stopDesktop mobile desktop
 
 concurrentOwnerCommandsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 concurrentOwnerCommandsTest = testRemote $ \compress mobile desktop -> do

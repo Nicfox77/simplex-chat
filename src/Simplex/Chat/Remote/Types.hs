@@ -223,14 +223,16 @@ data RemoteFile = RemoteFile
   deriving (Show)
 
 data CtrlAppInfo = CtrlAppInfo
-  { appVersionRange :: AppVersionRange,
+  { uiProtocol :: Maybe Int,
+    appVersionRange :: AppVersionRange,
     deviceName :: Text,
     compression :: BoolDef
   }
   deriving (Show)
 
 data HostAppInfo = HostAppInfo
-  { appVersion :: AppVersion,
+  { uiProtocol :: Maybe Int,
+    appVersion :: AppVersion,
     deviceName :: Text,
     encoding :: PlatformEncoding,
     encryptFiles :: Bool, -- if the host encrypts files in app storage

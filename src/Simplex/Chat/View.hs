@@ -119,6 +119,7 @@ chatResponseToView hu cfg@ChatConfig {logLevel, showReactions, showFullLinks, te
   CRActiveUser User {profile = p@LocalProfile {localBadge}, uiThemes} -> viewUserProfile localBadge (fromLocalProfile p) <> viewUITheme uiThemes
   CRUsersList users -> viewUsersList users
   CRChatStarted -> ["chat started"]
+  CRUiState {} -> []
   CRChatRunning -> ["chat is running"]
   CRChatStopped -> ["chat stopped"]
   CRConnectionsDiff showIds userDiff connDiff
@@ -439,6 +440,7 @@ contactList cs = T.unpack . T.intercalate ", " $ map (\ContactRef {localDisplayN
 
 chatEventToView :: (Maybe RemoteHostId, Maybe User) -> ChatConfig -> Bool -> CurrentTime -> TimeZone -> Maybe RemoteHostId -> ChatEvent -> [StyledString]
 chatEventToView hu ChatConfig {logLevel, showReactions, showReceipts, testView} liveItems ts tz outputRH = \case
+  CEvtUiStateChanged {} -> []
   CEvtChatSuspended -> ["chat suspended"]
   CEvtContactSwitch u ct progress -> ttyUser u $ viewContactSwitch ct progress
   CEvtGroupMemberSwitch u g m progress -> ttyUser u $ viewGroupMemberSwitch g m progress

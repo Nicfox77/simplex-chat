@@ -183,6 +183,8 @@ newChatController
         eventSeq <- newTVarIO 0
         inputQ <- newTBQueueIO tbqSize
         outputQ <- newTBQueueIO tbqSize
+        simultaneousUI <- newTVarIO False
+        uiRevision <- newTVarIO 0
         profileCreationGate <- liftIO newCommandGate
         subscriptionMode <- newTVarIO SMSubscribe
         processServiceRequests <- newTVarIO False
@@ -233,6 +235,8 @@ newChatController
               eventSeq,
               inputQ,
               outputQ,
+              simultaneousUI,
+              uiRevision,
               profileCreationGate,
               subscriptionMode,
               processServiceRequests,

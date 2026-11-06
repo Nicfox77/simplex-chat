@@ -167,7 +167,8 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
     mkCtrlAppInfo = do
       deviceName <- chatReadVar localDeviceName
       useCompression <- asks $ remoteCompression . config
-      pure CtrlAppInfo {appVersionRange = ctrlAppVersionRange, deviceName, compression = BoolDef useCompression}
+      uiProtocol <- uiProtocolVersion
+      pure CtrlAppInfo {uiProtocol, appVersionRange = ctrlAppVersionRange, deviceName, compression = BoolDef useCompression}
     parseHostAppInfo :: RCHostHello -> ExceptT RemoteHostError IO HostAppInfo
     parseHostAppInfo RCHostHello {app = hostAppInfo} = do
       hostInfo@HostAppInfo {appVersion, encoding} <-
@@ -198,6 +199,9 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
       (RCHostSession {sessionKeys}, rhHello, pairing') <- timeoutThrow (ChatErrorRemoteHost rhKey RHETimeout) 60000000 $ takeRCStep vars'
       hostInfo@HostAppInfo {deviceName = hostDeviceName} <-
         liftError (ChatErrorRemoteHost rhKey) $ parseHostAppInfo rhHello
+      expectedUI <- uiProtocolVersion
+      let HostAppInfo {uiProtocol} = hostInfo
+      unless (uiProtocol == expectedUI) $ throwError $ ChatErrorRemoteHost rhKey $ RHEProtocolError $ RPEInvalidBody "simultaneous UI protocol mismatch; update both devices"
       withRemoteHostSession rhKey sseq $ \case
         RHSessionPendingConfirmation _ tls' rhs' -> Right ((), RHSessionConfirmed tls' rhs')
         _ -> Left $ ChatErrorRemoteHost rhKey RHEBadState
@@ -236,14 +240,14 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
       cancelRemoteHostSession (Just (sseq, RHSRDisconnected)) rhKey
     pollEvents :: RemoteHostId -> RemoteHostClient -> CM ()
     pollEvents rhId rhClient = do
-      oq <- asks outputQ
+      cc <- ask
       forever $
-        handlePollError oq $ do
+        handlePollError cc $ do
           r_ <- liftRH rhId $ remoteRecv rhClient 10000000
-          forM_ r_ $ \r -> atomically $ writeTBQueue oq (Just rhId, r)
+          forM_ r_ $ \r -> atomically $ writeUIOutput cc (Just rhId, r)
       where
-        handlePollError oq a = a `catchAllErrors` \e ->
-          atomically $ writeTBQueue oq (Just rhId, Left e)
+        handlePollError cc a = a `catchAllErrors` \e ->
+          atomically $ writeUIOutput cc (Just rhId, Left e)
     httpError :: RemoteHostId -> HTTP2ClientError -> ChatError
     httpError rhId = ChatErrorRemoteHost (RHId rhId) . RHEProtocolError . RPEHTTP2 . tshow
 
@@ -464,6 +468,9 @@ startRemoteCtrlSession = do
 connectRemoteCtrl :: RCVerifiedInvitation -> SessionSeq -> CM (Maybe RemoteCtrlInfo, CtrlAppInfo)
 connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) sseq = handleCtrlError sseq RCSRConnectionFailed "connectRemoteCtrl" $ do
   ctrlInfo <- parseCtrlAppInfo app
+  expectedUI <- uiProtocolVersion
+  let CtrlAppInfo {uiProtocol} = ctrlInfo
+  unless (uiProtocol == expectedUI) $ throwError $ ChatErrorRemoteCtrl $ RCEProtocolError $ RPEInvalidBody "simultaneous UI protocol mismatch; update both devices"
   v <- checkAppVersion ctrlInfo
   rc_ <- withStore' $ \db -> getRemoteCtrlByFingerprint db ca
   mapM_ (validateRemoteCtrl inv) rc_
@@ -500,7 +507,13 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
       hostDeviceName <- chatReadVar localDeviceName
       encryptFiles <- chatReadVar encryptLocalFiles
       useCompression <- asks $ remoteCompression . config
-      pure HostAppInfo {appVersion, deviceName = hostDeviceName, encoding = localEncoding, encryptFiles, compression = BoolDef useCompression}
+      uiProtocol <- uiProtocolVersion
+      pure HostAppInfo {uiProtocol, appVersion, deviceName = hostDeviceName, encoding = localEncoding, encryptFiles, compression = BoolDef useCompression}
+
+uiProtocolVersion :: CM (Maybe Int)
+uiProtocolVersion = do
+  enabled <- chatReadVar simultaneousUI
+  pure $ if enabled then Just 1 else Nothing
 
 parseCtrlAppInfo :: JT.Value -> CM CtrlAppInfo
 parseCtrlAppInfo ctrlAppInfo = do
@@ -755,7 +768,19 @@ cancelRemoteCtrl handlingError = \case
 
 deleteRemoteCtrl :: RemoteCtrlId -> CM ()
 deleteRemoteCtrl rcId = do
-  checkNoRemoteCtrlSession
+  enabled <- chatReadVar simultaneousUI
+  if enabled
+    then do
+      session <- snd <$$> chatReadVar remoteCtrlSession
+      let matches = case session of
+            Just RCSessionConnected {remoteCtrlId} -> remoteCtrlId == rcId
+            Just RCSessionPendingConfirmation {remoteCtrlId_} -> remoteCtrlId_ == Just rcId
+            Just RCSessionConnecting {remoteCtrlId_} -> remoteCtrlId_ == Just rcId
+            _ -> False
+      when matches $ do
+        stopRemoteCtrl
+        forM_ session $ \s -> toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState s, rcStopReason = RCSRDisconnected}
+    else checkNoRemoteCtrlSession
   -- TODO check it exists
   withStore' (`deleteRemoteCtrlRecord` rcId)
 
