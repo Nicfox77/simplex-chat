@@ -36,7 +36,7 @@ import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuf
 import Simplex.Chat.Mobile.File
 import Simplex.Chat.Messages (AChat (..), AChatItem (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), CIMeta (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
 import Simplex.Chat.Options (ChatOpts (..))
-import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, validRemoteFileName, withRemoteSession)
+import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, validRemoteFileName, withRemoteCommandLease, withRemoteSession)
 import Simplex.Chat.Remote.Protocol (RemoteResponse (..), encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
 import Simplex.Chat.Remote.Types
 import Simplex.Chat.Terminal.Output (markChatItemRead, remoteReadCommand)
@@ -185,6 +185,7 @@ runRemoteTests = do
     it "keeps both receivers live and shares sends, edits, deletes and read state through snapshots" simultaneousMessagesTest
     it "does not block the owner when a local subscriber overflows" simultaneousLocalOverflowTest
     it "resnapshots a fresh protocol-1 session after overflow while the phone keeps receiving" simultaneousRecoveryTest
+    it "drains admitted commands before selecting another profile after unlink" simultaneousProfileLeaseTest
   describe "single owner concurrency" $ do
     it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
     it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
@@ -283,6 +284,50 @@ uiSnapshot command = command "/_ui snapshot @2 count=100" >>= \case
   r -> fail $ "invalid UI snapshot: " <> show r
   where
     isOwnerChat (AChat _ Chat {chatInfo}) = chatInfoToRef chatInfo == Just (ChatRef CTDirect 2 Nothing)
+
+simultaneousProfileLeaseTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+simultaneousProfileLeaseTest = testRemote $ \compress mobile desktop -> do
+  let local = ownerCommand mobile Controller.CSLocal
+      cc = chatController mobile
+  local "/_ui enable" >>= expectOwnerOK
+  ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
+  startRemote compress mobile desktop
+  Just User {userId = originalUserId} <- readTVarIO $ Controller.currentUser cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  entered <- newEmptyMVar
+  release <- newEmptyMVar
+  let admitted = runReaderT (withRemoteCommandLease events $ do
+        liftIO $ putMVar entered () >> takeMVar release
+        Controller.chatReadVar' Controller.currentUser) cc
+  withAsync admitted $ \request -> do
+    takeMVar entered
+    local "/delete remote ctrl 1" >>= expectOwnerOK
+    mobile <## "remote controller stopped"
+    eventually 3 $ desktop <## "remote host 1 stopped"
+    withAsync (local "/create user after_unlink") $ \selection -> do
+      Timeout.timeout 50000 (wait selection) >>= (`shouldSatisfy` isNothing)
+      putMVar release ()
+      wait request >>= \r -> r `shouldSatisfy` \case
+        Right (Just User {userId = ownerId}) -> ownerId == originalUserId
+        _ -> False
+      wait selection >>= \r -> r `shouldSatisfy` \case
+        Right Controller.CRActiveUser {} -> True
+        _ -> False
+  readTVarIO (Controller.remoteCommandLeases cc) `shouldReturn` 0
+  runReaderT (withRemoteCommandLease events $ pure ()) cc >>= \r -> r `shouldSatisfy` \case
+    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    _ -> False
+  fresh <- atomically $ newEventBuffer 1
+  failed <- tryAny $ runReaderT (withRemoteCommandLease fresh $ liftIO (throwIO (userError "leased command failed") :: IO ())) cc
+  failed `shouldSatisfy` either (const True) (const False)
+  readTVarIO (Controller.remoteCommandLeases cc) `shouldReturn` 0
+  enteredAgain <- newEmptyMVar
+  never <- newEmptyMVar
+  withAsync (runReaderT (withRemoteCommandLease fresh $ liftIO $ putMVar enteredAgain () >> takeMVar never) cc) $ \request -> do
+    takeMVar enteredAgain
+    readTVarIO (Controller.remoteCommandLeases cc) `shouldReturn` 1
+    cancel request
+  readTVarIO (Controller.remoteCommandLeases cc) `shouldReturn` 0
 
 simultaneousRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 simultaneousRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -> do

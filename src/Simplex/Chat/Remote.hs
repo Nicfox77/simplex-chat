@@ -540,7 +540,9 @@ handleRemoteCommand execCC encryption remoteOutputQ HTTP2Request {request, reqBo
     replyError = reply . RRChatResponse . RRError
     processCommand :: User -> C.SbKeyNonce -> GetChunk -> RemoteCommand -> CM ()
     processCommand user rfKN getNext = \case
-      RCSend {command, retryNumber} -> lift $ handleSend execCC command retryNumber >>= reply
+      RCSend {command, retryNumber} -> lift $ do
+        response <- withRemoteCommandLease remoteOutputQ $ handleSend execCC command retryNumber
+        either reply reply response
       RCRecv {wait = time} -> lift $ liftIO (handleRecv time remoteOutputQ) >>= reply
       RCStoreFile {fileName, fileSize, fileDigest} -> lift $ handleStoreFile rfKN fileName fileSize fileDigest getNext >>= reply
       RCGetFile {file} -> handleGetFile user file replyWith
@@ -598,6 +600,20 @@ withRemoteSession events action = do
   case closed of
     Just _ -> pure $ Left remoteSessionClosed
     Nothing -> Right <$> action
+
+-- A shared profile lease, not a serialization gate: any number of admitted
+-- commands run concurrently. Selection after unlink waits for these to drain.
+-- Admission and increment share one STM transaction with the revocation token;
+-- bracket releases the count on errors, cancellation and reply preparation.
+withRemoteCommandLease :: EventBuffer a -> CM' b -> CM' (Either RemoteResponse b)
+withRemoteCommandLease events action = do
+  leases <- asks remoteCommandLeases
+  let acquire = atomically $ eventBufferClosed events >>= \case
+        Just _ -> pure False
+        Nothing -> modifyTVar' leases (+ 1) $> True
+      release admitted = when admitted $ atomically $ modifyTVar' leases (subtract 1)
+  bracket acquire release $ \admitted ->
+    if admitted then Right <$> action else pure $ Left remoteSessionClosed
 
 remoteSessionClosed :: RemoteResponse
 remoteSessionClosed = RRProtocolError $ RPEInvalidBody "event stream closed; a new session and snapshot are required"

@@ -321,6 +321,7 @@ data ChatController = ChatController
     outputQ :: TBQueue (Maybe RemoteHostId, Either ChatError ChatEvent),
     simultaneousUI :: TVar Bool,
     uiRevision :: TVar Int64,
+    remoteCommandLeases :: TVar Int,
     profileCreationGate :: CommandGate, -- protect name check + agent/store allocation
     subscriptionMode :: TVar SubscriptionMode,
     processServiceRequests :: TVar Bool,

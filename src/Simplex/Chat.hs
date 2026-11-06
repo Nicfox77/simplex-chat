@@ -185,6 +185,7 @@ newChatController
         outputQ <- newTBQueueIO tbqSize
         simultaneousUI <- newTVarIO False
         uiRevision <- newTVarIO 0
+        remoteCommandLeases <- newTVarIO 0
         profileCreationGate <- liftIO newCommandGate
         subscriptionMode <- newTVarIO SMSubscribe
         processServiceRequests <- newTVarIO False
@@ -237,6 +238,7 @@ newChatController
               outputQ,
               simultaneousUI,
               uiRevision,
+              remoteCommandLeases,
               profileCreationGate,
               subscriptionMode,
               processServiceRequests,

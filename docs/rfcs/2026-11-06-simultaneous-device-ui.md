@@ -57,6 +57,12 @@ Profile identity is frozen from hosted pairing admission through disconnect:
 creation, selection and deletion return `remoteCtrl busy` while linked. A narrow
 profile/pairing gate makes the admission check safe against profile selection.
 Ordinary commands, snapshots, file requests and long polling do not acquire it.
+Authenticated remote commands hold concurrent counted leases on the profile.
+After unlink, a profile change waits for already-admitted commands to finish or
+cancel; it cannot select a new implicit user underneath them. Lease admission
+checks revocation atomically, and bracketed cleanup releases leases on failures
+and cancellation. Remote identity mutations are rejected before taking the
+profile gate, avoiding a gate/lease wait cycle.
 Disconnect first to switch profiles. This conservative restriction prevents
 implicit-user commands or stale file requests from operating under a different
 profile. Existing per-chat/entity/store locking remains in use.
@@ -86,8 +92,8 @@ profile. Existing per-chat/entity/store locking remains in use.
   the in-process session; pair again after restarting.
 - Unlinking the active controller revokes its queue/admission token before
   transport cleanup and deletes its pairing. The phone continues receiving.
-  Already admitted commands may have committed before revocation; this is not
-  transaction rollback. Crypto/session keys and request authentication retain
+  Already admitted commands can finish during revocation under their original
+  profile; this is not transaction rollback. Crypto/session keys and request authentication retain
   the existing XRCP implementation.
 
 ## Validation and remaining physical checks
@@ -95,15 +101,16 @@ profile. Existing per-chat/entity/store locking remains in use.
 Validated locally on 2026-11-06:
 
 - The complete Haskell library compiles with GHC 9.6.6.
-- The remote suite passed 41 active examples, zero failures, excluding multicast
-  discovery on this container. There were 66 pending examples from the three
+- The remote suite passed 43 active examples, zero failures, excluding multicast
+  discovery on this container. There were 72 pending examples from the three
   upstream-disabled compression variants. These include real encrypted XRCP
   uploads/downloads, concurrent sends/read ownership and session shutdown.
-- Three protocol-1 simultaneous cases now pass: both event receivers active
+- Four protocol-1 simultaneous cases now pass: both event receivers active
   during sends, edits/deletes and reads/manual unread; a paused local subscriber
   overflowing without blocking remote delivery; and remote overflow followed by
-  a new session/snapshot while the phone keeps receiving. The third case was
-  added after the full remote run above and passed in a focused rerun.
+  a new session/snapshot while the phone keeps receiving; and profile selection after unlink waiting
+  for admitted commands, with exception/cancellation cleanup. All four ran in
+  the final full remote suite above.
 - Common/desktop Kotlin compilation and 259 tests passed before the last
   reconciliation refinements. The snapshot tests cover item/counter idempotence,
   edits/deletes/reads and wire decoding. Additional revision/generation and

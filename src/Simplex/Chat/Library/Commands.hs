@@ -19,7 +19,7 @@
 module Simplex.Chat.Library.Commands where
 
 import Control.Applicative (optional, (<|>))
-import Control.Concurrent.STM (retry)
+import Control.Concurrent.STM (check, retry)
 import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Except
@@ -453,9 +453,18 @@ execChatCommand src s retryNum =
   where
     execLocal cmd = do
       cc@ChatController {config = ChatConfig {chatHooks}} <- ask
-      result <- case preCmdHook chatHooks of
-        Just hook -> liftIO (hook cc cmd) >>= either pure (`execChatCommand'` retryNum)
-        Nothing -> execChatCommand' cmd retryNum
+      enabled <- chatReadVar' simultaneousUI
+      let remoteIdentity = case src of
+            CSRemoteCtrl -> enabled && profileLifecycleCommand cmd
+            _ -> False
+      -- Remote identity mutations must fail before taking the profile gate:
+      -- an admitted request owns a lease which a local post-unlink profile
+      -- change may already be waiting to drain.
+      result <- if remoteIdentity
+        then pure $ Left $ ChatErrorRemoteCtrl RCEBusy
+        else case preCmdHook chatHooks of
+          Just hook -> liftIO (hook cc cmd) >>= either pure (`execChatCommand'` retryNum)
+          Nothing -> execChatCommand' cmd retryNum
       when (either (const False) (\r -> sharedMutation r || tagMutation cmd) result) $ invalidateUI src
       pure result
 
@@ -555,7 +564,13 @@ checkUIProfileChange :: CM ()
 checkUIProfileChange = do
   enabled <- chatReadVar simultaneousUI
   session <- chatReadVar remoteCtrlSession
-  when (enabled && isJust session) $ throwError $ ChatErrorRemoteCtrl RCEBusy
+  when enabled $ do
+    when (isJust session) $ throwError $ ChatErrorRemoteCtrl RCEBusy
+    -- Revocation unpublishes the session before transport cancellation. An
+    -- already-admitted command must finish/cancel under its original profile.
+    -- New requests cannot acquire a lease on the revoked session.
+    leases <- asks remoteCommandLeases
+    atomically $ readTVar leases >>= check . (== 0)
 
 parseChatCommand :: ByteString -> Either String ChatCommand
 parseChatCommand = A.parseOnly chatCommandP . B.dropWhileEnd isSpace
