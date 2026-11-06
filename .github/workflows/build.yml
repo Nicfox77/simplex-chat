@@ -45,6 +45,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
+      native_apps:
+        description: Build branch-native Android APK and Linux desktop app and run their smoke tests
+        type: boolean
+        default: false
       tests:
         description: "hspec match patterns, one per line; / runs all tests, empty runs none"
         type: string
@@ -76,6 +80,20 @@ env:
 # See: https://github.com/actions/runner/issues/1846#issuecomment-1246102753
 
 jobs:
+  simultaneous-native-android:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_apps == true
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/android-emu.yml
+
+  simultaneous-native-desktop:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_apps == true
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/desktop-linux.yml
+
 
 # =============================
 #       Global variables

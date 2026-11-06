@@ -131,6 +131,15 @@ or APK assembly. The manually dispatched `android-emu.yml` and
 `desktop-linux.yml` workflows build branch-native libraries, package apps and
 run individual app smoke tests. They produce `android-app` and `desktop-app`
 artifacts for physical testing. These smoke tests do not pair the two GUIs.
+The fork has not registered those workflow files on its default branch, so they
+can also be invoked as reusable workflows through the registered build workflow,
+without changing the default branch:
+
+```sh
+gh workflow run build.yml -R Nicfox77/simplex-chat \
+  --ref feature/simultaneous-device-ui -f native_apps=true \
+  -f tests='/Remote session/Remote/With compression/simultaneous UI/'
+```
 
 Required physical acceptance with those matching builds:
 

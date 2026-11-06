@@ -1,6 +1,17 @@
 name: desktop-linux
 
 on:
+  workflow_call:
+    inputs:
+      claude:
+        type: boolean
+        default: false
+      backend:
+        type: boolean
+        default: false
+      release:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       claude:
