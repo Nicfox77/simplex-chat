@@ -190,4 +190,9 @@ Local validation for the restart implementation:
   a cold Clang/GHC cross-toolchain build. This was stopped to prioritize native
   restart/revocation tests, as requested. No Android native build or APK/device
   execution is claimed from that attempt. The repository's Android CI workflow
-  can build the native library and APK from the pushed feature branch.
+  builds the native library and APK from the pushed feature branch. Manual
+  dispatch initially returned HTTP 404 because the workflow was not registered
+  on this fork's default branch. Its added PR trigger is restricted to
+  `feature/tailscale-device-linking`; it does not require changing master or
+  running the optional Claude/backend/release jobs. Android native CI results
+  remain pending until the workflow completes.

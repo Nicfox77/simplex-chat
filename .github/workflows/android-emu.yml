@@ -1,6 +1,15 @@
 name: android-emu
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/android-emu.yml"
+      - "cabal.project"
+      - "simplex-chat.cabal"
+      - "src/**"
+      - "scripts/ci/android/**"
+      - "apps/multiplatform/**"
   workflow_dispatch:
     inputs:
       claude:
@@ -38,6 +47,9 @@ env:
 
 jobs:
   plan:
+    # This fork's draft device-linking PR also needs native Android validation.
+    # Other PRs keep the existing manual-only behavior.
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'feature/tailscale-device-linking'
     name: choose jobs, find earlier builds
     runs-on: ubuntu-24.04
     timeout-minutes: 10
