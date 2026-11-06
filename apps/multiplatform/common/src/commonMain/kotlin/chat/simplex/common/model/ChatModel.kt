@@ -5991,6 +5991,7 @@ sealed class RemoteCtrlStopReason {
   @Serializable @SerialName("connectionFailed") class ConnectionFailed(val chatError: ChatError): RemoteCtrlStopReason()
   @Serializable @SerialName("setupFailed") class SetupFailed(val chatError: ChatError): RemoteCtrlStopReason()
   @Serializable @SerialName("disconnected") object Disconnected: RemoteCtrlStopReason()
+  @Serializable @SerialName("stopped") object Stopped: RemoteCtrlStopReason()
 }
 
 sealed class UIRemoteCtrlSessionState {

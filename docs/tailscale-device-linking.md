@@ -1,145 +1,161 @@
 # Android and Linux desktop linking over Tailscale
 
-This branch implements a small direct-link UX improvement, not automatic session
-recovery. It uses the existing XRCP QR/invitation flow and stored pairing identities.
-It does not change the Haskell core, simplexmq dependency, listener lifetime, ports,
-TLS configuration, session verification, or stop/unlink behavior. No session keys
-or invitations are persisted in app storage by this feature. iOS is untouched;
-the new desktop help is enabled only on Linux.
+Android retries an established direct link after a dropped connection while the
+Linux desktop retains its owned, authenticated listener. One trusted QR pairing
+is sufficient for these reconnects. Pairing identities remain in the encrypted
+chat database; the live invitation and its private session keys remain in memory.
+
+**Process restart recovery is not implemented.** Restarting either application,
+explicitly disconnecting, or closing the linking screen ends this reconnect
+owner. After a desktop restart, select the saved linked phone and scan/paste a
+fresh invitation. The implementation never restores old ephemeral private keys.
+iOS application code and LAN discovery behavior are unchanged.
 
 ## Connect
 
-1. Connect Android and Linux to the intended tailnet and enable the desktop's
-   `tailscale0` interface before opening SimpleX's mobile-linking dialog.
-2. On the desktop, open **Linked mobiles** and select the already linked
-   mobile, or **Link a mobile** for a new device. Choose **Use Tailscale address**
-   (available when `tailscale0` is in the reported addresses), or select the
-   intended address in the existing dropdown. This is an explicit choice; LAN
-   defaults and address ordering remain unchanged.
-3. If the address or port changed, press **Refresh**. Check **Address in QR code**
-   against the intended Tailscale IPv4 and port. The shortcut changes the pending
-   selection, not the already generated invitation. Share link is hidden while
-   the invitation needs refreshing on Android/Linux.
-4. On Android, open **Use from desktop**. Scan the QR, or use **Share link** on
-   Linux and **Paste desktop address** on Android, then **Connect to desktop**.
-   Transfer the full, unmodified `xrcp:` invitation over a channel you trust.
-   A bare IP or MagicDNS name cannot replace the signed invitation. Compare and
-   verify the session code as in normal pairing.
+1. Enable Tailscale on Android and Linux before opening the mobile-linking dialog.
+2. On Linux, open **Linked mobiles**, select a saved mobile or **Link a mobile**,
+   and choose **Use Tailscale address**, or select `tailscale0` in the dropdown.
+3. Choose an unused fixed TCP port above 1023 if your access policy restricts
+   ports. Press **Refresh** and check **Address in QR code**. Editing a selection
+   does not change an already generated signed invitation.
+4. On Android, open **Use from desktop**, scan the QR or paste the full `xrcp:`
+   invitation, and verify the initial session code through a trusted channel.
 
-Multicast is unnecessary for this flow. Disable **Discoverable via local network**
-on the desktop and **Discover via local network** in Android's linked-desktop
-options if desired. If Android is already searching, tap **Scan QR code** to leave
-discovery and reach the scan/paste screen. The feature does not alter these
-preferences automatically.
+The retained-listener path is enabled only for an explicitly selected IPv4
+address in `100.64.0.0/10` and a peer that negotiates the Kotlin reconnect
+capability. A missing selected interface fails closed. The usual LAN pairing and
+multicast APIs retain their existing behavior. Tailscale multicast discovery is
+not required. A bare IP or MagicDNS hostname cannot replace the signed invitation;
+this implementation uses the stable tailnet IPv4 supplied by the interface and
+does not rewrite signatures or add an IPv6/MagicDNS editor.
 
-Use the IPv4 reported for `tailscale0`. This change does not add a MagicDNS editor
-or rewrite the signed invitation host. If Tailscale is missing from the list,
-enable it and reopen the dialog. The dependency treats the selection as a
-preference and can fall back to another address if it becomes unavailable; always
-check the actual address shown after refreshing.
+## Recovery, stop, and unlink
 
-## Reconnect and stop
+After a dropped TCP connection or a stalled event poll, the desktop closes and
+joins the old transport and polling worker, releases that connection's server
+handler, and waits for the paired phone on the same listener. Android retries
+with exponential backoff (1, 2, 4, 8, 16, then 30 seconds, with 20% jitter), a
+bounded native connection timeout, and a bounded confirmation wait. Android also
+closes a negotiated direct session after 30 seconds without an incoming desktop
+request, so silent TCP blackholes trigger recovery. This watchdog is raced with
+the HTTP server and cancelled/joined with its owner. Each attempt
+uses new phone DH keys, new KEM material, a new TLS channel binding, and new XRCP
+traffic keys. The desktop's live invitation keys last only as long as its owner.
 
-After transport loss, the current core stops the session and desktop listener.
-Select the existing linked mobile on the desktop to generate a fresh invitation;
-on Android leave any searching state and scan/paste that invitation again. Stored
-pairing identities are reused, but a fresh authenticated connection is required.
-Leave session verification enabled if you want to compare each new session code.
-The same manual flow is needed after a desktop restart. There is no background
-retry or QR-free recovery in this branch.
+Android automatically confirms only a previously verified target whose saved
+controller ID still matches. Both TLS identity pins and the XRCP identity check
+remain mandatory. Identity/authentication/version failures terminate automatic
+recovery; a deleted pairing is never automatically trusted again. Invitations
+are not saved in preferences or files, and there is no retry before initial trust.
 
-**Disconnect**, closing a pending linking dialog, and **Unlink/Delete** retain
-their upstream behavior. This feature never restarts a listener after those
-actions. After unlinking, intentional future pairing uses the normal new-device
-verification flow.
+**Disconnect**, screen disposal, unlink, and stopping/resetting the chat controller
+cancel Android's retry owner. Native commands that finish late are cleaned up
+using a sequence-checked local abort before replacement operations proceed. A
+connected phone sends an authenticated stop event so the desktop closes its
+retained listener; the desktop sends an authenticated stop command so the phone
+ends retries. These stop signals are bounded: if the network is already down,
+the remote endpoint cannot learn the stop immediately. Stop/unlink on that
+endpoint to close its waiting listener. No local listener survives local stop,
+unlink, or controller shutdown.
 
-## Existing listener exposure and mitigation
+The desktop retains a link only after successful pairing. Unpaired invitation
+and confirmation waits remain bounded. Closing a pending dialog or removing an
+active linked phone cancels its listener and workers. Stale disconnect handlers
+and abort commands cannot cancel a newer session.
 
-Selecting `tailscale0` or a Tailscale IP changes the invitation address; it **does
-not bind the listener to that interface**. The pinned simplexmq revision
-`a0eec7104c706ab0dab2ad604f280a7130f7a22c` calls
-`startTCPServer started Nothing` from `Simplex.RemoteControl.Discovery.startTLSServer`.
-The transport resolves this with `AI_PASSIVE` and prefers IPv6, otherwise IPv4,
-so it uses a wildcard address. Actual reachability depends on the OS and firewall.
-This behavior predates this branch and is unchanged. XRCP authentication still
-applies, but address selection is not a firewall boundary.
+## Binding, firewall, and tailnet policy
 
-For a Tailscale-only deployment:
+The original simplexmq API advertises the selected address but calls
+`startTCPServer ... Nothing`, binding a wildcard listener. The new retained
+listener instead binds the actual selected IPv4. It adds no discovery service or
+extra port. LAN listeners continue to use their original binding behavior.
 
-- Choose a fixed, unused TCP port above 1023 in the existing port field and refresh
-  the invitation. This makes firewall rules predictable; the feature opens no
-  additional port.
-- In the Linux host firewall, deny inbound traffic to that TCP port on every
-  interface except `tailscale0`, covering both IPv4 and IPv6. Permit the intended
-  Android peer on `tailscale0` only. Ensure these restrictions apply despite
-  existing broad allow rules or Tailscale-managed chains. Do not add a public
-  router port-forward.
-- In the tailnet access policy, allow only the intended phone identity/device to
-  reach this desktop and TCP port. Audit other matching grants/ACL rules: a broad
-  existing allow can defeat a narrower rule. Tailnet rules alone do not restrict
-  direct LAN/public traffic to the desktop wildcard listener.
-- While a linking dialog/session is active, inspect `ss -ltnp` on Linux. Verify
-  from the intended phone that the Tailscale endpoint is reachable and from a
-  separate LAN peer that the desktop's LAN address at the same port is blocked.
-  Also verify an unauthorized tailnet peer cannot connect. These are deployment
-  checks; they have not been exercised against a real tailnet for this branch.
+Address binding alone does not authorize a peer. Restrict the desktop TCP port
+in both the Linux firewall and the tailnet policy to the intended phone. Audit
+other matching rules: Tailscale grants/ACL permissions are additive, so an existing
+broad allow can also permit traffic. Do not forward this port from a public
+router. SimpleX does not edit firewall or Tailscale configuration.
 
-See Tailscale's [netfilter modes](https://tailscale.com/docs/reference/netfilter-modes)
-for how its firewall chains accept tailnet traffic, and
-[grants](https://tailscale.com/docs/features/access-control/grants) for limiting
-network access. These policies and the host firewall must be configured separately;
-SimpleX does not manage them.
+Inspect `ss -ltnp` while linking: the retained listener should show the selected
+`100.x.y.z:port`, not `0.0.0.0:port` or `[::]:port`. Check reachability from the
+intended phone and denial from an unauthorized tailnet peer and the desktop LAN
+address. Tailscale's [grants documentation](https://tailscale.com/docs/features/access-control/grants)
+and [netfilter documentation](https://tailscale.com/docs/reference/netfilter-modes)
+explain the separate policy and host-firewall boundaries.
 
-## Why recovery was not transplanted from draft #7338
+## Dependency and security review
 
-The locally fetched draft `upstream/pr-7338` adds a desktop loop that retains the
-listener and consumes successive XRCP steps. It also contains substantial session,
-stop, and UI changes. `upstream/pr-7234` has only iOS changes. Neither was
-cherry-picked.
+`cabal.project` pins `Nicfox77/simplexmq` at
+`985cf2b3e992884d2d8536458c012c456b889785`. It is the previous pinned upstream
+`a0eec710` plus upstream certificate-chain validation commit `c89b00cf` and a
+scoped owned-transport change. [Review the dependency diff](https://github.com/Nicfox77/simplexmq/compare/a0eec7104c706ab0dab2ad604f280a7130f7a22c...985cf2b3e992884d2d8536458c012c456b889785).
+The Nix source hash includes the pinned submodules. Backend build scripts read
+both dependency URL and revision from `cabal.project`.
 
-In the currently pinned XRCP client, the server callback hands the TLS connection
-to the app and then waits on a shared `endSession` TMVar. Its exported host-client
-API only exposes `action` and whole-client cancellation; there is no per-connection
-release. Reusing the initial listener also retains its originally captured
-`knownHost` TLS policy (which is empty for new pairing). A reliable recovery design
-must account for callback cleanup, pin the successfully paired peer, distinguish
-explicit stop from transport loss, and reject stale callbacks before handing out
-commands. Simply retaining the QR or retrying the loop is insufficient evidence
-of safe recovery. This branch takes the authorized UX fallback rather than
-extending that listener's lifetime or changing its authentication policy.
+The dependency adds per-connection release, an atomic active-session gate, a live
+peer pin updated before publishing the first successful pairing, and
+per-connection certificate capture. Handshakes may overlap, so the latest pin is
+checked again after admission. Certificate-chain validation is preserved. Release
+waits for the matching handler to finish; stale releases cannot close replacements.
+Startup/bind failure closes the socket and resolves the startup wait.
 
-Desktop restart recovery additionally needs a fresh authenticated invitation
-exchange or a reviewed secret-persistence design: the invitation's session
-signing/DH private keys are currently generated in memory. This branch persists
-none of them.
+The chat lifecycle adapts the relevant desktop loop from upstream draft #7338;
+it does not transplant its detached cleanup threads or UI changes. Draft #7234
+contains iOS-only changes and was not applied. The threat model includes another
+tailnet/LAN peer possessing a copied invitation, forged certificate chains,
+concurrent connection attempts, delayed events, repeated outages, explicit stop,
+and unlink while a native connect completes.
+
+Restart recovery still needs a separately reviewed, mutually authenticated fresh
+invitation exchange with replay protection and explicit persisted enable/disable
+state. The original invitation contains desktop ephemeral public keys, but those
+private keys disappear when its listener dies. Retrying that invitation against
+a new listener cannot substitute for fresh authenticated exchange. No such
+restart feature is claimed here.
 
 ## Validation
 
-`RemoteLinkSettingsTest` covers LAN-to-Tailscale selection, port changes, random
-ports, reverting edits, retaining LAN defaults, switching interfaces, and blocking
-stale invitation sharing on Android/Linux while preserving other platforms'
-developer-only sharing behavior. The same refresh predicate gates the QR overlay
-and Linux/Android link sharing.
+The dependency's `xrcp-lifecycle` suite exercises repeated reconnects, fresh phone
+DH keys, rejection of an unrelated phone and of an unrelated signing key presented
+with the real pinned CA certificate, stale release, loss during confirmation,
+owner shutdown, absent interface, and occupied port. It ran against this Linux
+machine's actual `tailscale0` IPv4 (`100.101.0.9`): four examples passed. This tests
+local routing to the tailnet address, not a connection from another device.
 
-Run the focused desktop tests with:
+`DirectLinkReconnectTest` covers initial-trust gating, early/stale events, backoff,
+stop during native connect, deleted pairing, transient recovery, and explicit
+stop. All 18 focused Gradle tests passed (eleven reconnect tests and seven endpoint/QR
+settings tests), together with shared Kotlin compilation for Android and Linux
+desktop. The latest retry class also passed eleven standalone JUnit tests, including loss
+during successful verification, early authentication failure, and stale terminal
+events.
+The native chat library compiled with GHC 9.6.6. The full Remote scope passed
+serially and with four test workers: 66 examples, zero failures, 42 pre-existing pending compression variants
+(24 active checks). This includes real transport loss/reconnect, fresh encrypted
+commands after reconnection, stale abort, unlink, watchdog ownership, LAN multicast,
+file transfers, and multiple profiles.
+
+A separate live probe of the pinned dependency accepted TCP on `100.101.0.9`,
+refused the same port on loopback and the LAN address, and refused the tailnet
+port after owner shutdown. No firewall or tailnet policy was changed.
+
+Reproduce the chat and Kotlin checks with:
 
 ```sh
+cabal test simplex-chat-test -O0 --test-options='--match /Remote/ --jobs=4'
 cd apps/multiplatform
-./gradlew :common:desktopTest --tests chat.simplex.app.RemoteLinkSettingsTest
+./gradlew :common:compileKotlinDesktop :common:compileDebugKotlinAndroid
+./gradlew :common:desktopTest --tests chat.simplex.app.DirectLinkReconnectTest \
+  --tests chat.simplex.app.RemoteLinkSettingsTest
 ```
 
-Observed in this development environment: all seven JUnit tests passed when the
-production helper and test source were compiled independently with cached Kotlin
-2.2.21, using language/API version 2.1 and JVM target 11. The platform expect/actual
-declarations were also compiled independently and checked on the JVM with Linux,
-macOS, and Windows OS/architecture inputs, plus the Android actual declaration.
-The full Gradle task was attempted but stopped during project configuration
-because the Android SDK is not installed; this does not validate the Compose UI
-or an Android build. The base resource XML parsed successfully and the four new
-string keys were checked for uniqueness and nonempty values.
+Android packages must include the native library rebuilt from this source revision;
+a stock release native library does not implement the new core protocol capability.
+Android native cross-compilation has not been run here.
 
-Manual UI checks still required on built Android/Linux apps: choose `tailscale0`,
-confirm the old QR and Share link action are hidden until refresh, check the displayed endpoint,
-paste a fresh invitation and verify the session, disconnect/unlink, and confirm no
-automatic restart. Repeat normal LAN pairing. No live Tailscale, reconnect, or
-full application validation is claimed by the unit tests.
+An Android SDK was installed for Kotlin compilation; `adb devices` reported no attached
+phones. Android UI, a real phone-to-desktop Tailscale outage/recovery, peer ACL
+denial, and restart behavior are therefore not claimed as live-device verified.
+PR #1's original Linux core CI passed. Its CLA Assistant failure reports the
+missing upstream signing `PERSONAL_ACCESS_TOKEN` and is unrelated to code.

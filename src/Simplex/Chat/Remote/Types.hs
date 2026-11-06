@@ -110,7 +110,18 @@ data RemoteHostSession
   | RHSessionPendingConfirmation {sessionCode :: Text, tls :: TLS 'TServer, rhPendingSession :: RHPendingSession}
   | RHSessionConfirmed {tls :: TLS 'TServer, rhPendingSession :: RHPendingSession}
   | RHSessionConnected
-      { rchClient :: RCHostClient,
+      { rhPendingSession :: RHPendingSession,
+        hostStopRequested :: TVar Bool,
+        canReconnect :: Bool,
+        tls :: TLS 'TServer,
+        rhClient :: RemoteHostClient,
+        pollAction :: Async (),
+        storePath :: FilePath
+      }
+
+  | RHSessionDisconnecting
+      { invitation :: Text,
+        rhPendingSession :: RHPendingSession,
         tls :: TLS 'TServer,
         rhClient :: RemoteHostClient,
         pollAction :: Async (),
@@ -132,6 +143,7 @@ rhsSessionState = \case
   RHSessionPendingConfirmation {tls} -> RHSPendingConfirmation {sessionCode = tlsSessionCode tls}
   RHSessionConfirmed {tls} -> RHSConfirmed {sessionCode = tlsSessionCode tls}
   RHSessionConnected {tls} -> RHSConnected {sessionCode = tlsSessionCode tls}
+  RHSessionDisconnecting {invitation} -> RHSConnecting {invitation}
 
 tlsSessionCode :: TLS p -> Text
 tlsSessionCode = verificationCode . tlsUniq
@@ -225,7 +237,8 @@ data RemoteFile = RemoteFile
 data CtrlAppInfo = CtrlAppInfo
   { appVersionRange :: AppVersionRange,
     deviceName :: Text,
-    compression :: BoolDef
+    compression :: BoolDef,
+    reconnect :: BoolDef
   }
   deriving (Show)
 
@@ -234,7 +247,8 @@ data HostAppInfo = HostAppInfo
     deviceName :: Text,
     encoding :: PlatformEncoding,
     encryptFiles :: Bool, -- if the host encrypts files in app storage
-    compression :: BoolDef
+    compression :: BoolDef,
+    reconnect :: BoolDef
   }
 
 $(J.deriveJSON defaultJSON ''RemoteFile)

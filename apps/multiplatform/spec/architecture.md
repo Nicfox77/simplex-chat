@@ -440,3 +440,23 @@ var platform: PlatformInterface = object : PlatformInterface {}
 | File | Path | Key Contents |
 |---|---|---|
 | ThemeManager.kt | [`common/src/commonMain/kotlin/chat/simplex/common/ui/theme/ThemeManager.kt`](../common/src/commonMain/kotlin/chat/simplex/common/ui/theme/ThemeManager.kt) | Theme resolution, system/light/dark/custom, per-user overrides |
+
+## Direct remote-link recovery (PC27)
+
+For Android and an explicitly selected Linux tailnet IPv4, the core negotiates
+`CtrlAppInfo.reconnect` / `HostAppInfo.reconnect` (absent means false). The desktop
+retains an address-bound XRCP listener after an authenticated transport drops.
+The dependency updates the first peer's certificate pin, serializes admission,
+and releases each old transport before reuse. The reverse HTTP poll has a bounded
+failure detector; session-sequence checks reject stale callbacks.
+
+Source: [`Remote.hs`](../../../src/Simplex/Chat/Remote.hs#L1),
+[`DirectLinkReconnect.kt`](../common/src/commonMain/kotlin/chat/simplex/common/model/DirectLinkReconnect.kt#L1).
+The Android retry owner is memory-only, requires initial user verification and a
+matching saved controller ID, and cancels on stop/unlink/controller reset. A local
+`/_abort remote ctrl <sequence>` cannot be invoked by a remote controller.
+Authenticated stop signaling distinguishes user stop from transport loss.
+
+See [connection, security, limits, and validation](../../../docs/tailscale-device-linking.md).
+Process-restart reconnection and persistence of ephemeral keys are not implemented.
+LAN and iOS peers do not opt into this capability.
