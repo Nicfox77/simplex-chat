@@ -2529,6 +2529,8 @@ export interface CtrlAppInfo {
   appVersionRange: AppVersionRange
   deviceName: string
   compression: boolean
+  restart: boolean
+  reconnect: boolean
 }
 
 export interface DroppedMsg {
@@ -4515,6 +4517,7 @@ export enum RelayStatus {
 export interface RemoteCtrlInfo {
   remoteCtrlId: number // int64
   ctrlDeviceName: string
+  recoveryEnabled: boolean
   sessionState?: RemoteCtrlSessionState
 }
 
@@ -4565,9 +4568,15 @@ export type RemoteCtrlStopReason =
   | RemoteCtrlStopReason.ConnectionFailed
   | RemoteCtrlStopReason.SetupFailed
   | RemoteCtrlStopReason.Disconnected
+  | RemoteCtrlStopReason.Stopped
 
 export namespace RemoteCtrlStopReason {
-  export type Tag = "discoveryFailed" | "connectionFailed" | "setupFailed" | "disconnected"
+  export type Tag = 
+    | "discoveryFailed"
+    | "connectionFailed"
+    | "setupFailed"
+    | "disconnected"
+    | "stopped"
 
   interface Interface {
     type: Tag
@@ -4590,6 +4599,10 @@ export namespace RemoteCtrlStopReason {
 
   export interface Disconnected extends Interface {
     type: "disconnected"
+  }
+
+  export interface Stopped extends Interface {
+    type: "stopped"
   }
 }
 

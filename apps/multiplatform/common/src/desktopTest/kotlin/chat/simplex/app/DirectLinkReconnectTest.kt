@@ -7,6 +7,54 @@ import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
 class DirectLinkReconnectTest {
+  @Test fun lateAttemptCleanupBelongsToItsOriginalNativeController() = runBlocking {
+    val entered = CompletableDeferred<Unit>(); val finish = CompletableDeferred<Unit>()
+    val cleaned = CompletableDeferred<String>()
+    val r = DirectLinkReconnect(this, {
+      entered.complete(Unit); finish.await()
+      DirectLinkReconnect.Attempt(1, 7) { cleaned.complete("old-controller"); Unit }
+    }, { fail("verification after reset"); false }, { fail("aborted replacement controller") }, {}, { 1 })
+    r.restore(7); withTimeout(1_000) { entered.await() }
+    r.clear(); finish.complete(Unit)
+    assertEquals("old-controller", withTimeout(1_000) { cleaned.await() })
+  }
+
+  @Test fun processRestoreUsesOnlySavedIdentityAndRejectsDifferentController() = runBlocking {
+    val called = CompletableDeferred<Unit>()
+    val aborted = CompletableDeferred<Int>()
+    val r = DirectLinkReconnect(this, { target ->
+      assertEquals("resume:7", target); called.complete(Unit)
+      DirectLinkReconnect.Attempt(2, 8)
+    }, { fail("untrusted replacement verified"); false }, { aborted.complete(it); Unit }, {}, { 1 })
+    r.restore(7)
+    withTimeout(1_000) { called.await(); assertEquals(2, aborted.await()) }
+    r.clear()
+  }
+
+  @Test fun verifiedRestartCapableTargetFetchesFreshInvitationOnRetry() = runBlocking {
+    val done = CompletableDeferred<Unit>()
+    lateinit var r: DirectLinkReconnect
+    r = DirectLinkReconnect(this, { target ->
+      assertEquals("resume:7", target); r.sessionCode(2, "fresh")
+      DirectLinkReconnect.Attempt(2, 7)
+    }, { true }, {}, { done.complete(Unit); Unit }, { 1 })
+    r.remember("old-ephemeral-invitation", DirectLinkReconnect.Attempt(1, 7))
+    r.trust(7, restart = true); r.stopped(1, true)
+    withTimeout(1_000) { done.await() }; r.clear()
+  }
+
+  @Test fun stopWhileRestoringAbortsLateNativeResult() = runBlocking {
+    val entered = CompletableDeferred<Unit>(); val finish = CompletableDeferred<Unit>()
+    val order = mutableListOf<String>()
+    val r = DirectLinkReconnect(this, {
+      entered.complete(Unit); finish.await(); DirectLinkReconnect.Attempt(3, 7)
+    }, { fail("verification after stop"); false }, { order.add("abort:$it"); Unit }, {}, { 1 })
+    r.restore(7); withTimeout(1_000) { entered.await() }
+    val stop = launch { r.replace { order.add("stop") } }
+    yield(); finish.complete(Unit); withTimeout(1_000) { stop.join() }
+    assertEquals(listOf("abort:3", "stop"), order)
+  }
+
   @Test fun unverifiedInvitationNeverRetries() = runBlocking {
     val calls = AtomicInteger()
     val r = DirectLinkReconnect(this, { calls.incrementAndGet(); null }, { true }, {}, {}, { 1 })

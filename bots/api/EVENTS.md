@@ -829,6 +829,7 @@ Use [VerifyRemoteCtrlSession](./COMMANDS.md#verifyremotectrlsession) to complete
 - type: "remoteCtrlSessionCode"
 - remoteCtrl_: [RemoteCtrlInfo](./TYPES.md#remotectrlinfo)?
 - sessionCode: string
+- sessionSeq: int
 
 ---
 
@@ -841,6 +842,7 @@ Remote controller session stopped.
 - type: "remoteCtrlStopped"
 - rcsState: [RemoteCtrlSessionState](./TYPES.md#remotectrlsessionstate)
 - rcStopReason: [RemoteCtrlStopReason](./TYPES.md#remotectrlstopreason)
+- sessionSeq: int
 
 ---
 

@@ -7,7 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.random.Random
 
-/** Owns retries for one explicitly verified direct link. Invitations are memory-only. */
+/** Owns retries for one verified direct link. Restart targets contain only a stored pairing ID. */
 internal class DirectLinkReconnect(
   private val scope: CoroutineScope,
   private val connect: suspend (String) -> Attempt?,
@@ -15,9 +15,10 @@ internal class DirectLinkReconnect(
   private val abort: suspend (Int) -> Unit,
   private val connected: (String) -> Unit,
   private val waitMillis: (Int) -> Long = { retryDelay(it) },
-  private val confirmationTimeout: Long = 20_000
+  private val confirmationTimeout: Long = 20_000,
+  private val rejected: () -> Unit = {}
 ) {
-  data class Attempt(val sequence: Int, val remoteId: Long?)
+  data class Attempt(val sequence: Int, val remoteId: Long?, val cleanup: (suspend () -> Unit)? = null)
   class Rejected: Exception()
   private data class Target(val invitation: String, val sequence: Int, val remoteId: Long?, val trusted: Boolean)
   private data class Event(val sequence: Int, val code: String?)
@@ -41,8 +42,18 @@ internal class DirectLinkReconnect(
     target = Target(invitation, attempt.sequence, attempt.remoteId, false)
   }
 
-  fun trust(remoteId: Long) = synchronized(state) {
-    target = target?.let { if (it.remoteId == null || it.remoteId == remoteId) it.copy(remoteId = remoteId, trusted = true) else null }
+  fun trust(remoteId: Long, restart: Boolean = false) = synchronized(state) {
+    target = target?.let {
+      if (it.remoteId == null || it.remoteId == remoteId)
+        it.copy(invitation = if (restart) recoveryTarget(remoteId) else it.invitation, remoteId = remoteId, trusted = true)
+      else null
+    }
+  }
+
+  fun restore(remoteId: Long) = synchronized(state) {
+    if (target != null) return@synchronized
+    target = Target(recoveryTarget(remoteId), 0, remoteId, true)
+    stopped(0, true)
   }
 
   fun clear() = synchronized(state) {
@@ -120,12 +131,12 @@ internal class DirectLinkReconnect(
             }
             if (!current(owner)) return
           } finally {
-            if (!success) attempt?.let { a -> withContext(NonCancellable) { abort(a.sequence) } }
+            if (!success) attempt?.let { a -> withContext(NonCancellable) { a.cleanup?.invoke() ?: abort(a.sequence) } }
           }
         }
       }
     } catch (_: Rejected) {
-      synchronized(state) { if (generation == owner) target = null }
+      synchronized(state) { if (generation == owner) { target = null; rejected() } }
     } finally {
       synchronized(state) {
         if (generation == owner) {
@@ -139,6 +150,8 @@ internal class DirectLinkReconnect(
   }
 
   companion object {
+    fun recoveryTarget(remoteId: Long): String = "resume:$remoteId"
+
     // Saturation avoids overflow during long outages; jitter avoids synchronized retries.
     fun retryDelay(failures: Int, jitter: Double = Random.nextDouble(0.8, 1.2)): Long =
       ((1_000L shl failures.coerceIn(0, 5)).coerceAtMost(30_000) * jitter).toLong().coerceIn(800, 36_000)

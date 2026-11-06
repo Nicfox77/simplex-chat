@@ -2268,6 +2268,8 @@ Remote controller application info.
 - appVersionRange: [AppVersionRange](#appversionrange)
 - deviceName: string
 - compression: bool
+- restart: bool
+- reconnect: bool
 
 
 ---
@@ -4142,6 +4144,7 @@ ParseError:
 **Record type**:
 - remoteCtrlId: int64
 - ctrlDeviceName: string
+- recoveryEnabled: bool
 - sessionState: [RemoteCtrlSessionState](#remotectrlsessionstate)?
 
 
@@ -4189,6 +4192,9 @@ SetupFailed:
 
 Disconnected:
 - type: "disconnected"
+
+Stopped:
+- type: "stopped"
 
 
 ---

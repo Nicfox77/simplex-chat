@@ -124,12 +124,13 @@ fun ConnectMobileLayout(
         }
         Box(Modifier.padding(horizontal = DEFAULT_PADDING)) {
           DefaultDropdownMenu(showMenu) {
-            if (host.activeHost) {
+            if (host.sessionState != null) {
               ItemAction(stringResource(MR.strings.disconnect_remote_host), painterResource(MR.images.ic_wifi_off), color = WarningOrange) {
                 stopRemoteHostAndReloadHosts(host, true)
                 showMenu.value = false
               }
-            } else {
+            }
+            if (!host.activeHost) {
               ItemAction(stringResource(MR.strings.delete_verb), painterResource(MR.images.ic_delete), color = Color.Red) {
                 deleteHost(host)
                 showMenu.value = false
@@ -254,6 +255,18 @@ fun connectMobileDevice(rh: RemoteHostInfo, connecting: MutableState<Boolean>) {
   } else if (rh.activeHost()) {
     showConnectedMobileDevice(rh) {
       stopRemoteHostAndReloadHosts(rh, true)
+    }
+  } else if (rh.sessionState is RemoteHostSessionState.Connecting) {
+    // A restored listener already owns this port and fresh invitation. Opening
+    // its status must not try to start a second listener or revoke recovery.
+    ModalManager.start.showModalCloseable { _ ->
+      ConnectMobileViewLayout(
+        title = stringResource(MR.strings.waiting_for_mobile_to_connect),
+        invitation = rh.sessionState.invitation,
+        deviceName = rh.hostDeviceName,
+        sessionCode = null,
+        port = rh.bindPort_?.toString()
+      )
     }
   } else {
     showConnectMobileDevice(rh, connecting)

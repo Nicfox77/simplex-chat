@@ -698,6 +698,9 @@ data ChatCommand
   | DeleteRemoteHost RemoteHostId -- Unregister remote host and remove its data
   | StoreRemoteFile {remoteHostId :: RemoteHostId, storeEncrypted :: Maybe Bool, localPath :: FilePath}
   | GetRemoteFile {remoteHostId :: RemoteHostId, file :: RemoteFile}
+  | RestoreRemoteHosts
+  | SetRemoteCtrlAddress RemoteCtrlId TransportHost
+  | ResumeRemoteCtrl RemoteCtrlId
   | ConnectRemoteCtrl {remoteInvitation :: RCSignedInvitation} -- Connect new or existing controller via OOB data
   | APIAbortRemoteCtrl SessionSeq -- Cancel only the matching local connection attempt
   | FindKnownRemoteCtrl -- Start listening for announcements from all existing controllers
@@ -776,6 +779,9 @@ allowRemoteCommand = \case
   GetRemoteFile {} -> False
   StopRemoteHost _ -> False
   DeleteRemoteHost _ -> False
+  RestoreRemoteHosts -> False
+  SetRemoteCtrlAddress _ _ -> False
+  ResumeRemoteCtrl _ -> False
   ConnectRemoteCtrl {} -> False
   APIAbortRemoteCtrl {} -> False
   FindKnownRemoteCtrl -> False
@@ -1683,6 +1689,7 @@ data RemoteCtrlSession
       { remoteCtrlId_ :: Maybe RemoteCtrlId,
         rcsClient :: RCCtrlClient,
         rcsWaitSession :: Async (),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
   | RCSessionPendingConfirmation
@@ -1693,6 +1700,7 @@ data RemoteCtrlSession
         sessionCode :: Text,
         rcsWaitSession :: Async (),
         rcsWaitConfirmation :: TMVar (Either RCErrorType (RCCtrlSession, RCCtrlPairing)),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
   | RCSessionConnected
@@ -1703,6 +1711,7 @@ data RemoteCtrlSession
         http2Server :: Async (),
         remoteOutputQ :: TBQueue (Either ChatError ChatEvent),
         remoteStopEvent :: TMVar (Either ChatError ChatEvent),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
 
@@ -1726,6 +1735,7 @@ rcsSessionState = \case
 data RemoteCtrlInfo = RemoteCtrlInfo
   { remoteCtrlId :: RemoteCtrlId,
     ctrlDeviceName :: Text,
+    recoveryEnabled :: Bool,
     sessionState :: Maybe RemoteCtrlSessionState
   }
   deriving (Show)
