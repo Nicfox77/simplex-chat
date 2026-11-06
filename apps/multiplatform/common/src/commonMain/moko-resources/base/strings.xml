@@ -2808,6 +2808,10 @@
   <string name="desktop_device">Desktop</string>
   <string name="not_compatible">Not compatible!</string>
   <string name="refresh_qr_code">Refresh</string>
+  <string name="use_tailscale_address">Use Tailscale address</string>
+  <string name="remote_link_qr_endpoint">Address in QR code: %s</string>
+  <string name="remote_link_direct_help">For Tailscale, select tailscale0 and refresh the QR code. On Android, scan it or paste the full invitation from Share link; local network discovery is not needed. The selected address does not restrict the listener: use a firewall and Tailscale access rules to allow only the intended device and port.</string>
+  <string name="remote_link_paste_help">Paste the full invitation from the desktop Share link, not just its IP address. After a disconnection, select the linked mobile on the desktop to get a fresh invitation, then scan or paste it here and verify the session code. Automatic reconnection is not available.</string>
   <string name="no_connected_mobile">No connected mobile</string>
   <string name="random_port">Random</string>
   <string name="open_port_in_firewall_title">Open port in firewall</string>

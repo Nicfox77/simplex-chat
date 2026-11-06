@@ -4,6 +4,7 @@ import SectionBottomSpacer
 import SectionDividerSpaced
 import SectionItemView
 import SectionItemViewLongClickable
+import SectionTextFooter
 import SectionView
 import TextIconSpaced
 import androidx.compose.foundation.layout.*
@@ -137,7 +138,7 @@ private fun ConnectDesktop(deviceName: String, remoteCtrls: SnapshotStateList<Re
   }
   SectionDividerSpaced()
   ScanDesktopAddressView(sessionAddress)
-  if (controller.appPrefs.developerTools.get()) {
+  if (appPlatform.isAndroid || controller.appPrefs.developerTools.get()) {
     SectionDividerSpaced()
     DesktopAddressView(sessionAddress)
   }
@@ -409,6 +410,9 @@ private fun DesktopAddressView(sessionAddress: MutableState<String>) {
         withBGApi { connectDesktopAddress(sessionAddress, sessionAddress.value) }
       },
     )
+    if (appPlatform.isAndroid) {
+      SectionTextFooter(stringResource(MR.strings.remote_link_paste_help))
+    }
   }
 }
 
