@@ -31,6 +31,7 @@ import Data.Time.Clock (getCurrentTime, nominalDay)
 import Simplex.Chat.Badges (badgeServerCredential, defaultFileSizeLimits)
 import Simplex.Chat.Call (supportedCallVRange)
 import Simplex.Chat.Controller
+import Simplex.Chat.Controller.Concurrent (newCommandGate)
 import Simplex.Chat.Library.Commands
 import Simplex.Chat.Operators
 import Simplex.Chat.Operators.Presets
@@ -182,6 +183,10 @@ newChatController
         eventSeq <- newTVarIO 0
         inputQ <- newTBQueueIO tbqSize
         outputQ <- newTBQueueIO tbqSize
+        simultaneousUI <- newTVarIO False
+        uiRevision <- newTVarIO 0
+        remoteCommandLeases <- newTVarIO 0
+        profileCreationGate <- liftIO newCommandGate
         subscriptionMode <- newTVarIO SMSubscribe
         processServiceRequests <- newTVarIO False
         chatLock <- newEmptyTMVarIO
@@ -231,6 +236,10 @@ newChatController
               eventSeq,
               inputQ,
               outputQ,
+              simultaneousUI,
+              uiRevision,
+              remoteCommandLeases,
+              profileCreationGate,
               subscriptionMode,
               processServiceRequests,
               chatLock,

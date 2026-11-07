@@ -316,6 +316,34 @@ object ChatModel {
     }
   }
 
+  internal var uiStateGeneration = 0L
+    private set
+  private var uiStateRevision = -1L
+
+  internal fun resetUIState() {
+    uiStateGeneration++
+    uiStateRevision = -1L
+  }
+
+  internal fun applyUIState(rhId: Long?, state: CR.UIState, requestedChatId: String?, generation: Long = uiStateGeneration): Boolean {
+    require(state.uiVersion == 1)
+    // Reject an in-flight snapshot after navigating to another host/profile.
+    if (generation != uiStateGeneration || state.revision < uiStateRevision ||
+      rhId != remoteHostId() || currentUser.value?.userId != state.user.userId) return false
+    uiStateRevision = state.revision
+    val ctx = chatsContext
+    currentUser.value = state.user.updateRemoteHostId(rhId)
+    users.clear()
+    users.addAll(state.users.map { it.copy(user = it.user.updateRemoteHostId(rhId)) })
+    ctx.updateChats(state.chats.map { it.copy(remoteHostId = rhId) })
+    if (requestedChatId != null && chatId.value == requestedChatId && state.openChat?.id == requestedChatId) {
+      ctx.applyUIItems(state.openChat.chatItems)
+    }
+    userTags.value = state.userTags
+    updateChatTags(rhId)
+    return true
+  }
+
   fun updateChatTags(rhId: Long?) {
     val newPresetTags = mutableMapOf<PresetTagKind, Int>()
     val newUnreadTags = mutableMapOf<Long, Int>()
@@ -553,6 +581,14 @@ object ChatModel {
         // invalid state, correcting
         addChat(chat)
       }
+    }
+
+    // Replace authoritative items, including edit/delete/read/timed metadata.
+    // This also rebuilds loaded unread state instead of applying counters twice.
+    fun applyUIItems(items: List<ChatItem>) {
+      chatItems.value = SnapshotStateList<ChatItem>().apply { addAll(items) }
+      chatState.clear()
+      items.forEach { chatState.itemAdded(it.id to it.isRcvNew) }
     }
 
     fun addToChatItems(index: Int, elem: ChatItem) {
@@ -1291,8 +1327,10 @@ object ChatModel {
     terminalItems.value += item
   }
 
-  val connectedToRemote: Boolean @Composable get() = currentRemoteHost.value != null || remoteCtrlSession.value?.active == true
-  fun connectedToRemote(): Boolean = currentRemoteHost.value != null || remoteCtrlSession.value?.active == true
+  // Only a UI viewing a remote host needs remote file paths and downloads.
+  // Hosting a desktop UI does not move this phone's files or database elsewhere.
+  val connectedToRemote: Boolean @Composable get() = currentRemoteHost.value != null
+  fun connectedToRemote(): Boolean = currentRemoteHost.value != null
 }
 
 data class ShowingInvitation(

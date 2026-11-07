@@ -562,6 +562,7 @@ object ChatController {
     val wasRunning = receiverJob != null
     stopReceiver()
     chatCtrl = ctrl
+    chatModel.resetUIState()
     if (wasRunning && ctrl != null) startReceiver()
   }
 
@@ -713,6 +714,7 @@ object ChatController {
   suspend fun startChat(user: User) {
     Log.d(TAG, "user: $user")
     try {
+      check(sendCmd(null, CC.EnableUI()).ok) { "Core does not support simultaneous UI protocol 1" }
       apiSetNetworkConfig(getNetCfg())
       val chatRunning = apiCheckChatRunning()
       val users = listUsers(null)
@@ -754,6 +756,7 @@ object ChatController {
     Log.d(TAG, "user: null")
     try {
       if (chatModel.chatRunning.value == true) return
+      check(sendCmd(null, CC.EnableUI()).ok) { "Core does not support simultaneous UI protocol 1" }
       chatModel.users.clear()
       chatModel.currentUser.value = null
       chatModel.localUserCreated.value = false
@@ -856,6 +859,12 @@ object ChatController {
           }
           val msg = recvMsg(ctrl)
           releaseLock = getWakeLock(timeout = 60000)
+          // A slow command caller may finish its optimistic model update after
+          // the event receiver already applied a newer snapshot. Periodic
+          // reconciliation while linked also repairs that response/event race.
+          if (msg == null && (uiSnapshotPending || chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true)) {
+            reconcileUI(chatModel.remoteHostId())
+          }
           if (msg != null) {
             val finishedWithoutTimeout = withTimeoutOrNull(60_000L) {
               processReceivedMsg(msg)
@@ -1011,7 +1020,9 @@ object ChatController {
 
   // Spec: spec/api.md#recvMsg
   fun recvMsg(ctrl: ChatCtrl): API? {
-    val rStr = chatRecvMsgWait(ctrl, MESSAGE_TIMEOUT)
+    val linked = chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true
+    val wait = if (uiSnapshotPending) 1_000_000 else if (linked) 5_000_000 else MESSAGE_TIMEOUT
+    val rStr = chatRecvMsgWait(ctrl, wait)
     return if (rStr == "") {
       null
     } else {
@@ -2407,7 +2418,7 @@ object ChatController {
     val chatItem = apiCancelFile(rh, fileId)
     if (chatItem != null) {
       chatItemSimpleUpdate(rh, user, chatItem)
-      cleanupFile(chatItem)
+      cleanupFile(rh, chatItem)
     }
   }
 
@@ -2950,7 +2961,99 @@ object ChatController {
   }
 
   // Spec: spec/api.md#processReceivedMsg
+  private var uiSnapshotPending = false
+  private var uiOwnerRecoveryPending = false
+
+  internal fun requiresUISnapshot(event: CR?): Boolean = when (event) {
+    null, is CR.UIStateChanged, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
+    is CR.NewRemoteHost, is CR.RemoteCtrlStopped, is CR.RemoteCtrlFound,
+    is CR.RemoteCtrlSessionCode, is CR.RemoteCtrlConnected, is CR.CallInvitation,
+    is CR.CallOffer, is CR.CallAnswer, is CR.CallExtraInfo, is CR.CallEnded,
+    is CR.StorePurchaseCredited, is CR.StorePurchaseRefused -> false
+    else -> true
+  }
+
   private suspend fun processReceivedMsg(msg: API) {
+    // A failed resnapshot must not resume counter/item deltas from a stream
+    // with gaps. Lifecycle, call and settlement callbacks remain actionable so
+    // disconnect/revocation can still release the session during recovery.
+    if (uiSnapshotPending && requiresUISnapshot(msg.result)) {
+      reconcileUI(chatModel.remoteHostId())
+      if (uiSnapshotPending) return
+    }
+    val shared = msg.result is CR.UIStateChanged ||
+      (msg.rhId == chatModel.remoteHostId() &&
+        (msg.rhId != null || chatModel.remoteCtrlSession.value?.active == true))
+    if (shared) uiSnapshotPending = true
+    if (msg.rhId == null && (msg.result as? CR.UIStateChanged)?.origin == "overflow") uiOwnerRecoveryPending = true
+    try {
+      if (msg.result !is CR.UIStateChanged) processReceivedMsgDelta(msg)
+    } finally {
+      if (shared) reconcileUI(msg.rhId)
+    }
+  }
+
+  // The receiver is subscribed before this request. The core returns list,
+  // counters, loaded items and users in ONE store transaction. Events queued
+  // during that transaction remain invalidations, rather than counter deltas
+  // to replay on top of a newer snapshot. Failed requests stay pending.
+  internal suspend fun reconcileUI(rhId: Long?) {
+    if (rhId != chatModel.remoteHostId() || chatModel.currentUser.value == null) return
+    val generation = chatModel.uiStateGeneration
+    val ctx = chatModel.chatsContext
+    val chatId = chatModel.chatId.value
+    val info = chatId?.let { ctx.getChat(it)?.chatInfo }
+    val ref = info?.takeIf { it is ChatInfo.Direct || it is ChatInfo.Group || it is ChatInfo.Local }
+      ?.let { CC.chatRef(it.chatType, it.apiId, it.groupChatScope()) }
+    val response = sendCmd(rhId, CC.UIState(ref, maxOf(100, ctx.chatItems.value.size + 100)), log = false)
+    val state = response.result as? CR.UIState ?: return
+    check(state.uiVersion == 1) { "Unsupported UI snapshot version" }
+    val secondary = chatModel.secondaryChatsContext.value
+    val secondaryInfo = state.chats.firstOrNull { it.id == chatId }?.chatInfo
+    val secondaryItems = if (secondary != null && secondaryInfo != null) {
+      val scope = secondary.groupScopeInfo?.toChatScope()
+      if (secondary.contentTag != null) {
+        apiGetChat(rhId, secondaryInfo.chatType, secondaryInfo.apiId, scope, secondary.contentTag,
+          ChatPagination.Last(maxOf(100, secondary.chatItems.value.size + 100)))?.first?.chatItems
+      } else {
+        val scopedRef = CC.chatRef(secondaryInfo.chatType, secondaryInfo.apiId, scope)
+        (sendCmd(rhId, CC.UIState(scopedRef, maxOf(100, secondary.chatItems.value.size + 100)), log = false)
+          .result as? CR.UIState)?.openChat?.chatItems
+      }
+    } else null
+    var applied = false
+    withContext(Dispatchers.Main) {
+      if (!chatModel.applyUIState(rhId, state, chatId, generation)) return@withContext
+      applied = true
+      if (secondaryItems != null && secondary === chatModel.secondaryChatsContext.value && chatModel.chatId.value == chatId) {
+        secondary?.applyUIItems(secondaryItems)
+      }
+      if (rhId == null) {
+        state.chats.filter { it.chatStats.unreadCount == 0 }.forEach {
+          ntfManager.cancelNotificationsForChat(it.id)
+        }
+      }
+    }
+    if (!applied) return
+    if (rhId == null && uiOwnerRecoveryPending) {
+      // Lifecycle events and platform-store callbacks can be among the lost
+      // deltas. Recover them from the owner, never from the viewer's database.
+      val controllers = listRemoteCtrls()
+      if (controllers != null && chatModel.remoteCtrlSession.value?.active == true &&
+        controllers.none { it.sessionState is RemoteCtrlSessionState.Connected }) {
+        chatModel.remoteCtrlSession.value = null
+        if (appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
+      }
+      apiGetCallInvitations(null).filter { it.contact.id !in chatModel.callInvitations }.forEach {
+        chatModel.callManager.reportNewIncomingCall(it)
+      }
+      BadgeStore.presentUnfinished()
+      uiOwnerRecoveryPending = controllers == null
+    }
+    uiSnapshotPending = uiOwnerRecoveryPending
+  }
+
+  private suspend fun processReceivedMsgDelta(msg: API) {
     lastMsgReceivedTimestamp = System.currentTimeMillis()
     val rhId = msg.rhId
     fun active(user: UserLike): Boolean = activeUser(rhId, user)
@@ -2980,7 +3083,7 @@ object ChatController {
           }
         }
         if (r.contact.directOrUsed) {
-          ntfManager.notifyContactConnected(r.user, r.contact)
+          if (rhId == null) ntfManager.notifyContactConnected(r.user, r.contact)
         }
       }
       is CR.ContactConnecting -> {
@@ -3027,7 +3130,7 @@ object ChatController {
             }
           }
         }
-        ntfManager.notifyContactRequestReceived(r.user, ChatInfo.ContactRequest(contactRequest))
+        if (rhId == null) ntfManager.notifyContactRequestReceived(r.user, ChatInfo.ContactRequest(contactRequest))
       }
       is CR.ContactUpdated -> {
         if (active(r.user) && chatModel.chatsContext.hasChat(rhId, r.toContact.id)) {
@@ -3061,7 +3164,7 @@ object ChatController {
             chatModel.chatsContext.updateChatInfo(rhId, r.chatInfo)
           }
         }
-      is CR.NewChatItems -> withBGApi {
+      is CR.NewChatItems -> {
         r.chatItems.forEach { chatItem ->
           val cInfo = chatItem.chatInfo
           val cItem = chatItem.chatItem
@@ -3080,7 +3183,7 @@ object ChatController {
           }
           val file = cItem.file
           val mc = cItem.content.msgContent
-          if (file != null &&
+          if (rhId == null && !cItem.chatDir.sent && file != null &&
             appPrefs.privacyAcceptImages.get() &&
             ((mc is MsgContent.MCImage && file.fileSize <= MAX_IMAGE_SIZE_AUTO_RCV)
                 || (mc is MsgContent.MCVideo && file.fileSize <= MAX_VIDEO_SIZE_AUTO_RCV)
@@ -3135,7 +3238,7 @@ object ChatController {
             AudioPlayer.stop(cItem)
           }
           val isLastChatItem = chatModel.getChat(cInfo.id)?.chatItems?.lastOrNull()?.id == cItem.id
-          if (isLastChatItem && ntfManager.hasNotificationsForChat(cInfo.id)) {
+          if (rhId == null && isLastChatItem && ntfManager.hasNotificationsForChat(cInfo.id)) {
             ntfManager.cancelNotificationsForChat(cInfo.id)
             ntfManager.displayNotification(
               r.user,
@@ -3384,7 +3487,7 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.RcvFileSndCancelled -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        cleanupFile(r.chatItem)
+        cleanupFile(rhId, r.chatItem)
       }
       is CR.RcvFileProgressXFTP -> {
         if (r.chatItem_ != null) {
@@ -3394,7 +3497,7 @@ object ChatController {
       is CR.RcvFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.RcvFileWarning -> {
@@ -3406,12 +3509,12 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.SndFileComplete -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        cleanupDirectFile(r.chatItem)
+        cleanupDirectFile(rhId, r.chatItem)
       }
       is CR.SndFileRcvCancelled -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupDirectFile(r.chatItem_)
+          cleanupDirectFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileProgressXFTP -> {
@@ -3425,7 +3528,7 @@ object ChatController {
       is CR.SndFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileWarning -> {
@@ -3568,7 +3671,7 @@ object ChatController {
         val sess = chatModel.remoteCtrlSession.value
         if (sess != null) {
           chatModel.remoteCtrlSession.value = null
-          ModalManager.fullscreen.closeModals()
+          if (appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
           fun showAlert(chatError: ChatError) {
             when {
               r.rcStopReason is RemoteCtrlStopReason.Disconnected ->
@@ -3619,9 +3722,7 @@ object ChatController {
             }
           }
 
-          if (sess.sessionState is UIRemoteCtrlSessionState.Connected) {
-            switchToLocalSession()
-          }
+
         }
       }
       is CR.ContactPQEnabled ->
@@ -3664,13 +3765,16 @@ object ChatController {
     }
   }
 
-  private fun cleanupDirectFile(aChatItem: AChatItem) {
+  private fun cleanupDirectFile(rhId: Long?, aChatItem: AChatItem) {
     if (aChatItem.chatInfo.chatType == ChatType.Direct) {
-      cleanupFile(aChatItem)
+      cleanupFile(rhId, aChatItem)
     }
   }
 
-  private fun cleanupFile(aChatItem: AChatItem) {
+  private fun cleanupFile(rhId: Long?, aChatItem: AChatItem) {
+    // All cleanup entry points, including command replies, carry the owner.
+    // A phone-relative file name must never remove a desktop-local file.
+    if (rhId != null) return
     val cItem = aChatItem.chatItem
     val mc = cItem.content.msgContent
     val fileName = cItem.file?.fileName
@@ -3843,6 +3947,7 @@ object ChatController {
     AlertManager.shared.hideAllAlerts()
     AlertManager.privacySensitive.hideAllAlerts()
     chatModel.currentRemoteHost.value = switchRemoteHost(rhId)
+    chatModel.resetUIState()
     reloadRemoteHosts()
     val user = apiGetActiveUser(rhId)
     val users = listUsers(rhId)
@@ -3862,6 +3967,10 @@ object ChatController {
       }
     }
     getUserChatData(rhId)
+    if (rhId != null && user != null) {
+      uiSnapshotPending = true
+      reconcileUI(rhId)
+    }
   }
 
   suspend fun showProgressIfNeeded(block: suspend () -> Unit) {
@@ -4032,6 +4141,8 @@ sealed class CC {
   class ApiSaveSettings(val settings: AppSettings): CC()
   class ApiGetSettings(val settings: AppSettings): CC()
   class ApiGetChatTags(val userId: Long): CC()
+  class EnableUI: CC()
+  class UIState(val ref: String?, val count: Int): CC()
   class ApiGetChats(val userId: Long): CC()
   class ApiGetChat(val type: ChatType, val id: Long, val scope: GroupChatScope?, val contentTag: MsgContentTag?, val pagination: ChatPagination, val search: String = ""): CC()
   class ApiGetChatContentTypes(val type: ChatType, val id: Long, val scope: GroupChatScope?): CC()
@@ -4230,6 +4341,8 @@ sealed class CC {
     is ApiSaveSettings -> "/_save app settings ${json.encodeToString(settings)}"
     is ApiGetSettings -> "/_get app settings ${json.encodeToString(settings)}"
     is ApiGetChatTags -> "/_get tags $userId"
+    is EnableUI -> "/_ui enable"
+    is UIState -> "/_ui snapshot${ref?.let { " $it" } ?: ""} count=$count"
     is ApiGetChats -> "/_get chats $userId pcc=on"
     is ApiGetChat -> {
       val tag = if (contentTag == null) {
@@ -4449,6 +4562,8 @@ sealed class CC {
     is ApiSaveSettings -> "apiSaveSettings"
     is ApiGetSettings -> "apiGetSettings"
     is ApiGetChatTags -> "apiGetChatTags"
+    is EnableUI -> "enableUI"
+    is UIState -> "uiState"
     is ApiGetChats -> "apiGetChats"
     is ApiGetChat -> "apiGetChat"
     is ApiGetChatContentTypes -> "apiGetChatContentTypes"
@@ -6830,6 +6945,8 @@ private fun <T> decodeObject(deserializer: DeserializationStrategy<T>, obj: Json
 // Spec: spec/api.md#CR
 @Serializable
 sealed class CR {
+  @Serializable @SerialName("uiStateChanged") class UIStateChanged(val uiVersion: Int, val revision: Long, val origin: String): CR()
+  @Serializable @SerialName("uiState") class UIState(val uiVersion: Int, val revision: Long, val user: User, val users: List<UserInfo>, val chats: List<Chat>, val openChat: Chat? = null, val userTags: List<ChatTag>): CR()
   @Serializable @SerialName("activeUser") class ActiveUser(val user: User): CR()
   @Serializable @SerialName("usersList") class UsersList(val users: List<UserInfo>): CR()
   @Serializable @SerialName("chatStarted") class ChatStarted: CR()
@@ -7036,6 +7153,8 @@ sealed class CR {
   @Serializable class Invalid(val str: String): CR()
 
   val responseType: String get() = when(this) {
+    is UIStateChanged -> "uiStateChanged"
+    is UIState -> "uiState"
     is ActiveUser -> "activeUser"
     is UsersList -> "usersList"
     is ChatStarted -> "chatStarted"
@@ -7232,6 +7351,8 @@ sealed class CR {
   }
 
   val details: String get() = when(this) {
+    is UIStateChanged -> "revision=$revision origin=$origin"
+    is UIState -> "revision=$revision chats=${chats.size}"
     is ActiveUser -> withUser(user, json.encodeToString(user))
     is UsersList -> json.encodeToString(users)
     is ChatStarted -> noDetails()

@@ -19,7 +19,7 @@
 module Simplex.Chat.Library.Commands where
 
 import Control.Applicative (optional, (<|>))
-import Control.Concurrent.STM (retry)
+import Control.Concurrent.STM (check, retry)
 import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Except
@@ -69,6 +69,7 @@ import Simplex.Chat.Badges.StorePlan (storePlan)
 import Simplex.Chat.Names (SimplexDomainProof (..), SimplexDomainClaim (..), claimDomain, mkDomainClaim)
 import Simplex.Chat.Call
 import Simplex.Chat.Controller
+import Simplex.Chat.Controller.Concurrent (withCommandGate)
 import Simplex.Chat.Delivery (DeliveryJobScope (..), DeliveryJobSpec (..), DeliveryWorkerScope (..))
 import Simplex.Chat.Files
 import Simplex.Chat.Image (cropToSquare, decodeResizable, resizeImageDataUri)
@@ -384,9 +385,16 @@ restoreCalls = do
   atomically $ writeTVar calls callsMap
 
 stopChatController :: ChatController -> IO ()
-stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, remoteHostSessions, remoteCtrlSession, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
-  readTVarIO remoteHostSessions >>= mapM_ (cancelRemoteHost False . snd)
-  atomically (stateTVar remoteCtrlSession (,Nothing)) >>= mapM_ (cancelRemoteCtrl False . snd)
+stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, currentRemoteHost, remoteHostSessions, remoteCtrlSession, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
+  (hosts, ctrl) <- atomically $ do
+    hosts <- swapTVar remoteHostSessions M.empty
+    writeTVar currentRemoteHost Nothing
+    ctrl <- takeRemoteCtrlSession remoteCtrlSession Nothing
+    pure (hosts, ctrl)
+  -- Unpublish before cancellation: closing HTTP2 invokes the disconnect
+  -- callback, which must not recursively cancel the same published session.
+  mapM_ (cancelRemoteCtrl False) ctrl
+  mapM_ (cancelRemoteHost False . snd) hosts
   disconnectAgentClient smpAgent
   readTVarIO s >>= mapM_ (\(a1, a2) -> uninterruptibleCancel a1 >> mapM_ uninterruptibleCancel a2)
   cancelAsync cleanupManagerAsync
@@ -445,14 +453,99 @@ execChatCommand src s retryNum =
   where
     execLocal cmd = do
       cc@ChatController {config = ChatConfig {chatHooks}} <- ask
-      case preCmdHook chatHooks of
-        Just hook -> liftIO (hook cc cmd) >>= either pure (`execChatCommand'` retryNum)
-        Nothing -> execChatCommand' cmd retryNum
+      enabled <- chatReadVar' simultaneousUI
+      let remoteIdentity = case src of
+            CSRemoteCtrl -> enabled && profileLifecycleCommand cmd
+            _ -> False
+      -- Remote identity mutations must fail before taking the profile gate:
+      -- an admitted request owns a lease which a local post-unlink profile
+      -- change may already be waiting to drain.
+      result <- if remoteIdentity
+        then pure $ Left $ ChatErrorRemoteCtrl RCEBusy
+        else case preCmdHook chatHooks of
+          Just hook -> liftIO (hook cc cmd) >>= either pure (`execChatCommand'` retryNum)
+          Nothing -> execChatCommand' cmd retryNum
+      when (either (const False) (\r -> sharedMutation r || tagMutation cmd) result) $ invalidateUI src
+      pure result
+
+-- Invalidation is intentionally an explicit successful-result policy. Query
+-- replies must not invalidate, otherwise a receiver taking a snapshot loops.
+tagMutation :: ChatCommand -> Bool
+tagMutation APICreateChatTag {} = True
+tagMutation _ = False
+
+sharedMutation :: ChatResponse -> Bool
+sharedMutation = \case
+  CRCmdOk {} -> True
+  CRNewChatItems {} -> True
+  CRChatItemUpdated {} -> True
+  CRChatItemReaction {} -> True
+  CRChatItemsDeleted {} -> True
+  CRGroupChatItemsDeleted {} -> True
+  CRChatCleared {} -> True
+  CRItemsReadForChat {} -> True
+  CRContactDeleted {} -> True
+  CRContactAliasUpdated {} -> True
+  CRContactPrefsUpdated {} -> True
+  CRGroupAliasUpdated {} -> True
+  CRGroupCreated {} -> True
+  CRPublicGroupCreated {} -> True
+  CRNewPreparedChat {} -> True
+  CRInvitation {} -> True
+  CRSentConfirmation {} -> True
+  CRSentInvitation {} -> True
+  CRStartedConnectionToContact {} -> True
+  CRStartedConnectionToGroup {} -> True
+  CRAcceptingContactRequest {} -> True
+  CRContactRequestRejected {} -> True
+  CRLeftMemberUser {} -> True
+  CRGroupDeletedUser {} -> True
+  CRUserDeletedMembers {} -> True
+  CRMemberSupportChatRead {} -> True
+  CRMemberSupportChatDeleted {} -> True
+  CRJoinedGroupMember {} -> True
+  CRMemberAccepted {} -> True
+  CRMembersRoleUser {} -> True
+  CRMembersBlockedForAllUser {} -> True
+  CRUserProfileUpdated {} -> True
+  CRUserPrivacy {} -> True
+  CRContactUserChanged {} -> True
+  CRGroupUserChanged {} -> True
+  CRConnectionAliasUpdated {} -> True
+  CRConnectionUserChanged {} -> True
+  CRRcvFileCancelled {} -> True
+  CRSndFileCancelled {} -> True
+  CRGroupUpdated {} -> True
+  CRTagsUpdated {} -> True
+  CRRcvFileAccepted {} -> True
+  _ -> False
 
 execChatCommand' :: ChatCommand -> Int -> CM' (Either ChatError ChatResponse)
-execChatCommand' cmd retryNum = handleCommandError $ do
-  cxt <- chatStoreCxt
-  processChatCommand cxt (NRMInteractive' retryNum) cmd
+execChatCommand' cmd retryNum =
+  if profileLifecycleCommand cmd
+    then do
+      gate <- asks profileCreationGate
+      withRunInIO $ \run -> withCommandGate gate $ run execute
+    else execute
+  where
+    execute = handleCommandError $ do
+      cxt <- chatStoreCxt
+      processChatCommand cxt (NRMInteractive' retryNum) cmd
+
+-- Only identity transitions and pairing admission share this gate. Normal
+-- commands, snapshots and event reads never hold it, so a receiver can issue
+-- commands without a command/output-queue wait cycle.
+profileLifecycleCommand :: ChatCommand -> Bool
+profileLifecycleCommand = \case
+  CreateActiveUser {} -> True
+  APISetActiveUser {} -> True
+  SetActiveUser {} -> True
+  APIDeleteUser {} -> True
+  DeleteUser {} -> True
+  ConnectRemoteCtrl {} -> True
+  FindKnownRemoteCtrl -> True
+  ConfirmRemoteCtrl {} -> True
+  _ -> False
 
 execRemoteCommand :: RemoteHostId -> ChatCommand -> ByteString -> Int -> CM' (Either ChatError ChatResponse)
 execRemoteCommand rhId cmd s retryNum = handleCommandError $ getRemoteHostClient rhId >>= \rh -> processRemoteCommand rhId rh cmd s retryNum
@@ -465,14 +558,53 @@ handleCommandError a = runExceptT a `E.catches` ioErrors
         E.Handler $ pure . Left . fromSomeException
       ]
 
+-- The authoritative core has one implicit active user. Until profile leases
+-- exist, freeze profile identity from pairing through disconnect.
+checkUIProfileChange :: CM ()
+checkUIProfileChange = do
+  enabled <- chatReadVar simultaneousUI
+  session <- chatReadVar remoteCtrlSession
+  when enabled $ do
+    when (isJust session) $ throwError $ ChatErrorRemoteCtrl RCEBusy
+    -- Revocation unpublishes the session before transport cancellation. An
+    -- already-admitted command must finish/cancel under its original profile.
+    -- New requests cannot acquire a lease on the revoked session.
+    leases <- asks remoteCommandLeases
+    atomically $ readTVar leases >>= check . (== 0)
+
 parseChatCommand :: ByteString -> Either String ChatCommand
 parseChatCommand = A.parseOnly chatCommandP . B.dropWhileEnd isSpace
 
 -- | Chat API commands interpreted in context of a local zone
 processChatCommand :: StoreCxt -> NetworkRequestMode -> ChatCommand -> CM ChatResponse
 processChatCommand cxt nm = \case
+  APIEnableUI -> do
+    chatWriteVar simultaneousUI True
+    ok_
+  APIUIState ref count -> withUser' $ \user -> do
+    -- Read the barrier BEFORE the transaction: events/mutations committed later
+    -- remain queued and trigger another snapshot, never replay counter deltas.
+    rev <- chatReadVar uiRevision
+    ChatConfig {maxChats} <- asks config
+    withFastStore $ \db -> do
+      users <- liftIO $ getUsersInfo db
+      previews <- liftIO $ getChatPreviews db cxt user True (PTLast maxChats) clqNoFilters
+      chats <- mapM (liftEither) previews
+      tags <- liftIO $ getUserChatTags db user
+      openChat <- case ref of
+        Nothing -> pure Nothing
+        Just (ChatRef ct cid scope) ->
+          let page = CPLast $ max 1 $ min 10000 count
+              detail = case ct of
+                CTDirect -> AChat SCTDirect . fst <$> getDirectChat db cxt user cid Nothing page Nothing
+                CTGroup -> AChat SCTGroup . fst <$> getGroupChat db cxt user cid scope Nothing page Nothing
+                CTLocal -> AChat SCTLocal . fst <$> getLocalChat db user cid Nothing page Nothing
+                _ -> throwError $ SEInternalError "unsupported UI snapshot chat"
+           in (Just <$> detail) `catchError` const (pure Nothing)
+      pure $ CRUiState 1 rev user users chats openChat tags
   ShowActiveUser -> withUser' $ pure . CRActiveUser
   CreateActiveUser NewUser {profile, pastTimestamp, userChatRelay, clientService} -> do
+    checkUIProfileChange
     forM_ profile $ \p@Profile {displayName, image} -> do
       checkValidName displayName
       checkProfileImageSize image
@@ -528,6 +660,7 @@ processChatCommand cxt nm = \case
       day = 86400
   ListUsers -> CRUsersList <$> withFastStore' getUsersInfo
   APISetActiveUser userId' viewPwd_ -> do
+    checkUIProfileChange
     unlessM (lift chatStarted) $ throwChatError CEChatNotStarted
     user_ <- chatReadVar currentUser
     user' <- privateGetUser userId'
@@ -607,6 +740,7 @@ processChatCommand cxt nm = \case
         setStoreChanged
         ok user'
   APIDeleteUser userId' delSMPQueues viewPwd_ -> withUser $ \user -> do
+    checkUIProfileChange
     user' <- privateGetUser userId'
     validateUserPassword user user' viewPwd_
     checkDeleteChatUser user'
@@ -6682,6 +6816,8 @@ chatCommandP =
       "/create user " *> (CreateActiveUser <$> newUserP False),
       "/create chat relay user " *> (CreateActiveUser <$> newUserP True),
       "/create bot " *> (CreateActiveUser <$> newBotUserP),
+      "/_ui enable" $> APIEnableUI,
+      "/_ui snapshot" *> (APIUIState <$> optional (A.space *> chatRefP) <* " count=" <*> A.decimal),
       "/users" $> ListUsers,
       "/_user " *> (APISetActiveUser <$> A.decimal <*> optional (A.space *> jsonP)),
       ("/user " <|> "/u ") *> (SetActiveUser <$> displayNameP <*> optional (A.space *> pwdP)),

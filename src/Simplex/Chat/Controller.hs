@@ -21,6 +21,7 @@ import Control.Concurrent (ThreadId)
 import Control.Concurrent.Async (Async)
 import Control.Exception (Exception)
 import qualified Control.Exception as E
+import Control.Monad (when, void)
 import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
@@ -55,6 +56,7 @@ import Numeric.Natural
 import qualified Paths_simplex_chat as SC
 import Simplex.Chat.AppSettings
 import Simplex.Chat.Call
+import Simplex.Chat.Controller.Concurrent
 import Simplex.Chat.Delivery
 import Simplex.Chat.Messages
 import Simplex.Chat.Messages.CIContent
@@ -317,6 +319,10 @@ data ChatController = ChatController
     eventSeq :: TVar Int,
     inputQ :: TBQueue String,
     outputQ :: TBQueue (Maybe RemoteHostId, Either ChatError ChatEvent),
+    simultaneousUI :: TVar Bool,
+    uiRevision :: TVar Int64,
+    remoteCommandLeases :: TVar Int,
+    profileCreationGate :: CommandGate, -- protect name check + agent/store allocation
     subscriptionMode :: TVar SubscriptionMode,
     processServiceRequests :: TVar Bool,
     chatLock :: Lock,
@@ -360,6 +366,8 @@ data HelpSection = HSMain | HSFiles | HSGroups | HSContacts | HSMyAddress | HSIn
 
 data ChatCommand
   = ShowActiveUser
+  | APIEnableUI
+  | APIUIState (Maybe ChatRef) Int
   | CreateActiveUser {newUser :: NewUser}
   | ListUsers
   | APISetActiveUser {userId :: UserId, viewPwd :: Maybe UserPwd}
@@ -748,6 +756,16 @@ data CommandSource
 
 allowRemoteCommand :: ChatCommand -> Bool -- XXX: consider using Relay/Block/ForceLocal
 allowRemoteCommand = \case
+  APISendCallInvitation {} -> False
+  SendCallInvitation {} -> False
+  APIRejectCall {} -> False
+  APISendCallOffer {} -> False
+  APISendCallAnswer {} -> False
+  APISendCallExtraInfo {} -> False
+  APIEndCall {} -> False
+  APICallStatus {} -> False
+  APIGetCallInvitations -> False
+  APIEnableUI -> False
   StartChat {} -> False
   APIStopChat -> False
   APIActivateChat _ -> False
@@ -821,6 +839,7 @@ data RelayTest = RelayTest
 
 data ChatResponse
   = CRActiveUser {user :: User}
+  | CRUiState {uiVersion :: Int, revision :: Int64, user :: User, users :: [UserInfo], chats :: [AChat], openChat :: Maybe AChat, userTags :: [ChatTag]}
   | CRUsersList {users :: [UserInfo]}
   | CRChatStarted
   | CRChatRunning
@@ -987,6 +1006,7 @@ data ChatResponse
 
 data ChatEvent
   = CEvtChatSuspended
+  | CEvtUiStateChanged {uiVersion :: Int, revision :: Int64, origin :: Text}
   | CEvtContactSwitch {user :: User, contact :: Contact, switchProgress :: SwitchProgress}
   | CEvtGroupMemberSwitch {user :: User, groupInfo :: GroupInfo, member :: GroupMember, switchProgress :: SwitchProgress}
   | CEvtContactRatchetSync {user :: User, contact :: Contact, ratchetSyncProgress :: RatchetSyncProgress}
@@ -1119,6 +1139,15 @@ data DeletedRcvQueue = DeletedRcvQueue
 allowRemoteEvent :: ChatEvent -> Bool
 allowRemoteEvent = \case
   CEvtChatSuspended -> False
+  -- Only the app that owns the platform-store transaction can finish it.
+  -- Badge state still travels to the remote UI through CEvtBadgeChanged.
+  CEvtCallInvitation {} -> False
+  CEvtCallOffer {} -> False
+  CEvtCallAnswer {} -> False
+  CEvtCallExtraInfo {} -> False
+  CEvtCallEnded {} -> False
+  CEvtStorePurchaseCredited {} -> False
+  CEvtStorePurchaseRefused {} -> False
   CEvtRemoteHostSessionCode {} -> False
   CEvtNewRemoteHost _ -> False
   CEvtRemoteHostConnected {} -> False
@@ -1698,7 +1727,7 @@ data RemoteCtrlSession
         tls :: TLS 'TClient,
         rcsSession :: RCCtrlSession,
         http2Server :: Async (),
-        remoteOutputQ :: TBQueue (Either ChatError ChatEvent),
+        remoteOutputQ :: EventBuffer (Either ChatError ChatEvent),
         ctrlAppInfo :: CtrlAppInfo
       }
 
@@ -1797,12 +1826,48 @@ toView_ ev = do
   event <- case eventHook chatHooks of
     Just hook -> liftIO $ hook cc ev
     Nothing -> pure ev
-  atomically $
+  atomically $ do
+    modifyTVar' (uiRevision cc) (+ 1)
     readTVar session >>= \case
       Just (_, RCSessionConnected {remoteOutputQ})
-        | either (const True) allowRemoteEvent event -> writeTBQueue remoteOutputQ event
+        | either (const True) allowRemoteEvent event -> do
+            writeEventBuffer remoteOutputQ event
+            enabled <- readTVar $ simultaneousUI cc
+            when enabled $ writeUIOutput cc (Nothing, event)
       -- TODO potentially, it should hold some events while connecting
-      _ -> writeTBQueue localQ (Nothing, event)
+      _ -> do
+        enabled <- readTVar $ simultaneousUI cc
+        if enabled then writeUIOutput cc (Nothing, event) else writeTBQueue localQ (Nothing, event)
+
+-- A frontend may issue commands from its receiver. Never wait for that same
+-- receiver to drain a queue: overflow discards deltas and demands a snapshot.
+-- Insertion of the marker and discarding the queue are one STM transaction.
+writeUIOutput :: ChatController -> (Maybe RemoteHostId, Either ChatError ChatEvent) -> STM ()
+writeUIOutput ChatController {outputQ, uiRevision} out = do
+  full <- isFullTBQueue outputQ
+  if full
+    then do
+      void $ flushTBQueue outputQ
+      rev <- readTVar uiRevision
+      writeTBQueue outputQ (fst out, Right $ CEvtUiStateChanged 1 rev "overflow")
+    else writeTBQueue outputQ out
+
+-- Successful replies stay private to the caller. Subscribers receive only an
+-- invalidation, never a command error, password or request-specific payload.
+invalidateUI :: CommandSource -> CM' ()
+invalidateUI src = do
+  cc@ChatController {simultaneousUI, uiRevision, remoteCtrlSession} <- ask
+  atomically $ do
+    enabled <- readTVar simultaneousUI
+    when enabled $ do
+      rev <- stateTVar uiRevision $ \n -> (n + 1, n + 1)
+      let ev = Right $ CEvtUiStateChanged 1 rev $ case src of
+            CSRemoteCtrl -> "remote"
+            _ -> "local"
+      writeUIOutput cc (Nothing, ev)
+      readTVar remoteCtrlSession >>= \case
+        Just (_, RCSessionConnected {remoteOutputQ}) -> writeEventBuffer remoteOutputQ ev
+        _ -> pure ()
 
 withStore' :: (DB.Connection -> IO a) -> CM a
 withStore' action = withStore $ liftIO . action

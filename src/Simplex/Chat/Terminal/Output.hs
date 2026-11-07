@@ -16,9 +16,11 @@ import Control.Logger.Simple
 import Control.Monad
 import Control.Monad.Catch (MonadMask)
 import Control.Monad.Reader
+import Data.ByteString (ByteString)
 import Data.List (intercalate)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Encoding (encodeUtf8)
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.LocalTime (getCurrentTimeZone)
 import Simplex.Chat.Controller
@@ -146,8 +148,8 @@ runTerminalOutput ct cc@ChatController {outputQ, showLiveItems, logFilePath} Cha
   forever $ do
     (outputRH, r_) <- atomically $ readTBQueue outputQ
     forM_ r_ $ \case
-      CEvtNewChatItems u (ci : _) -> when markRead $ markChatItemRead u ci -- At the moment of writing received items are created one at a time
-      CEvtChatItemUpdated u ci -> when markRead $ markChatItemRead u ci
+      CEvtNewChatItems u (ci : _) -> when markRead $ markChatItemRead cc outputRH u ci -- At the moment of writing received items are created one at a time
+      CEvtChatItemUpdated u ci -> when markRead $ markChatItemRead cc outputRH u ci
       CEvtRemoteHostConnected {remoteHost = RemoteHostInfo {remoteHostId}} -> getRemoteUser remoteHostId
       CEvtRemoteHostStopped {remoteHostId_} -> mapM_ removeRemoteUser remoteHostId_
       _ -> pure ()
@@ -158,19 +160,33 @@ runTerminalOutput ct cc@ChatController {outputQ, showLiveItems, logFilePath} Cha
     responseString ct cc liveItems outputRH r_ >>= printEvent
     mapM_ (chatEventNotification ct cc) r_
   where
-    markChatItemRead u (AChatItem _ _ chat ci@ChatItem {chatDir, meta = CIMeta {itemStatus}}) =
-      case (chatDirNtf u chat chatDir (isUserMention ci), itemStatus) of
-        (True, CISRcvNew) -> do
-          let itemId = chatItemId' ci
-              chatRef_ = chatInfoToRef chat
-          forM_ chatRef_ $ \chatRef -> runReaderT (execChatCommand' (APIChatItemsRead chatRef [itemId]) 0) cc
-        _ -> pure ()
     logResponse path s = withFile path AppendMode $ \h -> mapM_ (hPutStrLn h . unStyle) s
     getRemoteUser rhId =
       runReaderT (execChatCommand (CSRemoteHost rhId) "/user" 0) cc >>= \case
         Right CRActiveUser {user} -> updateRemoteUser ct user rhId
         cr -> logError $ "Unexpected reply while getting remote user: " <> tshow cr
     removeRemoteUser rhId = atomically $ TM.delete rhId (currentRemoteUsers ct)
+
+markChatItemRead :: ChatController -> Maybe RemoteHostId -> User -> AChatItem -> IO ()
+markChatItemRead cc outputRH u (AChatItem _ _ chat ci@ChatItem {chatDir, meta = CIMeta {itemStatus}}) =
+  case (chatDirNtf u chat chatDir (isUserMention ci), itemStatus) of
+    (True, CISRcvNew) -> do
+      let itemId = chatItemId' ci
+      forM_ (chatInfoToRef chat) $ \chatRef -> flip runReaderT cc $ case outputRH of
+        Nothing -> execChatCommand' (APIChatItemsRead chatRef [itemId]) 0
+        Just rhId -> execChatCommand (CSRemoteHost rhId) (remoteReadCommand chatRef itemId) 0
+    _ -> pure ()
+
+-- Preserve the origin of an event when marking it read. Remote item/contact
+-- identifiers are scoped to the owning phone's store; using the local command
+-- path can mark an unrelated desktop chat read when its IDs happen to match.
+remoteReadCommand :: ChatRef -> ChatItemId -> ByteString
+remoteReadCommand (ChatRef cType cId scope) itemId = encodeUtf8 $
+  "/_read chat items " <> chatTypeStr cType <> tshow cId <> scopeText <> " " <> tshow itemId
+  where
+    scopeText = case scope of
+      Nothing -> ""
+      Just (GCSMemberSupport memberId_) -> "(_support" <> maybe "" ((":" <>) . tshow) memberId_ <> ")"
 
 chatEventNotification :: ChatTerminal -> ChatController -> ChatEvent -> IO ()
 chatEventNotification t@ChatTerminal {sendNotification} cc = \case

@@ -1,6 +1,17 @@
 name: desktop-linux
 
 on:
+  workflow_call:
+    inputs:
+      claude:
+        type: boolean
+        default: false
+      backend:
+        type: boolean
+        default: false
+      release:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       claude:
@@ -248,7 +259,7 @@ jobs:
         if: ${{ !cancelled() && steps.core.outcome == 'success' }}
         working-directory: apps/multiplatform
         run: |
-          ./gradlew --no-daemon --console=plain -Psimplex.assets.dir=../../assets -Pkotlin.daemon.jvmargs=-Xmx4g :desktop:createDistributable
+          ./gradlew --no-daemon --console=plain --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' -Psimplex.assets.dir=../../assets :desktop:createDistributable
           app=release/main/app/simplex
           ls -la "$app/bin" "$app/lib/app/resources"
           du -sh "$app"
@@ -274,7 +285,7 @@ jobs:
         working-directory: apps/multiplatform
         env:
           SNAPSHOT_DIR: ${{ runner.temp }}/snapshots
-        run: ./gradlew --no-daemon --console=plain -Psimplex.assets.dir=../../assets -Pkotlin.daemon.jvmargs=-Xmx4g :common:desktopTest
+        run: ./gradlew --no-daemon --console=plain --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' -Psimplex.assets.dir=../../assets :common:desktopTest
 
       - name: Report desktop tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}

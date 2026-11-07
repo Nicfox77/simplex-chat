@@ -37,6 +37,9 @@ abstract class NtfManager {
   )
 
   fun notifyMessageReceived(rhId: Long?, user: UserLike, cInfo: ChatInfo, cItem: ChatItem) {
+    // The phone owns background notifications. Mirrored sent items and remote
+    // viewer events must not create a second alert (or a local-database action).
+    if (rhId != null || cItem.chatDir.sent) return
     if (
       cItem.showNotification &&
       cInfo.ntfsEnabled(cItem) &&

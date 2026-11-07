@@ -1,6 +1,20 @@
 name: android-emu
 
 on:
+  workflow_call:
+    inputs:
+      claude:
+        type: boolean
+        default: false
+      backend:
+        type: boolean
+        default: false
+      release:
+        type: boolean
+        default: false
+      armv7a:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       claude:
@@ -273,7 +287,7 @@ jobs:
         if: ${{ !cancelled() && steps.core.outcome == 'success' }}
         working-directory: apps/multiplatform
         run: |
-          ./gradlew --no-daemon --console=plain -Psimplex.assets.dir=../../assets -Pandroid.injected.build.abi=arm64-v8a :android:assembleFossDebug
+          ./gradlew --no-daemon --console=plain --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' -Psimplex.assets.dir=../../assets -Pandroid.injected.build.abi=arm64-v8a :android:assembleFossDebug
           mkdir -p "$RUNNER_TEMP/apk"
           cp "android/build/intermediates/apk/foss/debug/$APK" "$RUNNER_TEMP/apk"
           ls -la "$RUNNER_TEMP/apk"
