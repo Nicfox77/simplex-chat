@@ -10,13 +10,18 @@ import ChatClient
 import ChatTests.DBUtils
 import ChatTests.Utils
 import Control.Logger.Simple
+import Control.Concurrent.STM (retry)
 import Control.Monad
 import Control.Monad.Except (runExceptT)
+import Control.Monad.Reader (runReaderT)
 import qualified Data.Aeson as J
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as BC
 import Data.ByteString.Builder (toLazyByteString)
 import qualified Data.ByteString.Lazy.Char8 as LB
 import Data.List (find, isPrefixOf)
+import Data.Maybe (isJust)
+import qualified Data.Text as T
 import qualified Data.Map.Strict as M
 import Data.Word (Word32)
 import Simplex.Chat.Controller (ChatCommand (..), ChatConfig (..), versionNumber)
@@ -25,17 +30,24 @@ import Simplex.Chat.Library.Commands (parseChatCommand)
 import qualified Simplex.Chat.Controller as Controller
 import Simplex.Chat.Mobile.File
 import Simplex.Chat.Remote (remoteFilesFolder, validRemoteFileName)
+import qualified Simplex.Chat.Remote as Remote
 import Simplex.Chat.Remote.Protocol (encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
+import qualified Simplex.Chat.Store.Remote as RemoteStore
 import Simplex.Chat.Remote.Types
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFileArgs (..))
 import Simplex.Messaging.Encoding (smpEncode)
-import Simplex.Messaging.Encoding.String (strEncode)
+import Simplex.Messaging.Encoding.String (strEncode, strDecode)
 import qualified Simplex.Messaging.TMap as TM
 import Simplex.Messaging.Transport (TSbChainKeys (..))
+import Simplex.Messaging.Transport.Client (TransportHost (..))
+import qualified Network.Socket as NS
+import Simplex.RemoteControl.Discovery (getLocalAddress)
+import qualified Simplex.Messaging.Transport.HTTP2.Client as H2
 import Simplex.Messaging.Transport.HTTP2 (HTTP2BodyChunk (..), getHTTP2Body)
 import Simplex.Messaging.Util
 import Simplex.RemoteControl.Types (RCCtrlAddress (..))
+import Simplex.RemoteControl.Invitation (RCSignedInvitation (..), RCInvitation (..), verifySignedInvitation)
 import System.FilePath (takeFileName, (</>))
 import Test.Hspec hiding (it)
 import UnliftIO
@@ -61,6 +73,30 @@ remoteTests = describe "Remote" $ do
       filter (not . sanitized) fileNames `shouldBe` []
     it "sanitizes to a name with no directory components" $ \_ ->
       filter (not . bareName) fileNames `shouldBe` []
+  describe "recovery address" $ do
+    it "accepts only tailnet IPv4 and well formed DNS names" $ \_ -> do
+      forM_ ["100.64.0.1", "100.127.255.254", "desktop", "desktop.tailnet.ts.net"] $ \h ->
+        Remote.validRecoveryHost (either error id $ strDecode h) `shouldBe` True
+      forM_ ["192.168.1.1", "100.128.0.1", "-desktop", "desktop..ts.net"] $ \h ->
+        Remote.validRecoveryHost (either error id $ strDecode h) `shouldBe` False
+  describe "controller idle watchdog" $ do
+    it "closes a silent transport without waiting for TCP to fail" $ \_ -> do
+      activity <- newEmptyTMVarIO
+      closed <- newEmptyTMVarIO
+      withAsync (Remote.remoteCtrlWatchdog 10000 activity $ atomically $ putTMVar closed ()) $ \worker -> do
+        timeout 2000000 (wait worker) `shouldReturn` Just ()
+        atomically (tryTakeTMVar closed) `shouldReturn` Just ()
+    it "keeps an active transport and cancels the timer with its owner" $ \_ -> do
+      activity <- newEmptyTMVarIO
+      closed <- newEmptyTMVarIO
+      worker <- async $ Remote.remoteCtrlWatchdog 500000 activity $ atomically $ putTMVar closed ()
+      replicateM_ 5 $ do
+        atomically $ void $ tryPutTMVar activity ()
+        threadDelay 20000
+      atomically (isEmptyTMVar closed) `shouldReturn` True
+      cancel worker
+      threadDelay 550000
+      atomically (isEmptyTMVar closed) `shouldReturn` True
   describe "skipped keys" $ do
     it "keeps the most recent skipped keys" $ \_ -> do
       (_, pk) <- atomically . C.generateKeyPair =<< C.newRandom
@@ -112,6 +148,17 @@ runRemoteTests = do
     it "connects with new pairing (stops mobile)" $ remoteHandshakeTest False
     it "connects with new pairing (stops desktop)" $ remoteHandshakeTest True
     it "connects with stored pairing" remoteHandshakeStoredTest
+    it "restores the desktop database with fresh invitation keys and no new QR" desktopRestartTest
+    it "restores the phone database and revokes recovery on authenticated stop" phoneRestartTest
+    it "cannot revive a stopped backend with a delayed authenticated invitation" (delayedRecoveryStopTest False)
+    it "cannot revive an unlinked backend with a delayed authenticated invitation" (delayedRecoveryStopTest True)
+    it "revokes backend recovery while disconnected and cannot re-enable it with a routing edit" persistentStopWaitingTest
+    it "does not restore authorization with a delayed routing write after stop" (delayedRecoveryAddressTest False)
+    it "does not recreate an unlinked pairing with a delayed routing write" (delayedRecoveryAddressTest True)
+    it "does not reopen a stopped listener from a stale startup snapshot" (delayedListenerRestoreTest False)
+    it "does not reopen an unlinked listener from a stale startup snapshot" (delayedListenerRestoreTest True)
+    it "retains a pinned listener after transport loss and reconnects without another invitation" persistentReconnectTest
+    it "deletes an active remote host and closes its listener" persistentUnlinkTest
     xitMacCI "connects with multicast discovery" remoteHandshakeDiscoverTest
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
@@ -174,6 +221,241 @@ remoteHandshakeStoredTest = testRemote $ \compress mobile desktop -> do
   logNote "Starting stored session again"
   startRemoteStored compress mobile desktop
   stopMobile mobile desktop `catchAny` (logError . tshow)
+
+-- Use loopback to run the production retained-listener lifecycle on CI without a tailnet.
+startPersistentRemote :: HasCallStack => String -> TestCC -> TestCC -> IO String
+startPersistentRemote compress mobile desktop = do
+  desktop ##> "/set device name My desktop"
+  desktop <## "ok"
+  mobile ##> "/set device name Mobile"
+  mobile <## "ok"
+  let addr = RCCtrlAddress (either error id $ strDecode "127.0.0.1") "lo"
+  result <- runReaderT (runExceptT $ Remote.startRemoteHostWith True Nothing (Just addr) Nothing) (chatController desktop)
+  (_, _, signed) <- either (fail . show) pure result
+  let inv = BC.unpack $ strEncode signed
+  mobile ##> ("/connect remote ctrl " <> inv)
+  mobile <## ("connecting new remote controller: My desktop, v" <> versionNumber)
+  desktop <## "new remote host connecting"
+  mobile <## "new remote controller connected"
+  -- Neither database grants restart access before the first authenticated HELLO.
+  runRemote mobile (Controller.withStore' RemoteStore.getRemoteCtrls) >>= (\r -> null r `shouldBe` True)
+  runRemote desktop (Controller.withStore' RemoteStore.getRemoteHosts) >>= (\r -> null r `shouldBe` True)
+  verifyRemoteCtrl mobile desktop
+  mobile <## ("remote controller 1 session started with My desktop" <> compress)
+  desktop <## "new remote host 1 added: Mobile"
+  desktop <## ("remote host 1 connected" <> compress)
+  pure inv
+
+-- Close every controller/store/socket and reopen the same on-disk databases.
+-- The Kotlin owner drives /_resume; these checks exercise its real native path.
+desktopRestartTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+desktopRestartTest ((mobileCompression, desktopCompression), ps) =
+  withNewTestChatCfg ps testCfg {remoteCompression = mobileCompression} "mobile" aliceProfile $ \mobile -> do
+    let cfg = testCfg {remoteCompression = desktopCompression}
+        compress = " (" <> (if mobileCompression && desktopCompression then "with" else "no") <> " compression)"
+    old <- withNewTestChatCfg ps cfg "desktop" aliceDesktopProfile $ \desktop -> do
+      inv <- startPersistentRemote compress mobile desktop
+      mobile ##> "/_remote ctrl address 1 localhost"
+      mobile <## "ok"
+      pure inv
+    eventually 3 $ mobile <## "remote controller stopped"
+    withTestChatCfg ps cfg "desktop" $ \desktop -> do
+      desktop ##> "/set device name My desktop"
+      desktop <## "ok"
+      runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+      fresh <- readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= \sessions -> case M.lookup (RHId 1) sessions of
+        Just (_, RHSessionConnecting {invitation}) -> pure $ T.unpack invitation
+        _ -> fail "saved authorized listener was not restored"
+      RCSignedInvitation {invitation = RCInvitation {dh = oldDH, skey = oldSigning}} <- either fail pure $ strDecode $ BC.pack old
+      RCSignedInvitation {invitation = RCInvitation {dh = freshDH, skey = freshSigning}} <- either fail pure $ strDecode $ BC.pack fresh
+      oldDH `shouldNotBe` freshDH
+      oldSigning `shouldNotBe` freshSigning
+      resumeStoredRemote compress mobile desktop
+      stopMobile mobile desktop
+      -- Explicit stop is durable: startup cannot reopen the saved listener.
+      runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+      readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+
+phoneRestartTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+phoneRestartTest ((mobileCompression, desktopCompression), ps) =
+  withNewTestChatCfg ps testCfg {remoteCompression = desktopCompression} "desktop" aliceDesktopProfile $ \desktop -> do
+    let cfg = testCfg {remoteCompression = mobileCompression}
+        compress = " (" <> (if mobileCompression && desktopCompression then "with" else "no") <> " compression)"
+    withNewTestChatCfg ps cfg "mobile" aliceProfile $ \mobile -> void $ startPersistentRemote compress mobile desktop
+    eventually 3 $ desktop <## "remote host 1 stopped"
+    withTestChatCfg ps cfg "mobile" $ \mobile -> do
+      ctrls <- runRemote mobile Remote.listRemoteCtrls
+      map (\Controller.RemoteCtrlInfo {recoveryEnabled} -> recoveryEnabled) ctrls `shouldBe` [True]
+      resumeStoredRemote compress mobile desktop
+      -- A desktop's authenticated stop revokes the phone's saved enable flag.
+      stopDesktop mobile desktop
+      ctrls' <- runRemote mobile Remote.listRemoteCtrls
+      map (\Controller.RemoteCtrlInfo {recoveryEnabled} -> recoveryEnabled) ctrls' `shouldBe` [False]
+      result <- runReaderT (runExceptT $ Remote.resumeRemoteCtrl 1) (chatController mobile)
+      either (const True) (const False) result `shouldBe` True
+      mobile <##. "remote controller stopped"
+
+runRemote :: HasCallStack => TestCC -> Controller.CM a -> IO a
+runRemote client action = runReaderT (runExceptT action) (chatController client) >>= either (fail . show) pure
+
+resumeStoredRemote :: HasCallStack => String -> TestCC -> TestCC -> IO ()
+resumeStoredRemote compress mobile desktop = do
+  mobile ##> "/_resume remote ctrl 1"
+  mobile <## ("connecting remote controller 1: My desktop, v" <> versionNumber)
+  desktop <## "remote host 1 connecting"
+  mobile <## "remote controller 1 connected"
+  verifyRemoteCtrl mobile desktop
+  mobile <## ("remote controller 1 session started with My desktop" <> compress)
+  desktop <## ("remote host 1 connected" <> compress)
+  desktop ##> "/user"
+  desktop <## "user profile: alice (Alice)"
+  desktop <## "use /p <name> [<bio>] to change it"
+
+persistentReconnectTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+persistentReconnectTest = testRemote $ \compress mobile desktop -> do
+  inv <- startPersistentRemote compress mobile desktop
+  Just (oldSeq, _) <- readTVarIO $ Controller.remoteCtrlSession $ chatController mobile
+  forM_ [1..2 :: Int] $ \_ -> do
+    (oldPoll, oldHTTP) <- readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= \sessions -> case M.lookup (RHId 1) sessions of
+      Just (_, RHSessionConnected {rhClient = RemoteHostClient {httpClient}, pollAction}) -> pure (pollAction, H2.action httpClient)
+      _ -> fail "expected a connected remote host"
+    forM_ oldHTTP cancel
+    concurrently_
+      (eventually 3 $ mobile <## "remote controller stopped")
+      (eventually 3 $ desktop <## "remote host 1 stopped")
+    timeout 3000000 (waitCatch oldPoll) >>= (\r -> isJust r `shouldBe` True)
+    retained <- timeout 3000000 . atomically $ do
+      sessions <- readTVar $ Controller.remoteHostSessions $ chatController desktop
+      case M.lookup (RHId 1) sessions of
+        Just (_, RHSessionConnecting {invitation}) -> pure invitation
+        _ -> retry
+    (T.unpack <$> retained) `shouldBe` Just inv
+    mobile ##> ("/connect remote ctrl " <> inv)
+    mobile <## ("connecting remote controller 1: My desktop, v" <> versionNumber)
+    desktop <## "remote host 1 connecting"
+    mobile <## "remote controller 1 connected"
+    verifyRemoteCtrl mobile desktop
+    mobile <## ("remote controller 1 session started with My desktop" <> compress)
+    desktop <## ("remote host 1 connected" <> compress)
+    mobile ##> ("/_abort remote ctrl " <> show oldSeq)
+    mobile <## "ok"
+    readTVarIO (Controller.remoteCtrlSession $ chatController mobile) >>= (\r -> isJust r `shouldBe` True)
+    desktop ##> "/user"
+    desktop <## "user profile: alice (Alice)"
+    desktop <## "use /p <name> [<bio>] to change it"
+  stopMobile mobile desktop
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+
+delayedRecoveryStopTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
+delayedRecoveryStopTest unlink = testRemote $ \compress mobile desktop -> do
+  inv <- startPersistentRemote compress mobile desktop
+  [RemoteCtrl {ctrlPairing = savedPairing, recoveryEndpoint = savedEndpoint}] <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
+  Just (oldSeq, _) <- readTVarIO $ Controller.remoteCtrlSession $ chatController mobile
+  signed <- either fail pure $ strDecode $ BC.pack inv
+  verified <- maybe (fail "invalid test invitation") pure $ verifySignedInvitation signed
+  sessions <- readTVarIO $ Controller.remoteHostSessions $ chatController desktop
+  case M.lookup (RHId 1) sessions of
+    Just (_, RHSessionConnected {rhClient = RemoteHostClient {httpClient}}) -> forM_ (H2.action httpClient) cancel
+    _ -> fail "expected connected link"
+  eventually 3 $ mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  fetched <- newEmptyTMVarIO
+  deliver <- newEmptyTMVarIO
+  let delayedFetch _ _ _ = atomically (putTMVar fetched ()) >> atomically (takeTMVar deliver) >> pure verified
+  withAsync (runReaderT (runExceptT $ Remote.resumeRemoteCtrlWith delayedFetch 1) (chatController mobile)) $ \attempt -> do
+    timeout 3000000 (atomically $ takeTMVar fetched) `shouldReturn` Just ()
+    runRemote mobile Remote.stopRemoteCtrl
+    when unlink $ runRemote mobile $ Remote.deleteRemoteCtrl 1
+    -- A verified handshake completing late must not recreate trust after unlink
+    -- or restore the enable flag after stop, independently of the Kotlin owner.
+    lateCommit <- runReaderT (runExceptT $ Remote.commitRemoteCtrlPairing oldSeq "late verification" savedPairing savedEndpoint) (chatController mobile)
+    (case lateCommit of Left (Controller.ChatErrorRemoteCtrl Controller.RCEInactive) -> True; _ -> False) `shouldBe` True
+    atomically $ putTMVar deliver ()
+    result <- timeout 3000000 $ wait attempt
+    result `shouldSatisfy` \case
+      Just (Left (Controller.ChatErrorRemoteCtrl Controller.RCEInactive)) -> True
+      _ -> False
+  atomically (readTVar $ Controller.remoteCtrlSession $ chatController mobile) >>= (\r -> isJust r `shouldBe` False)
+  ctrls <- runRemote mobile Remote.listRemoteCtrls
+  map (\Controller.RemoteCtrlInfo {recoveryEnabled} -> recoveryEnabled) ctrls `shouldBe` (if unlink then [] else [False])
+  runRemote desktop $ Remote.closeRemoteHost $ RHId 1
+
+persistentStopWaitingTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+persistentStopWaitingTest = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  sessions <- readTVarIO $ Controller.remoteHostSessions $ chatController desktop
+  case M.lookup (RHId 1) sessions of
+    Just (_, RHSessionConnected {rhClient = RemoteHostClient {httpClient}}) -> forM_ (H2.action httpClient) cancel
+    _ -> fail "expected connected link"
+  eventually 3 $ mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  mobile ##> "/stop remote ctrl"
+  mobile <## "ok"
+  result <- runReaderT (runExceptT $ Remote.resumeRemoteCtrl 1) (chatController mobile)
+  result `shouldSatisfy` \case
+    Left (Controller.ChatErrorRemoteCtrl Controller.RCEBadController) -> True
+    _ -> False
+  mobile <##. "remote controller stopped"
+  edit <- runReaderT (runExceptT $ Remote.setRemoteCtrlAddress 1 $ THDomainName "localhost") (chatController mobile)
+  edit `shouldSatisfy` \case
+    Left (Controller.ChatErrorRemoteCtrl Controller.RCEBadController) -> True
+    _ -> False
+  desktop ##> "/stop remote host 1"
+  desktop <## "ok"
+  runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+  hosts <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
+  map (\RemoteHost {recoveryEnabled} -> recoveryEnabled) hosts `shouldBe` [False]
+
+-- Model a routing write admitted while authorized but delivered after revocation.
+-- The store update itself must preserve revocation, even for a stale caller.
+delayedRecoveryAddressTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
+delayedRecoveryAddressTest unlink = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  runRemote mobile $ Remote.setRemoteCtrlAddress 1 $ THDomainName "localhost"
+  [RemoteCtrl {recoveryEndpoint = savedEndpoint}] <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
+  savedEndpoint `shouldSatisfy` isJust
+  stopMobile mobile desktop
+  when unlink $ runRemote mobile $ Remote.deleteRemoteCtrl 1
+  runRemote mobile $ Controller.withStore' $ \db -> RemoteStore.updateRemoteCtrlAddress db 1 $ THDomainName "delayed.example.ts.net"
+  ctrls <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
+  map (\RemoteCtrl {recoveryEndpoint} -> isJust recoveryEndpoint) ctrls `shouldBe` (if unlink then [] else [False])
+  result <- runReaderT (runExceptT $ Remote.setRemoteCtrlAddress 1 $ THDomainName "another.example.ts.net") (chatController mobile)
+  either (const True) (const False) result `shouldBe` True
+  runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+
+-- Startup can have read an enabled row before a concurrent stop/unlink. Exercise
+-- the restore entrypoint with that exact stale snapshot after revocation.
+delayedListenerRestoreTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
+delayedListenerRestoreTest unlink = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  [RemoteHost {bindAddress_, bindPort_}] <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
+  stopMobile mobile desktop
+  when unlink $ runRemote desktop $ Remote.deleteRemoteHost 1
+  result <- runReaderT (runExceptT $ Remote.startRemoteHostWith_ True True (Just (1, False)) bindAddress_ bindPort_) (chatController desktop)
+  result `shouldSatisfy` \case
+    Left (Controller.ChatErrorRemoteHost (RHId 1) Controller.RHEInactive) -> not unlink
+    Left (Controller.ChatErrorStore _) -> unlink
+    _ -> False
+  desktop <## "remote host 1 stopped"
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+  hosts <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
+  map (\RemoteHost {recoveryEnabled} -> recoveryEnabled) hosts `shouldBe` (if unlink then [] else [False])
+
+persistentUnlinkTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+persistentUnlinkTest = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  desktop ##> "/delete remote host 1"
+  desktop <## "ok"
+  eventually 3 $ mobile <## "remote controller stopped"
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+  desktop ##> "/list remote hosts"
+  desktop <## "No remote hosts"
+  runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+  ctrls <- runRemote mobile Remote.listRemoteCtrls
+  map (\Controller.RemoteCtrlInfo {recoveryEnabled} -> recoveryEnabled) ctrls `shouldBe` [False]
 
 remoteHandshakeDiscoverTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 remoteHandshakeDiscoverTest = testRemote $ \compress mobile desktop -> do
@@ -658,7 +940,16 @@ startRemoteStored compress mobile desktop = do
 
 startRemoteDiscover :: String -> TestCC -> TestCC -> IO ()
 startRemoteDiscover compress mobile desktop = do
-  desktop ##> "/start remote host 1 multicast=on"
+  -- A multi-interface host may enumerate a Docker/tailnet address first while
+  -- multicast is routed over LAN. Test discovery on the actual multicast route.
+  source <- bracket (NS.socket NS.AF_INET NS.Datagram NS.defaultProtocol) NS.close $ \sock -> do
+    NS.connect sock $ NS.SockAddrInet 5227 $ NS.tupleToHostAddress (224, 0, 0, 251)
+    NS.getSocketName sock >>= \case
+      NS.SockAddrInet _ addr -> pure $ THIPv4 $ NS.hostAddressToTuple addr
+      _ -> fail "expected IPv4 multicast route"
+  addresses <- getLocalAddress Nothing
+  RCCtrlAddress {interface = iface} <- maybe (fail "multicast route has no local interface") pure $ find (\RCCtrlAddress {address} -> address == source) addresses
+  desktop ##> ("/start remote host 1 multicast=on addr=" <> BC.unpack (strEncode source) <> " iface=\"" <> T.unpack iface <> "\"")
   desktop <##. "remote host 1 started on "
   desktop <##. "other addresses: "
   desktop <## "Remote session invitation:"

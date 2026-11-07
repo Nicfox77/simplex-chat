@@ -3101,6 +3101,7 @@ RemoteCtrlConnecting: Remote controller is connecting..
 - remoteCtrl_: [RemoteCtrlInfo](./TYPES.md#remotectrlinfo)?
 - ctrlAppInfo: [CtrlAppInfo](./TYPES.md#ctrlappinfo)
 - appVersion: string
+- sessionSeq: int
 
 ChatCmdError: Command error (only used in WebSockets API).
 - type: "chatCmdError"

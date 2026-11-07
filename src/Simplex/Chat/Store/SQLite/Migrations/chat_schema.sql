@@ -692,7 +692,8 @@ CREATE TABLE remote_hosts(
   ,
   bind_addr TEXT,
   bind_iface TEXT,
-  bind_port INTEGER
+  bind_port INTEGER,
+  recovery_enabled INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE TABLE remote_controllers(
   -- e.g., desktops known to a mobile app
@@ -704,6 +705,9 @@ CREATE TABLE remote_controllers(
   id_pub BLOB NOT NULL, -- remote controller long-term/identity key to verify signatures
   dh_priv_key BLOB NOT NULL, -- last session DH key
   prev_dh_priv_key BLOB -- previous session DH key
+  ,
+  recovery_host TEXT,
+  recovery_port INTEGER
 ) STRICT;
 CREATE TABLE IF NOT EXISTS "msg_deliveries"(
   msg_delivery_id INTEGER PRIMARY KEY,

@@ -327,11 +327,13 @@ class RemoteCtrlSessionCode(TypedDict):
     type: Literal["remoteCtrlSessionCode"]
     remoteCtrl_: NotRequired["T.RemoteCtrlInfo"]
     sessionCode: str
+    sessionSeq: int  # int
 
 class RemoteCtrlStopped(TypedDict):
     type: Literal["remoteCtrlStopped"]
     rcsState: "T.RemoteCtrlSessionState"
     rcStopReason: "T.RemoteCtrlStopReason"
+    sessionSeq: int  # int
 
 class MessageError(TypedDict):
     type: Literal["messageError"]

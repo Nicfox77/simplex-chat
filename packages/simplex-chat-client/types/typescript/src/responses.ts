@@ -503,6 +503,7 @@ export namespace CR {
     remoteCtrl_?: T.RemoteCtrlInfo
     ctrlAppInfo: T.CtrlAppInfo
     appVersion: string
+    sessionSeq: number // int
   }
 
   export interface SentConfirmation extends Interface {

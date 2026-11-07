@@ -360,7 +360,11 @@ cliCommands =
 
 undocumentedCommands :: [ConsName]
 undocumentedCommands =
-  [ "APIAbortSwitchContact",
+  [ "RestoreRemoteHosts",
+    "ResumeRemoteCtrl",
+    "SetRemoteCtrlAddress",
+    "APIAbortRemoteCtrl",
+    "APIAbortSwitchContact",
     "APIAbortSwitchGroupMember",
     "APIAcceptConditions",
     "APIAckBadgeAlert",

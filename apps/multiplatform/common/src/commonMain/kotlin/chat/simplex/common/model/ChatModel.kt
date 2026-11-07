@@ -5965,6 +5965,18 @@ data class RemoteCtrlSession(
   val appVersion: String,
   val sessionState: UIRemoteCtrlSessionState
 ) {
+  val recoveryCtrl: RemoteCtrlInfo?
+    get() = when (val s = sessionState) {
+      is UIRemoteCtrlSessionState.Connecting -> s.remoteCtrl_
+      is UIRemoteCtrlSessionState.PendingConfirmation -> s.remoteCtrl_
+      is UIRemoteCtrlSessionState.Connected -> s.remoteCtrl
+      else -> null
+    }
+
+  // Capability in an unverified invitation cannot authorize a background owner.
+  val restartRecovery: Boolean
+    get() = recoveryCtrl?.recoveryEnabled == true
+
   val active: Boolean
     get () = sessionState is UIRemoteCtrlSessionState.Connected
 
@@ -5991,6 +6003,7 @@ sealed class RemoteCtrlStopReason {
   @Serializable @SerialName("connectionFailed") class ConnectionFailed(val chatError: ChatError): RemoteCtrlStopReason()
   @Serializable @SerialName("setupFailed") class SetupFailed(val chatError: ChatError): RemoteCtrlStopReason()
   @Serializable @SerialName("disconnected") object Disconnected: RemoteCtrlStopReason()
+  @Serializable @SerialName("stopped") object Stopped: RemoteCtrlStopReason()
 }
 
 sealed class UIRemoteCtrlSessionState {
