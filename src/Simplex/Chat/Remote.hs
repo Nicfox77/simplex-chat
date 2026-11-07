@@ -176,12 +176,16 @@ startRemoteHostWith persistent = startRemoteHostWith_ persistent False
 
 startRemoteHostWith_ :: Bool -> Bool -> Maybe (RemoteHostId, Bool) -> Maybe RCCtrlAddress -> Maybe Word16 -> CM (NonEmpty RCCtrlAddress, Maybe RemoteHostInfo, RCSignedInvitation)
 startRemoteHostWith_ persistent restoring rh_ rcAddrPrefs_ port_ = do
-  (rhKey, multicast, remoteHost_, pairing) <- case rh_ of
-    Just (rhId, multicast) -> do
-      rh@RemoteHost {hostPairing} <- withStore $ \db -> getRemoteHost db rhId
-      pure (RHId rhId, multicast, Just $ remoteHostInfo rh $ Just RHSStarting, hostPairing) -- get from the database, start multicast if requested
-    Nothing -> lift . withAgent' $ \a -> (RHNew,False,Nothing,) <$> rcNewHostPairing a
+  let rhKey = maybe RHNew (RHId . fst) rh_
+  -- Reserve before re-reading authorization: stop can invalidate this owner,
+  -- and an old startup snapshot must never reopen an already revoked listener.
   sseq <- startRemoteHostSession rhKey
+  (multicast, remoteHost_, pairing) <- handleConnectError rhKey sseq $ case rh_ of
+    Just (rhId, multicast) -> do
+      rh@RemoteHost {hostPairing, recoveryEnabled} <- withStore $ \db -> getRemoteHost db rhId
+      when (restoring && not recoveryEnabled) $ throwError $ ChatErrorRemoteHost rhKey RHEInactive
+      pure (multicast, Just $ remoteHostInfo rh $ Just RHSStarting, hostPairing) -- get from the database, start multicast if requested
+    Nothing -> lift . withAgent' $ \a -> (False,Nothing,) <$> rcNewHostPairing a
   ctrlAppInfo <- mkCtrlAppInfo
   (localAddrs, invitation, rchClient, vars) <- handleConnectError rhKey sseq $
     if persistent
@@ -586,9 +590,12 @@ resumeRemoteCtrlWith fetchInvitation rcId = do
 setRemoteCtrlAddress :: RemoteCtrlId -> TransportHost -> CM ()
 setRemoteCtrlAddress rcId host = do
   unless (validRecoveryHost host) $ throwError $ ChatErrorRemoteCtrl RCEBadInvitation
-  RemoteCtrl {recoveryEndpoint} <- withStore (`getRemoteCtrl` rcId)
-  RCEndpoint {port} <- maybe (throwError $ ChatErrorRemoteCtrl RCEBadController) pure recoveryEndpoint
-  withStore' $ \db -> setRemoteCtrlRecovery db rcId $ Just RCEndpoint {host, port}
+  enabled <- withStore $ \db -> do
+    RemoteCtrl {recoveryEndpoint} <- getRemoteCtrl db rcId
+    case recoveryEndpoint of
+      Nothing -> pure False
+      Just _ -> True <$ liftIO (updateRemoteCtrlAddress db rcId host)
+  unless enabled $ throwError $ ChatErrorRemoteCtrl RCEBadController
 
 validRecoveryHost :: TransportHost -> Bool
 validRecoveryHost (THIPv4 (100, b, _, _)) = b >= 64 && b <= 127

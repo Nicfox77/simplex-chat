@@ -169,7 +169,7 @@ address; disconnect and restart; unlink and restart; verify peer ACL denial.
 Android packages must contain the native library rebuilt from this revision.
 A shared Kotlin compile is not an Android native cross-build or a phone test.
 
-Local validation for the restart implementation:
+Local validation for the restart implementation before the final audit:
 
 - The pinned dependency suite passed all 5 checks on loopback and again with the
   owned-listener test using this machine's actual `tailscale0` (`100.101.0.9`).
@@ -196,3 +196,110 @@ Local validation for the restart implementation:
   `feature/tailscale-device-linking`; it does not require changing master or
   running the optional Claude/backend/release jobs. Android native CI results
   remain pending until the workflow completes.
+
+
+## CI cancellation and integration audit (2026-11-07)
+
+At head `3b78d96e860be81db9248343ff6fc4d7e6d46726`, both
+[main CI](https://github.com/Nicfox77/simplex-chat/actions/runs/42314688708)
+and [Android arm64 CI](https://github.com/Nicfox77/simplex-chat/actions/runs/42314688790)
+were **cancelled**, not passed. The failed check annotations on jobs
+`128224401318` and `128224422950` say `repository invocation blocked`.
+Both job logs end with a runner shutdown signal. Main CI had completed native
+compilation and entered Gradle; Android was still compiling the native core.
+Neither log reports a compiler error, OOM, or timeout causing cancellation.
+The Android job ran about 26 minutes against a 150-minute limit. No newer run
+on this head superseded either run; the two workflows have separate concurrency
+groups. GitHub's API does not disclose the underlying account/repository block.
+Repository Actions permissions report enabled with all actions allowed.
+
+One controlled failed-job rerun of each run was accepted on November 7. Their
+status must be checked separately; acceptance/queuing does not establish success.
+If the block persists, the repository owner must resolve the Actions/account
+restriction with GitHub (check Actions and billing notices; contact Support with
+the run IDs and exact annotation). Changing concurrency or increasing timeouts
+does not address the reported block. Retry the latest feature-head runs after
+it is lifted, using `gh run rerun RUN_ID --failed --repo Nicfox77/simplex-chat`.
+
+Reduced draft main CI selects native tests from a `ci-tests` block in the PR
+body. The cancelled run logged `No tests selected`; the PR now selects `/Remote/`,
+`/Schema dump/`, and `/Bot API docs/` for new runs. CLA remains an independent
+infrastructure failure: the inherited action expects an external signing
+`PERSONAL_ACCESS_TOKEN` that this fork does not have. Its workflow is unchanged.
+
+The final security audit found a routing-edit/revocation race: authorization was
+read in one transaction and an endpoint, including its port, written in another.
+An edit delayed across stop could restore cleared recovery authorization. The
+edit now checks authorization and updates routing in one transaction; the store
+write changes only the host of an endpoint that is still enabled. It never writes
+a port or creates a row. Regression checks deliver a stale routing write after
+stop and after unlink and verify that recovery and listener restoration remain
+disabled. A second regression uses an enabled startup snapshot after stop/unlink:
+the desktop now reserves its session sequence before re-reading authorization,
+and rejects a disabled/deleted row before opening the listener. Stop can also
+invalidate a restore already in flight. Both stopped and unlinked snapshots
+have regression coverage.
+
+Final local build boundaries:
+
+- The final focused native run passed **9 examples, zero failures**: desktop and
+  phone database restart, delayed authenticated invitation after stop/unlink,
+  disconnected revocation, delayed routing writes after stop/unlink, and stale
+  startup snapshots after stop/unlink. The four new regressions are included.
+  All **4 SQLite schema/rollback checks** and **17 generated API/doc checks**
+  completed successfully in the preceding run; that run's two new-test failures
+  were expected stop events left unread by the test harness, corrected before
+  the final 9-test pass. The complete Remote suite was interrupted to prioritize
+  this final focused validation and was not rerun to completion on this fix.
+- Desktop Kotlin compilation and all 26 focused reconnect/settings tests passed
+  from a fresh Gradle run. Android common and Foss app Kotlin compilation passed;
+  the Android module's one unit test passed (a basic upstream example, not a
+  native-security test).
+- The pinned dependency's 5 transport checks passed on loopback and passed again
+  with `XRCP_TEST_ADDRESS=100.101.0.9`. Only the owned-listener case uses that
+  actual tailnet address; DNS coverage uses localhost.
+- Postgres 18 loaded the pre-change schema and passed the new migration's
+  disabled defaults for existing pairing rows, rollback, row preservation and
+  reapply. This validates migration SQL, not a full Postgres core build.
+- Local arm64 Nix evaluation failed before chat compilation at Alex bootstrap
+  source unpacking in the relocated store. APK assembly compiled Kotlin and
+  reached native linking, then failed because the rebuilt arm64 `libsimplex.so`
+  is absent. No Android native library or APK pass is claimed. Docker exploration
+  was stopped at the user's request; no isolated native build was completed.
+
+### Interface compatibility with draft PR #2
+
+The comparison is against PR #2 head
+`a03ed2f70948a23fa5c20e5edb7d606cafb5254e`; no PR #2 files were edited and no
+combined build, merge, or paired-app validation was performed.
+
+Both changes keep the phone as the sole database/agent owner and use authenticated
+XRCP, so there is no conflicting database-replication model. Their capabilities
+are separate: this PR advertises `reconnect`/`restart` and extends session events
+with sequence ownership; PR #2 adds optional `uiProtocol` and requires protocol 1
+when its simultaneous UI is enabled. Its enabled peer rejects a PR #1-only peer
+with no UI protocol capability. A missing restart capability must continue to
+mean restart recovery is disabled; transport authentication alone must not grant it.
+
+Integration requires deliberate reconciliation in `Remote.hs`, controller session
+records, `SimpleXAPI.kt`, and `ConnectDesktopView.kt`:
+
+- Preserve both capability sets and regenerate API models; both apps need the
+  resulting native core. Do not remove PR #2's UI protocol check to make a mixed
+  pair connect.
+- Each successful reconnect must create PR #2's fresh event buffer and snapshot
+  state. Overflow closes that session and requires a fresh snapshot; it is not
+  an authenticated user stop and must not revoke saved recovery by itself.
+- Keep this PR's session-sequence checks, authenticated-stop signal, transactional
+  pairing commit and durable recovery revocation. PR #2's request-admission token
+  must close atomically on every session detach, including this PR's explicit
+  stop, abort, process cleanup and stale-worker paths. Keep its admitted-command
+  leases until old commands drain before any profile transition.
+- PR #2 keeps the phone UI active and starts Android service with
+  `remoteSession=true`; this PR's retry/restore owner and view-disposal rules must
+  use those service semantics without cancelling an active verified owner.
+
+These are integration requirements, not evidence that the independent branches
+already provide both behaviors together. Physical acceptance still requires
+rebuilt Android/Linux binaries on both devices and the outage/restart,
+stop/unlink/restart, MagicDNS, background-service and peer-ACL checks above.

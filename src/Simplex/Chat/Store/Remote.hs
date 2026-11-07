@@ -20,6 +20,7 @@ import Simplex.Messaging.Agent.Store.DB (BoolInt (..))
 import qualified Simplex.Messaging.Agent.Store.DB as DB
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
+import Simplex.Messaging.Transport.Client (TransportHost)
 import Simplex.RemoteControl.Types
 import UnliftIO
 #if defined(dbPostgres)
@@ -182,6 +183,15 @@ setRemoteCtrlRecovery db rcId endpoint =
   where
     host_ = (\RCEndpoint {host} -> decodeASCII $ strEncode host) <$> endpoint
     port_ = (\RCEndpoint {port} -> port) <$> endpoint
+
+-- A routing edit can never grant recovery authorization. In particular a stale
+-- edit arriving after stop/unlink must not restore a cleared endpoint or port.
+updateRemoteCtrlAddress :: DB.Connection -> RemoteCtrlId -> TransportHost -> IO ()
+updateRemoteCtrlAddress db rcId host =
+  DB.execute
+    db
+    "UPDATE remote_controllers SET recovery_host = ? WHERE remote_ctrl_id = ? AND recovery_host IS NOT NULL AND recovery_port IS NOT NULL"
+    (decodeASCII $ strEncode host, rcId)
 
 disableRemoteRecovery :: DB.Connection -> IO ()
 disableRemoteRecovery db = do

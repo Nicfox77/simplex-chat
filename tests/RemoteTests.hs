@@ -153,6 +153,10 @@ runRemoteTests = do
     it "cannot revive a stopped backend with a delayed authenticated invitation" (delayedRecoveryStopTest False)
     it "cannot revive an unlinked backend with a delayed authenticated invitation" (delayedRecoveryStopTest True)
     it "revokes backend recovery while disconnected and cannot re-enable it with a routing edit" persistentStopWaitingTest
+    it "does not restore authorization with a delayed routing write after stop" (delayedRecoveryAddressTest False)
+    it "does not recreate an unlinked pairing with a delayed routing write" (delayedRecoveryAddressTest True)
+    it "does not reopen a stopped listener from a stale startup snapshot" (delayedListenerRestoreTest False)
+    it "does not reopen an unlinked listener from a stale startup snapshot" (delayedListenerRestoreTest True)
     it "retains a pinned listener after transport loss and reconnects without another invitation" persistentReconnectTest
     it "deletes an active remote host and closes its listener" persistentUnlinkTest
     xitMacCI "connects with multicast discovery" remoteHandshakeDiscoverTest
@@ -402,6 +406,42 @@ persistentStopWaitingTest = testRemote $ \compress mobile desktop -> do
   readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
   hosts <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
   map (\RemoteHost {recoveryEnabled} -> recoveryEnabled) hosts `shouldBe` [False]
+
+-- Model a routing write admitted while authorized but delivered after revocation.
+-- The store update itself must preserve revocation, even for a stale caller.
+delayedRecoveryAddressTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
+delayedRecoveryAddressTest unlink = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  runRemote mobile $ Remote.setRemoteCtrlAddress 1 $ THDomainName "localhost"
+  [RemoteCtrl {recoveryEndpoint = savedEndpoint}] <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
+  savedEndpoint `shouldSatisfy` isJust
+  stopMobile mobile desktop
+  when unlink $ runRemote mobile $ Remote.deleteRemoteCtrl 1
+  runRemote mobile $ Controller.withStore' $ \db -> RemoteStore.updateRemoteCtrlAddress db 1 $ THDomainName "delayed.example.ts.net"
+  ctrls <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
+  map (\RemoteCtrl {recoveryEndpoint} -> isJust recoveryEndpoint) ctrls `shouldBe` (if unlink then [] else [False])
+  result <- runReaderT (runExceptT $ Remote.setRemoteCtrlAddress 1 $ THDomainName "another.example.ts.net") (chatController mobile)
+  either (const True) (const False) result `shouldBe` True
+  runRemote desktop (Remote.restoreRemoteHostsWith $ const True)
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+
+-- Startup can have read an enabled row before a concurrent stop/unlink. Exercise
+-- the restore entrypoint with that exact stale snapshot after revocation.
+delayedListenerRestoreTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) -> IO ()
+delayedListenerRestoreTest unlink = testRemote $ \compress mobile desktop -> do
+  _ <- startPersistentRemote compress mobile desktop
+  [RemoteHost {bindAddress_, bindPort_}] <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
+  stopMobile mobile desktop
+  when unlink $ runRemote desktop $ Remote.deleteRemoteHost 1
+  result <- runReaderT (runExceptT $ Remote.startRemoteHostWith_ True True (Just (1, False)) bindAddress_ bindPort_) (chatController desktop)
+  result `shouldSatisfy` \case
+    Left (Controller.ChatErrorRemoteHost (RHId 1) Controller.RHEInactive) -> not unlink
+    Left (Controller.ChatErrorStore _) -> unlink
+    _ -> False
+  desktop <## "remote host 1 stopped"
+  readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= (\r -> M.null r `shouldBe` True)
+  hosts <- runRemote desktop $ Controller.withStore' RemoteStore.getRemoteHosts
+  map (\RemoteHost {recoveryEnabled} -> recoveryEnabled) hosts `shouldBe` (if unlink then [] else [False])
 
 persistentUnlinkTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 persistentUnlinkTest = testRemote $ \compress mobile desktop -> do
