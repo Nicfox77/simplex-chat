@@ -95,14 +95,39 @@ profile. Existing per-chat/entity/store locking remains in use.
   Already admitted commands can finish during revocation under their original
   profile; this is not transaction rollback. Crypto/session keys and request authentication retain
   the existing XRCP implementation.
+- A revoked or overflowed event stream returns the typed XRCP
+  `sessionClosed` protocol error. It is terminal: the viewer ends polling and
+  emits one sequence-bound `remoteHostStopped` callback before a fresh session
+  and snapshot can recover. Corrupt-body and other receive failures also end
+  polling, retaining their error in the stop reason instead of retrying and
+  flooding the UI. Polling starts after the connected callback is published.
+
+## Integration with device linking (PR #1)
+
+The branches share a phone-owned database and authenticated XRCP model, but
+are not ready to combine without integration. A merge-tree check against
+PR #1 head `3b78d96e860be81db9248343ff6fc4d7e6d46726` found conflicts in
+`Remote.hs`, `Controller.hs`, `Library/Commands.hs`, `RemoteTests.hs`,
+`ConnectDesktopView.kt` and `android-emu.yml`. PR #1's branch is unchanged.
+
+An integration must preserve PR #1's persistent authorization, ownership
+reservation, sequence checks and stop/unlink revocation together with this
+branch's per-session event buffer, protocol negotiation, profile leases and
+snapshot recovery. Its reconnect supervisor must consume terminal poll
+failure once, create a fresh buffer/session, and request a snapshot before
+resuming deltas. A `sessionClosed` response cannot restore authorization after
+explicit stop/unlink. Keep Android service lifetime tied to both the active
+session and PR #1's authorized retry owner. Merge both test registrations and
+workflow triggers, retain the dependency pin from PR #1, and run both remote
+suites plus matching native app builds before claiming combined support.
 
 ## Validation and remaining physical checks
 
-Validated locally on 2026-11-06:
+Validated locally on 2026-11-07:
 
 - The complete Haskell library compiles with GHC 9.6.6.
-- The remote suite passed 43 active examples, zero failures, excluding multicast
-  discovery on this container. There were 72 pending examples from the three
+- The remote suite passed 46 active examples, zero failures, excluding multicast
+  discovery on this container. There were 75 pending examples from the three
   upstream-disabled compression variants. These include real encrypted XRCP
   uploads/downloads, concurrent sends/read ownership and session shutdown.
 - Four protocol-1 simultaneous cases now pass: both event receivers active
@@ -111,10 +136,15 @@ Validated locally on 2026-11-06:
   a new session/snapshot while the phone keeps receiving; and profile selection after unlink waiting
   for admitted commands, with exception/cancellation cleanup. All four ran in
   the final full remote suite above.
-- Common/desktop Kotlin compilation and 259 tests passed before the last
-  reconciliation refinements. The snapshot tests cover item/counter idempotence,
-  edits/deletes/reads and wire decoding. Additional revision/generation and
-  delayed-command-result tests are included for CI.
+- Full common/desktop Kotlin compilation and all 264 desktop tests passed with
+  one Gradle worker and a single 3 GB JVM. Tests cover complete domain user
+  references, notification ownership, attachment snapshot idempotence and
+  transfer-state replacement, edits/deletes/reads, stale revision/generation
+  rejection, delayed command replies and wire decoding.
+- Remote tests require the stop callback first, without retries that consume
+  protocol errors. The live-session regression checks stale poll failure and
+  duplicate stop suppression; receive tests distinguish closed/overflowed
+  streams from empty polls and malformed bodies.
 - Android compilation reached the common Android Kotlin compiler, then failed
   for insufficient memory. A subsequent process exited 137. The shared cgroup
   records an OOM kill; concurrent builds were running. No Android APK/native

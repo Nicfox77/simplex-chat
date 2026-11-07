@@ -142,6 +142,8 @@ data RemoteProtocolError
   | -- | failed to parse RemoteCommand or RemoteResponse
     RPEInvalidJSON {invalidJSON :: String}
   | RPEInvalidBody {invalidBody :: String}
+  | -- | The authenticated session was revoked; reconnect and resnapshot.
+    RPESessionClosed
   | PRESessionCode
   | RPEIncompatibleEncoding
   | RPEUnexpectedFile

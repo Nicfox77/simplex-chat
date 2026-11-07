@@ -214,7 +214,9 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
       disconnected <- toIO $ onDisconnected rhKey' sseq
       httpClient <- liftError' (httpError remoteHostId) $ attachRevHTTP2Client disconnected tls
       rhClient <- mkRemoteHostClient httpClient sessionKeys sessId storePath hostInfo
-      pollAction <- async $ pollEvents remoteHostId rhClient
+      -- A fast closed-stream reply must not race publication of Connected.
+      startPoll <- newEmptyTMVarIO
+      pollAction <- async $ atomically (readTMVar startPoll) >> pollEvents remoteHostId sseq rhClient
       withRemoteHostSession rhKey' sseq $ \case
         RHSessionConfirmed _ RHPendingSession {rchClient} -> Right ((), RHSessionConnected {rchClient, tls, rhClient, pollAction, storePath})
         _ -> Left $ ChatErrorRemoteHost rhKey RHEBadState
@@ -222,6 +224,7 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
       let RemoteHostClient {encryption = RemoteCrypto {compression}} = rhClient
           remoteHost = rhi {sessionState = Just RHSConnected {sessionCode}} :: RemoteHostInfo
       toView $ CEvtRemoteHostConnected {remoteHost, compression}
+      atomically $ putTMVar startPoll ()
     upsertRemoteHost :: RCHostPairing -> Maybe RemoteHostInfo -> Maybe RCCtrlAddress -> Text -> SessionSeq -> RemoteHostSessionState -> CM RemoteHostInfo
     upsertRemoteHost pairing'@RCHostPairing {knownHost = kh_} rhi_ rcAddr_ hostDeviceName sseq state = do
       KnownHostPairing {hostDhPubKey = hostDhPubKey'} <- maybe (throwError . ChatError $ CEInternalError "KnownHost is known after verification") pure kh_
@@ -238,18 +241,27 @@ startRemoteHost rh_ rcAddrPrefs_ port_ = do
     onDisconnected rhKey sseq = do
       logDebug $ "HTTP2 client disconnected: " <> tshow (rhKey, sseq)
       cancelRemoteHostSession (Just (sseq, RHSRDisconnected)) rhKey
-    pollEvents :: RemoteHostId -> RemoteHostClient -> CM ()
-    pollEvents rhId rhClient = do
+    pollEvents :: RemoteHostId -> SessionSeq -> RemoteHostClient -> CM ()
+    pollEvents rhId sseq rhClient = do
       cc <- ask
-      forever $
-        handlePollError cc $ do
-          r_ <- liftRH rhId $ remoteRecv rhClient 10000000
-          forM_ r_ $ \r -> atomically $ writeUIOutput cc (Just rhId, r)
-      where
-        handlePollError cc a = a `catchAllErrors` \e ->
-          atomically $ writeUIOutput cc (Just rhId, Left e)
+      let loop = do
+            r_ <- liftRH rhId $ remoteRecv rhClient 10000000
+            forM_ r_ $ \r -> atomically $ writeUIOutput cc (Just rhId, r)
+            loop
+      -- Receive failures are terminal. Retrying a revoked stream floods the
+      -- UI with errors and can delay its stop/recovery callback indefinitely.
+      -- Cleanup runs outside the poller because it cancels pollAction.
+      loop `catchAllErrors` \e -> void . forkIO $ remoteHostPollFailed rhId sseq e
     httpError :: RemoteHostId -> HTTP2ClientError -> ChatError
     httpError rhId = ChatErrorRemoteHost (RHId rhId) . RHEProtocolError . RPEHTTP2 . tshow
+
+remoteHostPollFailed :: RemoteHostId -> SessionSeq -> ChatError -> CM ()
+remoteHostPollFailed rhId sseq err =
+  cancelRemoteHostSession (Just (sseq, reason)) (RHId rhId)
+  where
+    reason = case err of
+      ChatErrorRemoteHost _ (RHEProtocolError RPESessionClosed) -> RHSRDisconnected
+      _ -> RHSRCrashed err
 
 startRemoteHostSession :: RHKey -> CM SessionSeq
 startRemoteHostSession rhKey = do
@@ -616,7 +628,7 @@ withRemoteCommandLease events action = do
     if admitted then Right <$> action else pure $ Left remoteSessionClosed
 
 remoteSessionClosed :: RemoteResponse
-remoteSessionClosed = RRProtocolError $ RPEInvalidBody "event stream closed; a new session and snapshot are required"
+remoteSessionClosed = RRProtocolError RPESessionClosed
 
 -- TODO this command could remember stored files and return IDs to allow removing files that are not needed.
 -- Also, there should be some process removing unused files uploaded to remote host (possibly, all unused files).

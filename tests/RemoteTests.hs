@@ -36,7 +36,7 @@ import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuf
 import Simplex.Chat.Mobile.File
 import Simplex.Chat.Messages (AChat (..), AChatItem (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), CIMeta (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
 import Simplex.Chat.Options (ChatOpts (..))
-import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, validRemoteFileName, withRemoteCommandLease, withRemoteSession)
+import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, remoteHostPollFailed, validRemoteFileName, withRemoteCommandLease, withRemoteSession)
 import Simplex.Chat.Remote.Protocol (RemoteResponse (..), encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
 import Simplex.Chat.Remote.Types
 import Simplex.Chat.Terminal.Output (markChatItemRead, remoteReadCommand)
@@ -74,12 +74,17 @@ remoteTests = describe "Remote" $ do
       result `shouldSatisfy` \case
         RRChatEvent Nothing -> True
         _ -> False
-    it "reports a closed buffer as a protocol failure, not an empty poll" $ \_ -> do
-      events <- atomically $ newEventBuffer 1
-      atomically $ closeEventBuffer events EBDetached
-      result <- handleRecv 1000000 events
-      result `shouldSatisfy` \case
-        RRProtocolError (RPEInvalidBody _) -> True
+    forM_ [EBDetached, EBOverflow] $ \reason ->
+      it ("reports " <> show reason <> " as session closure, not an empty poll or corrupt body") $ \_ -> do
+        events <- atomically $ newEventBuffer 1
+        atomically $ closeEventBuffer events reason
+        result <- handleRecv 1000000 events
+        result `shouldSatisfy` \case
+          RRProtocolError RPESessionClosed -> True
+          _ -> False
+    it "round trips the session-closed wire error" $ \_ ->
+      J.eitherDecode (J.encode RPESessionClosed) `shouldSatisfy` \case
+        Right RPESessionClosed -> True
         _ -> False
     forM_ [EBDetached, EBOverflow] $ \reason ->
       it ("rejects command and file work after " <> show reason <> " before transport shutdown") $ \_ -> do
@@ -88,7 +93,7 @@ remoteTests = describe "Remote" $ do
         atomically $ closeEventBuffer events reason
         result <- withRemoteSession events $ writeIORef executed True
         result `shouldSatisfy` \case
-          Left (RRProtocolError (RPEInvalidBody _)) -> True
+          Left (RRProtocolError RPESessionClosed) -> True
           _ -> False
         readIORef executed `shouldReturn` False
     it "does not serialize a long poll with command admission" $ \_ -> do
@@ -101,7 +106,7 @@ remoteTests = describe "Remote" $ do
         atomically $ closeEventBuffer events EBDetached
         result' <- Timeout.timeout 1000000 $ wait poller
         result' `shouldSatisfy` \case
-          Just (RRProtocolError (RPEInvalidBody _)) -> True
+          Just (RRProtocolError RPESessionClosed) -> True
           _ -> False
   describe "remote read routing" $
     forM_ [ChatRef CTDirect 2 Nothing, ChatRef CTGroup 3 Nothing, ChatRef CTGroup 3 (Just $ GCSMemberSupport Nothing), ChatRef CTGroup 3 (Just $ GCSMemberSupport $ Just 4)] $ \ref ->
@@ -190,6 +195,7 @@ runRemoteTests = do
     it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
     it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
     it "serializes concurrent phone and desktop profile creation" concurrentOwnerCommandsTest
+    it "stops once on a closed event stream and ignores a stale poll failure" remotePollFailureTest
     it "stops a session whose event reader overflows" remoteEventOverflowTest
     it "recovers an overflow with a new session and an authoritative snapshot" remoteEventRecoveryTest
     it "keeps app-local events on the phone during a live remote session" remoteLocalEventsTest
@@ -205,6 +211,25 @@ runRemoteTests = do
 
 -- * Chat commands
 
+-- Drive the terminal receive failure with a live authenticated connection.
+-- Strict reads forbid raw protocol errors before Stopped or duplicate callbacks.
+remotePollFailureTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+remotePollFailureTest = testRemote $ \compress mobile desktop -> do
+  startRemote compress mobile desktop
+  let cc = chatController desktop
+      failed seqNo err = runReaderT (runExceptT $ remoteHostPollFailed 1 seqNo err) cc
+      closed = Controller.ChatErrorRemoteHost (RHId 1) $ Controller.RHEProtocolError RPESessionClosed
+  Just (seqNo, _) <- atomically $ TM.lookup (RHId 1) $ Controller.remoteHostSessions cc
+  failed (seqNo - 1) closed >>= (`shouldSatisfy` either (const False) (const True))
+  isNothing <$> readTVarIO (Controller.currentRemoteHost cc) `shouldReturn` False
+  failed seqNo closed >>= (`shouldSatisfy` either (const False) (const True))
+  desktop <## "remote host 1 stopped"
+  readTVarIO (Controller.currentRemoteHost cc) `shouldReturn` Nothing
+  M.null <$> readTVarIO (Controller.remoteHostSessions cc) `shouldReturn` True
+  failed seqNo closed >>= (`shouldSatisfy` either (const False) (const True))
+  (</) desktop
+  eventually 3 $ mobile <## "remote controller stopped"
+
 remoteEventOverflowTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
   startRemote compress mobile desktop
@@ -219,7 +244,7 @@ remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
   Timeout.timeout 5000000 (atomically $ readTVar session >>= check . isNothing)
     `shouldReturn` Just ()
   mobile <## "remote controller stopped"
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
 
 -- Exercises protocol-1 negotiation and the frontend snapshot contract over
 -- encrypted XRCP, with both terminal event subscribers running throughout.
@@ -268,7 +293,7 @@ simultaneousMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob 
       _ -> False
   local "/delete remote ctrl 1" >>= expectOwnerOK
   mobile <## "remote controller stopped"
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
   bob #> "@alice phone continues"
   mobile <# "bob> phone continues"
   where
@@ -303,7 +328,7 @@ simultaneousProfileLeaseTest = testRemote $ \compress mobile desktop -> do
     takeMVar entered
     local "/delete remote ctrl 1" >>= expectOwnerOK
     mobile <## "remote controller stopped"
-    eventually 3 $ desktop <## "remote host 1 stopped"
+    desktop <## "remote host 1 stopped"
     withAsync (local "/create user after_unlink") $ \selection -> do
       Timeout.timeout 50000 (wait selection) >>= (`shouldSatisfy` isNothing)
       putMVar release ()
@@ -315,7 +340,7 @@ simultaneousProfileLeaseTest = testRemote $ \compress mobile desktop -> do
         _ -> False
   readTVarIO (Controller.remoteCommandLeases cc) `shouldReturn` 0
   runReaderT (withRemoteCommandLease events $ pure ()) cc >>= \r -> r `shouldSatisfy` \case
-    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    Left (RRProtocolError RPESessionClosed) -> True
     _ -> False
   fresh <- atomically $ newEventBuffer 1
   failed <- tryAny $ runReaderT (withRemoteCommandLease fresh $ liftIO (throwIO (userError "leased command failed") :: IO ())) cc
@@ -341,7 +366,7 @@ simultaneousRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob 
   atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $
     writeEventBuffer oldEvents $ Right $ Controller.CEvtCustomChatEvent Nothing "burst"
   eventually 3 $ mobile <## "remote controller stopped"
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
   bob #> "@alice received while viewer was away"
   mobile <# "bob> received while viewer was away"
   startRemoteStored compress mobile desktop
@@ -350,7 +375,7 @@ simultaneousRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob 
   unread `shouldBe` 1
   rejected <- withRemoteSession oldEvents $ pure ()
   rejected `shouldSatisfy` \case
-    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    Left (RRProtocolError RPESessionClosed) -> True
     _ -> False
   bob #> "@alice both after resnapshot"
   mobile <# "bob> both after resnapshot"
@@ -492,13 +517,13 @@ remoteEventRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -
   atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $
     writeEventBuffer oldEvents $ Right $ Controller.CEvtCustomChatEvent Nothing "burst"
   eventually 3 $ mobile <## "remote controller stopped"
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
   bob #> "@alice while desktop was away"
   mobile <# "bob> while desktop was away"
   startRemoteStored compress mobile desktop
   oldRequest <- withRemoteSession oldEvents $ pure ()
   oldRequest `shouldSatisfy` \case
-    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    Left (RRProtocolError RPESessionClosed) -> True
     _ -> False
   let local = ownerCommand mobile Controller.CSLocal
       remote = ownerCommand desktop (Controller.CSRemoteHost 1)
@@ -583,7 +608,7 @@ remoteUnlinkTest = testRemote $ \compress mobile desktop -> do
   usersBefore <- local "/users"
   rejected <- withRemoteSession oldEvents $ ownerCommand mobile Controller.CSRemoteCtrl "/create user revoked_controller"
   rejected `shouldSatisfy` \case
-    Left (RRProtocolError (RPEInvalidBody _)) -> True
+    Left (RRProtocolError RPESessionClosed) -> True
     _ -> False
   usersAfter <- local "/users"
   show usersAfter `shouldBe` show usersBefore
@@ -602,7 +627,7 @@ remoteOwnerStopTest = testRemote $ \compress mobile desktop -> do
     _ -> False
   isNothing <$> readTVarIO (Controller.remoteCtrlSession cc) `shouldReturn` True
   atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBDetached
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
 
 remoteViewerStopTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 remoteViewerStopTest = testRemote $ \compress mobile desktop -> do
@@ -1209,7 +1234,7 @@ stopMobile mobile desktop = do
   logWarn "stopping via mobile"
   mobile ##> "/stop remote ctrl"
   mobile <## "ok"
-  eventually 3 $ desktop <## "remote host 1 stopped"
+  desktop <## "remote host 1 stopped"
 
 -- | Run action with extended timeout
 eventually :: Int -> IO a -> IO a
