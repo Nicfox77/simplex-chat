@@ -102,11 +102,37 @@ class SimultaneousUIStateTest {
   }
 
   @Test
+  fun repeatedSnapshotsKeepOneAttachmentAndReplaceItsTransferState() {
+    val attachment = CIFile.getSample(fileId = 7, fileName = "photo.jpg", filePath = "phone/photo.jpg")
+      .copy(fileStatus = CIFileStatus.RcvInvitation)
+    val photo = received.copy(
+      content = CIContent.RcvMsgContent(MsgContent.MCImage(text = "photo", image = "")),
+      file = attachment
+    )
+    val state = snapshot(conversation.copy(chatItems = listOf(photo)))
+    repeat(3) { assertTrue(chatModel.applyUIState(null, state, conversation.id)) }
+    assertEquals(listOf(7L), chatModel.chatsContext.chatItems.value.mapNotNull { it.file?.fileId })
+    assertEquals(CIFileStatus.RcvInvitation, chatModel.chatsContext.chatItems.value.single().file?.fileStatus)
+    val completed = photo.copy(file = attachment.copy(fileStatus = CIFileStatus.RcvComplete))
+    val newer = snapshot(conversation.copy(chatItems = listOf(completed)), 2)
+    repeat(3) { assertTrue(chatModel.applyUIState(null, newer, conversation.id)) }
+    assertEquals(listOf(7L), chatModel.chatsContext.chatItems.value.mapNotNull { it.file?.fileId })
+    assertEquals(CIFileStatus.RcvComplete, chatModel.chatsContext.chatItems.value.single().file?.fileStatus)
+    assertFalse(chatModel.applyUIState(null, state, conversation.id))
+  }
+
+  @Test
   fun recoveryBlocksStateDeltasButAllowsSessionAndStoreCallbacks() {
-    assertTrue(ChatController.requiresUISnapshot(CR.NewChatItems(UserRef(1), emptyList())))
+    val userRef = UserRef(
+      userId = user.userId,
+      localDisplayName = user.localDisplayName,
+      activeUser = user.activeUser,
+      showNtfs = user.showNtfs
+    )
+    assertTrue(ChatController.requiresUISnapshot(CR.NewChatItems(userRef, emptyList())))
     assertFalse(ChatController.requiresUISnapshot(CR.UIStateChanged(1, 10, "overflow")))
     assertFalse(ChatController.requiresUISnapshot(CR.RemoteHostSessionCode(null, "code")))
-    assertFalse(ChatController.requiresUISnapshot(CR.StorePurchaseCredited(UserRef(1), "invoice")))
+    assertFalse(ChatController.requiresUISnapshot(CR.StorePurchaseCredited(userRef, "invoice")))
     assertFalse(ChatController.requiresUISnapshot(null)) // errors still reach the handler
   }
 
