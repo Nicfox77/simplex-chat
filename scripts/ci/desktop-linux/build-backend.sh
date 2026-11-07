@@ -24,10 +24,11 @@ EOF
 
 cabal build exe:simplex-chat exe:simplex-directory-service
 
-simplexmq_tag=$(sed -n '/simplex-chat\/simplexmq.git/{n;s/^ *tag: *//p}' cabal.project)
+simplexmq_url=$(awk '/location:.*\/simplexmq.git/ {print $2; exit}' cabal.project)
+simplexmq_tag=$(awk '/location:.*\/simplexmq.git/ {getline; print $2; exit}' cabal.project)
 smq=$(mktemp -d)
 git -C "$smq" init -q
-git -C "$smq" fetch -q --depth 1 https://github.com/simplex-chat/simplexmq.git "$simplexmq_tag"
+git -C "$smq" fetch -q --depth 1 "$simplexmq_url" "$simplexmq_tag"
 git -C "$smq" checkout -q FETCH_HEAD
 git -C "$smq" submodule update -q --init --recursive
 cp cabal.project.local "$smq"

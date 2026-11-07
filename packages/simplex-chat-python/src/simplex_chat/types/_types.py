@@ -1773,6 +1773,8 @@ class CtrlAppInfo(TypedDict):
     appVersionRange: "AppVersionRange"
     deviceName: str
     compression: bool
+    restart: bool
+    reconnect: bool
 
 class DroppedMsg(TypedDict):
     brokerTs: str  # ISO-8601 timestamp
@@ -3152,6 +3154,7 @@ RelayStatus = Literal["new", "invited", "accepted", "acknowledgedRoster", "activ
 class RemoteCtrlInfo(TypedDict):
     remoteCtrlId: int  # int64
     ctrlDeviceName: str
+    recoveryEnabled: bool
     sessionState: NotRequired["RemoteCtrlSessionState"]
 
 class RemoteCtrlSessionState_starting(TypedDict):
@@ -3196,14 +3199,18 @@ class RemoteCtrlStopReason_setupFailed(TypedDict):
 class RemoteCtrlStopReason_disconnected(TypedDict):
     type: Literal["disconnected"]
 
+class RemoteCtrlStopReason_stopped(TypedDict):
+    type: Literal["stopped"]
+
 RemoteCtrlStopReason = (
     RemoteCtrlStopReason_discoveryFailed
     | RemoteCtrlStopReason_connectionFailed
     | RemoteCtrlStopReason_setupFailed
     | RemoteCtrlStopReason_disconnected
+    | RemoteCtrlStopReason_stopped
 )
 
-RemoteCtrlStopReason_Tag = Literal["discoveryFailed", "connectionFailed", "setupFailed", "disconnected"]
+RemoteCtrlStopReason_Tag = Literal["discoveryFailed", "connectionFailed", "setupFailed", "disconnected", "stopped"]
 
 ReportReason = Literal["spam", "content", "community", "profile", "other"]
 

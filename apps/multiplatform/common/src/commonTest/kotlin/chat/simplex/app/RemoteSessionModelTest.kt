@@ -39,6 +39,19 @@ class RemoteSessionModelTest {
   }
 
   @Test
+  fun authorizedReconnectKeepsThePhoneAsFileOwner() {
+    val desktop = RemoteCtrlInfo(1, "Desktop", null, recoveryEnabled = true)
+    chatModel.remoteCtrlSession.value = RemoteCtrlSession(
+      ctrlAppInfo = null,
+      appVersion = "",
+      sessionState = UIRemoteCtrlSessionState.Connecting(desktop)
+    )
+    assertTrue(chatModel.remoteCtrlSession.value!!.restartRecovery)
+    assertFalse(chatModel.remoteCtrlSession.value!!.active)
+    assertFalse(chatModel.connectedToRemote())
+  }
+
+  @Test
   fun desktopViewingPhoneUsesRemoteFiles() {
     chatModel.currentRemoteHost.value = RemoteHostInfo(
       remoteHostId = 1,

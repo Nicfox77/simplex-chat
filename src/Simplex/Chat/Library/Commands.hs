@@ -89,6 +89,7 @@ import Simplex.Chat.Remote.Types
 import Simplex.Chat.Library.Internal
 import Simplex.Chat.Stats
 import Simplex.Chat.Store
+import Simplex.Chat.Store.Remote (disableRemoteRecovery)
 import Simplex.Chat.Store.AppSettings
 import Simplex.Chat.Store.Badges
 import Simplex.Chat.Store.ContactRequest
@@ -543,6 +544,7 @@ profileLifecycleCommand = \case
   APIDeleteUser {} -> True
   DeleteUser {} -> True
   ConnectRemoteCtrl {} -> True
+  ResumeRemoteCtrl {} -> True
   FindKnownRemoteCtrl -> True
   ConfirmRemoteCtrl {} -> True
   _ -> False
@@ -752,7 +754,9 @@ processChatCommand cxt nm = \case
       _ -> checkStoreNotChanged . lift $ startChatController mainApp enableSndFiles serviceRequests $> CRChatStarted
   CheckChatRunning -> maybe CRChatStopped (const CRChatRunning) <$> chatReadVar agentAsync
   APIStopChat -> do
+    withStore' disableRemoteRecovery
     ask >>= liftIO . stopChatController
+    withStore' disableRemoteRecovery
     pure CRChatStopped
   APIActivateChat restoreChat -> withUser $ \_ -> do
     lift $ when restoreChat restoreCalls
@@ -3858,13 +3862,19 @@ processChatCommand cxt nm = \case
   DeleteRemoteHost rh -> deleteRemoteHost rh >> ok_
   StoreRemoteFile rh encrypted_ localPath -> CRRemoteFileStored rh <$> storeRemoteFile rh encrypted_ localPath
   GetRemoteFile rh rf -> getRemoteFile rh rf >> ok_
+  RestoreRemoteHosts -> restoreRemoteHosts >> ok_
+  SetRemoteCtrlAddress rcId host -> withUser_ $ setRemoteCtrlAddress rcId host >> ok_
+  ResumeRemoteCtrl rcId -> withUser_ $ do
+    (remoteCtrl_, ctrlAppInfo, sessionSeq) <- resumeRemoteCtrl rcId
+    pure CRRemoteCtrlConnecting {remoteCtrl_, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
   ConnectRemoteCtrl inv -> withUser_ $ do
-    (remoteCtrl_, ctrlAppInfo) <- connectRemoteCtrlURI inv
-    pure CRRemoteCtrlConnecting {remoteCtrl_, ctrlAppInfo, appVersion = currentAppVersion}
+    (remoteCtrl_, ctrlAppInfo, sessionSeq) <- connectRemoteCtrlURI inv
+    pure CRRemoteCtrlConnecting {remoteCtrl_, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
+  APIAbortRemoteCtrl sseq -> abortRemoteCtrl sseq >> ok_
   FindKnownRemoteCtrl -> withUser_ $ findKnownRemoteCtrl >> ok_
   ConfirmRemoteCtrl rcId -> withUser_ $ do
-    (rc, ctrlAppInfo) <- confirmRemoteCtrl rcId
-    pure CRRemoteCtrlConnecting {remoteCtrl_ = Just rc, ctrlAppInfo, appVersion = currentAppVersion}
+    (rc, ctrlAppInfo, sessionSeq) <- confirmRemoteCtrl rcId
+    pure CRRemoteCtrlConnecting {remoteCtrl_ = Just rc, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
   VerifyRemoteCtrlSession sessId -> withUser_ $ verifyRemoteCtrlSession (execChatCommand CSRemoteCtrl) sessId
   StopRemoteCtrl -> withUser_ $ stopRemoteCtrl >> ok_
   ListRemoteCtrls -> withUser_ $ CRRemoteCtrlList <$> listRemoteCtrls
@@ -7207,7 +7217,11 @@ chatCommandP =
       "/delete remote host " *> (DeleteRemoteHost <$> A.decimal),
       "/store remote file " *> (StoreRemoteFile <$> A.decimal <*> optional (" encrypt=" *> onOffP) <* A.space <*> filePath),
       "/get remote file " *> (GetRemoteFile <$> A.decimal <* A.space <*> jsonP),
+      "/_restore remote hosts" $> RestoreRemoteHosts,
+      "/_remote ctrl address " *> (SetRemoteCtrlAddress <$> A.decimal <* A.space <*> strP),
+      "/_resume remote ctrl " *> (ResumeRemoteCtrl <$> A.decimal),
       ("/connect remote ctrl " <|> "/crc ") *> (ConnectRemoteCtrl <$> strP),
+      "/_abort remote ctrl " *> (APIAbortRemoteCtrl <$> A.decimal),
       "/find remote ctrl" $> FindKnownRemoteCtrl,
       "/confirm remote ctrl " *> (ConfirmRemoteCtrl <$> A.decimal),
       "/verify remote ctrl " *> (VerifyRemoteCtrlSession <$> textP),

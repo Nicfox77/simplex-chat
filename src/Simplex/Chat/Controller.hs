@@ -706,7 +706,11 @@ data ChatCommand
   | DeleteRemoteHost RemoteHostId -- Unregister remote host and remove its data
   | StoreRemoteFile {remoteHostId :: RemoteHostId, storeEncrypted :: Maybe Bool, localPath :: FilePath}
   | GetRemoteFile {remoteHostId :: RemoteHostId, file :: RemoteFile}
+  | RestoreRemoteHosts
+  | SetRemoteCtrlAddress RemoteCtrlId TransportHost
+  | ResumeRemoteCtrl RemoteCtrlId
   | ConnectRemoteCtrl {remoteInvitation :: RCSignedInvitation} -- Connect new or existing controller via OOB data
+  | APIAbortRemoteCtrl SessionSeq -- Cancel only the matching local connection attempt
   | FindKnownRemoteCtrl -- Start listening for announcements from all existing controllers
   | ConfirmRemoteCtrl RemoteCtrlId -- Confirm the connection with found controller
   | VerifyRemoteCtrlSession {sessionCode :: Text} -- Verify remote controller session
@@ -793,7 +797,11 @@ allowRemoteCommand = \case
   GetRemoteFile {} -> False
   StopRemoteHost _ -> False
   DeleteRemoteHost _ -> False
+  RestoreRemoteHosts -> False
+  SetRemoteCtrlAddress _ _ -> False
+  ResumeRemoteCtrl _ -> False
   ConnectRemoteCtrl {} -> False
+  APIAbortRemoteCtrl {} -> False
   FindKnownRemoteCtrl -> False
   ConfirmRemoteCtrl _ -> False
   VerifyRemoteCtrlSession {} -> False
@@ -984,7 +992,7 @@ data ChatResponse
   | CRRemoteHostStarted {remoteHost_ :: Maybe RemoteHostInfo, invitation :: Text, ctrlPort :: String, localAddrs :: NonEmpty RCCtrlAddress}
   | CRRemoteFileStored {remoteHostId :: RemoteHostId, remoteFileSource :: CryptoFile}
   | CRRemoteCtrlList {remoteCtrls :: [RemoteCtrlInfo]}
-  | CRRemoteCtrlConnecting {remoteCtrl_ :: Maybe RemoteCtrlInfo, ctrlAppInfo :: CtrlAppInfo, appVersion :: AppVersion}
+  | CRRemoteCtrlConnecting {remoteCtrl_ :: Maybe RemoteCtrlInfo, ctrlAppInfo :: CtrlAppInfo, appVersion :: AppVersion, sessionSeq :: SessionSeq}
   | CRRemoteCtrlConnected {remoteCtrl :: RemoteCtrlInfo, compression :: Bool}
   | CRSQLResult {rows :: [Text]}
 #if !defined(dbPostgres)
@@ -1103,8 +1111,8 @@ data ChatEvent
   | CEvtRemoteHostConnected {remoteHost :: RemoteHostInfo, compression :: Bool}
   | CEvtRemoteHostStopped {remoteHostId_ :: Maybe RemoteHostId, rhsState :: RemoteHostSessionState, rhStopReason :: RemoteHostStopReason}
   | CEvtRemoteCtrlFound {remoteCtrl :: RemoteCtrlInfo, ctrlAppInfo_ :: Maybe CtrlAppInfo, appVersion :: AppVersion, compatible :: Bool}
-  | CEvtRemoteCtrlSessionCode {remoteCtrl_ :: Maybe RemoteCtrlInfo, sessionCode :: Text}
-  | CEvtRemoteCtrlStopped {rcsState :: RemoteCtrlSessionState, rcStopReason :: RemoteCtrlStopReason}
+  | CEvtRemoteCtrlSessionCode {remoteCtrl_ :: Maybe RemoteCtrlInfo, sessionCode :: Text, sessionSeq :: SessionSeq}
+  | CEvtRemoteCtrlStopped {rcsState :: RemoteCtrlSessionState, rcStopReason :: RemoteCtrlStopReason, sessionSeq :: SessionSeq}
   | CEvtContactPQEnabled {user :: User, contact :: Contact, pqEnabled :: PQEncryption}
   | CEvtContactDisabled {user :: User, contact :: Contact}
   | CEvtConnectionDisabled {connectionEntity :: ConnectionEntity}
@@ -1687,6 +1695,7 @@ data RemoteCtrlStopReason
   | RCSRConnectionFailed {chatError :: ChatError}
   | RCSRSetupFailed {chatError :: ChatError}
   | RCSRDisconnected
+  | RCSRStopped -- Authenticated desktop stop; do not reconnect.
   deriving (Show, Exception)
 
 data ArchiveError
@@ -1709,6 +1718,7 @@ data RemoteCtrlSession
       { remoteCtrlId_ :: Maybe RemoteCtrlId,
         rcsClient :: RCCtrlClient,
         rcsWaitSession :: Async (),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
   | RCSessionPendingConfirmation
@@ -1719,6 +1729,7 @@ data RemoteCtrlSession
         sessionCode :: Text,
         rcsWaitSession :: Async (),
         rcsWaitConfirmation :: TMVar (Either RCErrorType (RCCtrlSession, RCCtrlPairing)),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
   | RCSessionConnected
@@ -1728,6 +1739,8 @@ data RemoteCtrlSession
         rcsSession :: RCCtrlSession,
         http2Server :: Async (),
         remoteOutputQ :: EventBuffer (Either ChatError ChatEvent),
+        remoteStopEvent :: TMVar (Either ChatError ChatEvent),
+        recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
       }
 
@@ -1751,6 +1764,7 @@ rcsSessionState = \case
 data RemoteCtrlInfo = RemoteCtrlInfo
   { remoteCtrlId :: RemoteCtrlId,
     ctrlDeviceName :: Text,
+    recoveryEnabled :: Bool,
     sessionState :: Maybe RemoteCtrlSessionState
   }
   deriving (Show)

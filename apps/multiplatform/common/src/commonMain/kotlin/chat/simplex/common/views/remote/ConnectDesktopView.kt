@@ -4,6 +4,7 @@ import SectionBottomSpacer
 import SectionDividerSpaced
 import SectionItemView
 import SectionItemViewLongClickable
+import SectionTextFooter
 import SectionView
 import TextIconSpaced
 import androidx.compose.foundation.layout.*
@@ -120,7 +121,7 @@ private fun ConnectDesktop(deviceName: String, remoteCtrls: SnapshotStateList<Re
   }
   SectionDividerSpaced()
   ScanDesktopAddressView(sessionAddress)
-  if (controller.appPrefs.developerTools.get()) {
+  if (appPlatform.isAndroid || controller.appPrefs.developerTools.get()) {
     SectionDividerSpaced()
     DesktopAddressView(sessionAddress)
   }
@@ -392,6 +393,9 @@ private fun DesktopAddressView(sessionAddress: MutableState<String>) {
         withBGApi { connectDesktopAddress(sessionAddress, sessionAddress.value) }
       },
     )
+    if (appPlatform.isAndroid) {
+      SectionTextFooter(stringResource(MR.strings.remote_link_paste_help))
+    }
   }
 }
 
@@ -405,6 +409,12 @@ private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>) {
         SectionItemViewLongClickable(click = {}, longClick = { showMenu.value = true }) {
           RemoteCtrl(rc)
           DefaultDropdownMenu(showMenu) {
+            if (rc.recoveryEnabled) {
+              ItemAction(stringResource(MR.strings.remote_link_recovery_address), painterResource(MR.images.ic_edit)) {
+                showMenu.value = false
+                showRecoveryAddress(rc)
+              }
+            }
             ItemAction(stringResource(MR.strings.delete_verb), painterResource(MR.images.ic_delete), color = Color.Red) {
               unlinkDesktop(remoteCtrls, rc)
               showMenu.value = false
@@ -430,6 +440,31 @@ private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>) {
       }
     }
     SectionBottomSpacer()
+  }
+}
+
+private fun showRecoveryAddress(rc: RemoteCtrlInfo) {
+  ModalManager.start.showModalCloseable { close ->
+    val host = remember { mutableStateOf(TextFieldValue("")) }
+    ColumnWithScrollBar {
+      AppBarTitle(stringResource(MR.strings.remote_link_recovery_address))
+      SectionView {
+        DefaultConfigurableTextField(
+          host,
+          stringResource(MR.strings.remote_link_recovery_host),
+          modifier = Modifier.fillMaxWidth().padding(horizontal = DEFAULT_PADDING),
+          isValid = ::remoteRecoveryHostValid,
+        )
+        SectionTextFooter(stringResource(MR.strings.remote_link_recovery_address_help))
+        SectionItemView({
+          if (remoteRecoveryHostValid(host.value.text)) withBGApi {
+            if (controller.setRemoteCtrlAddress(rc.remoteCtrlId, host.value.text)) close()
+          }
+        }, disabled = !remoteRecoveryHostValid(host.value.text)) {
+          Text(stringResource(MR.strings.save_verb), color = MaterialTheme.colors.primary)
+        }
+      }
+    }
   }
 }
 

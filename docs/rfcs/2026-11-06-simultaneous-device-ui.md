@@ -104,22 +104,20 @@ profile. Existing per-chat/entity/store locking remains in use.
 
 ## Integration with device linking (PR #1)
 
-The branches share a phone-owned database and authenticated XRCP model, but
-are not ready to combine without integration. A merge-tree check against
-PR #1 head `3b78d96e860be81db9248343ff6fc4d7e6d46726` found conflicts in
-`Remote.hs`, `Controller.hs`, `Library/Commands.hs`, `RemoteTests.hs`,
-`ConnectDesktopView.kt` and `android-emu.yml`. PR #1's branch is unchanged.
+The isolated integration branch combines PR #1's final
+`f3f11dc3654a89508691662e7b044e69de4b6e9a` with PR #2's
+`0302c406bce37c7b299ad611b2b4ef79ce7a46f8`. See the
+[integration record](2026-11-07-device-linking-simultaneous-integration.md)
+for the six conflict resolutions, paired-feature tests, exact input commits,
+validation evidence and remaining native/physical acceptance work. The original
+feature branches are unchanged by this integration.
 
-An integration must preserve PR #1's persistent authorization, ownership
-reservation, sequence checks and stop/unlink revocation together with this
-branch's per-session event buffer, protocol negotiation, profile leases and
-snapshot recovery. Its reconnect supervisor must consume terminal poll
-failure once, create a fresh buffer/session, and request a snapshot before
-resuming deltas. A `sessionClosed` response cannot restore authorization after
-explicit stop/unlink. Keep Android service lifetime tied to both the active
-session and PR #1's authorized retry owner. Merge both test registrations and
-workflow triggers, retain the dependency pin from PR #1, and run both remote
-suites plus matching native app builds before claiming combined support.
+Recovery retains authenticated persisted authorization and sequence ownership.
+A replacement session creates a fresh protocol-1 buffer and the viewer takes an
+authoritative snapshot before resuming deltas. Explicit stop/unlink revokes
+admission and authorization, and Android service retention covers both hosted
+sessions and authorized retries. This integration still requires matching
+native builds and physical acceptance before either draft is ready.
 
 ## Validation and remaining physical checks
 

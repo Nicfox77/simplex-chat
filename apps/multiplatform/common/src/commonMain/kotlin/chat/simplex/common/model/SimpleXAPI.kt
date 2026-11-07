@@ -551,6 +551,7 @@ object ChatController {
 
   val chatModel = ChatModel
   private var receiverJob: Job? = null
+  private var recoveryRestored = false
   var lastMsgReceivedTimestamp: Long = System.currentTimeMillis()
     private set
 
@@ -561,6 +562,8 @@ object ChatController {
   fun setChatCtrl(ctrl: ChatCtrl?) {
     val wasRunning = receiverJob != null
     stopReceiver()
+    directReconnect.clear()
+    recoveryRestored = false
     chatCtrl = ctrl
     chatModel.resetUIState()
     if (wasRunning && ctrl != null) startReceiver()
@@ -740,6 +743,7 @@ object ChatController {
         Log.d(TAG, "startChat: running")
       }
       apiStartChat()
+      restoreDirectLinks()
       appPrefs.chatStopped.set(false)
       withLongRunningApi { BadgeStore.presentUnfinished() }
       if (appPrefs.shouldDeleteDatabaseBackups.get()) {
@@ -764,6 +768,7 @@ object ChatController {
       chatModel.chatRunning.value = true
       startReceiver()
       setLocalDeviceName(appPrefs.deviceNameForRemoteAccess.get()!!)
+      restoreDirectLinks()
       Log.d(TAG, "startChat: started without user")
     } catch (e: Throwable) {
       Log.e(TAG, "failed starting chat without user $e")
@@ -1153,9 +1158,9 @@ object ChatController {
     }
   }
 
-  suspend fun apiStopChat(): Boolean {
+  suspend fun apiStopChat(): Boolean = directReconnect.replace {
     val r = sendCmd(null, CC.ApiStopChat())
-    if (r.result is CR.ChatStopped) return true
+    if (r.result is CR.ChatStopped) return@replace true
     throw Exception("failed stopping chat: ${r.responseType} ${r.details}")
   }
 
@@ -2746,10 +2751,93 @@ object ChatController {
 
   suspend fun getRemoteFile(rhId: Long, file: RemoteFile): Boolean = sendCmd(null, CC.GetRemoteFile(rhId, file)).result is CR.CmdOk
 
-  suspend fun connectRemoteCtrl(desktopAddress: String): Pair<SomeRemoteCtrl?, ChatError?> {
+  private var directVerifiedCtrl: RemoteCtrlInfo? = null
+  private var directNativeCtrl: ChatCtrl? = null
+  private val directReconnect = DirectLinkReconnect(
+    CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    connect = { invitation ->
+      val nativeCtrl = getChatCtrl() ?: throw DirectLinkReconnect.Rejected()
+      directNativeCtrl = nativeCtrl
+      val savedId = invitation.removePrefix("resume:").toLongOrNull().takeIf { invitation.startsWith("resume:") }
+      val r = sendCmd(null, if (savedId == null) CC.ConnectRemoteCtrl(invitation) else CC.ResumeRemoteCtrl(savedId), nativeCtrl)
+      when {
+        r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
+          val rc = r.res
+          if (!rc.ctrlAppInfo.reconnect || (savedId != null && !rc.ctrlAppInfo.restart)) {
+            sendCmd(null, CC.AbortRemoteCtrl(rc.sessionSeq), nativeCtrl)
+            throw DirectLinkReconnect.Rejected()
+          }
+          if (getChatCtrl() == nativeCtrl) chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(ctrlAppInfo = rc.ctrlAppInfo, appVersion = rc.appVersion)
+          DirectLinkReconnect.Attempt(rc.sessionSeq, rc.remoteCtrl_?.remoteCtrlId) {
+            sendCmd(null, CC.AbortRemoteCtrl(rc.sessionSeq), nativeCtrl); Unit
+          }
+        }
+        r is API.Error && directReconnectRejected(r.err) -> throw DirectLinkReconnect.Rejected()
+        else -> null
+      }
+    },
+    verify = { code ->
+      val r = sendCmd(null, CC.VerifyRemoteCtrlSession(code), directNativeCtrl)
+      if (r is API.Result && r.res is CR.RemoteCtrlConnected) {
+        directVerifiedCtrl = r.res.remoteCtrl
+        true
+      } else false
+    },
+    abort = { sequence -> sendCmd(null, CC.AbortRemoteCtrl(sequence)); Unit },
+    connected = { code ->
+      directVerifiedCtrl?.let { rc ->
+        chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = UIRemoteCtrlSessionState.Connected(rc, code))
+      }
+      directVerifiedCtrl = null
+    },
+    rejected = { chatModel.remoteCtrlSession.value = null }
+  )
+
+  // Called once after the unlocked main database and event receiver are ready.
+  // Endpoint and trust are read from the encrypted native DB; preferences contain
+  // no invitation, private session key or automatic-trust flag.
+  private suspend fun restoreDirectLinks() {
+    if (recoveryRestored) return
+    recoveryRestored = true
+    if (appPlatform.isDesktop) {
+      sendCmd(null, CC.RestoreRemoteHosts())
+      reloadRemoteHosts()
+    } else if (appPlatform.isAndroid) {
+      directReconnect.command {
+        if (chatModel.remoteCtrlSession.value == null) {
+          val saved = listRemoteCtrls()?.filter { it.recoveryEnabled } ?: emptyList()
+          // A phone has one remote-control session. Ambiguous legacy databases
+          // require the user to choose a target instead of selecting arbitrarily.
+          saved.singleOrNull()?.let { rc ->
+            // A restored owner also needs the service when the linking screen
+            // has not been opened in this process. Android may deny background
+            // starts; foreground recovery must still be able to proceed.
+            runCatching { platform.androidServiceStart(remoteSession = true) }.onFailure { Log.e(TAG, "restoreDirectLinks service: $it") }
+            chatModel.remoteCtrlSession.value = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connecting(rc))
+            directReconnect.restore(rc.remoteCtrlId)
+          }
+        }
+      }
+    }
+  }
+
+  private fun directReconnectRejected(error: ChatError): Boolean = when (error) {
+    is ChatError.ChatErrorAgent -> error.agentError is AgentErrorType.RCP &&
+      error.agentError.rcpErr.let { it !is RCErrorType.EXCEPTION && it !is RCErrorType.NOT_DISCOVERED && it !is RCErrorType.NO_LOCAL_ADDRESS }
+    is ChatError.ChatErrorRemoteCtrl -> error.remoteCtrlError !is RemoteCtrlError.Timeout && error.remoteCtrlError !is RemoteCtrlError.Busy
+    is ChatError.ChatErrorStore -> error.storeError is StoreError.RemoteCtrlNotFound
+    else -> false
+  }
+
+  suspend fun connectRemoteCtrl(desktopAddress: String): Pair<SomeRemoteCtrl?, ChatError?> = directReconnect.replace {
     val r = sendCmd(null, CC.ConnectRemoteCtrl(desktopAddress))
-    return when {
-      r is API.Result && r.res is CR.RemoteCtrlConnecting -> SomeRemoteCtrl(r.res.remoteCtrl_, r.res.ctrlAppInfo, r.res.appVersion) to null
+    when {
+      r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
+        if (appPlatform.isAndroid && r.res.ctrlAppInfo.reconnect) {
+          directReconnect.remember(desktopAddress, DirectLinkReconnect.Attempt(r.res.sessionSeq, r.res.remoteCtrl_?.remoteCtrlId))
+        }
+        SomeRemoteCtrl(r.res.remoteCtrl_, r.res.ctrlAppInfo, r.res.appVersion) to null
+      }
       r is API.Error -> null to r.err
       else -> {
         apiErrorAlert("connectRemoteCtrl", generalGetString(MR.strings.error_alert_title), r)
@@ -2758,7 +2846,7 @@ object ChatController {
     }
   }
 
-  suspend fun findKnownRemoteCtrl(): Boolean = sendCommandOkResp(null, CC.FindKnownRemoteCtrl())
+  suspend fun findKnownRemoteCtrl(): Boolean = directReconnect.replace { sendCommandOkResp(null, CC.FindKnownRemoteCtrl()) }
 
   suspend fun confirmRemoteCtrl(rcId: Long): Pair<SomeRemoteCtrl?, ChatError?> {
     val r = sendCmd(null, CC.ConfirmRemoteCtrl(remoteCtrlId = rcId))
@@ -2772,11 +2860,14 @@ object ChatController {
     }
   }
 
-  suspend fun verifyRemoteCtrlSession(sessionCode: String): RemoteCtrlInfo? {
+  suspend fun verifyRemoteCtrlSession(sessionCode: String): RemoteCtrlInfo? = directReconnect.command {
     val r = sendCmd(null, CC.VerifyRemoteCtrlSession(sessionCode))
-    if (r is API.Result && r.res is CR.RemoteCtrlConnected) return r.res.remoteCtrl
+    if (r is API.Result && r.res is CR.RemoteCtrlConnected) {
+      directReconnect.trust(r.res.remoteCtrl.remoteCtrlId, r.res.remoteCtrl.recoveryEnabled)
+      return@command r.res.remoteCtrl
+    }
     apiErrorAlert("verifyRemoteCtrlSession", generalGetString(MR.strings.error_alert_title), r)
-    return null
+    null
   }
 
   suspend fun listRemoteCtrls(): List<RemoteCtrlInfo>? {
@@ -2786,9 +2877,13 @@ object ChatController {
     return null
   }
 
-  suspend fun stopRemoteCtrl(): Boolean = sendCommandOkResp(null, CC.StopRemoteCtrl())
+  suspend fun setRemoteCtrlAddress(rcId: Long, host: String): Boolean = directReconnect.command { sendCommandOkResp(null, CC.SetRemoteCtrlAddress(rcId, host)) }
 
-  suspend fun deleteRemoteCtrl(rcId: Long): Boolean = sendCommandOkResp(null, CC.DeleteRemoteCtrl(rcId))
+  suspend fun stopRemoteCtrl(): Boolean = directReconnect.replace { sendCommandOkResp(null, CC.StopRemoteCtrl()) }
+
+  suspend fun deleteRemoteCtrl(rcId: Long): Boolean = directReconnect.replace {
+    if (!sendCommandOkResp(null, CC.StopRemoteCtrl())) false else sendCommandOkResp(null, CC.DeleteRemoteCtrl(rcId))
+  }
 
   private suspend fun sendCommandOkResp(rh: Long?, cmd: CC, ctrl: ChatCtrl? = null): Boolean {
     val r = sendCmd(rh, cmd, ctrl)
@@ -3659,6 +3754,8 @@ object ChatController {
         }
       }
       is CR.RemoteCtrlSessionCode -> {
+        if (directReconnect.staleEvent(r.sessionSeq)) return
+        if (directReconnect.sessionCode(r.sessionSeq, r.sessionCode)) return
         val state = UIRemoteCtrlSessionState.PendingConfirmation(remoteCtrl_ = r.remoteCtrl_, sessionCode = r.sessionCode)
         chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = state)
       }
@@ -3668,6 +3765,14 @@ object ChatController {
         chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = state)
       }
       is CR.RemoteCtrlStopped -> {
+        if (directReconnect.staleEvent(r.sessionSeq)) return
+        val retryable = r.rcStopReason is RemoteCtrlStopReason.Disconnected ||
+          (r.rcStopReason is RemoteCtrlStopReason.ConnectionFailed && !directReconnectRejected(r.rcStopReason.chatError)) ||
+          (r.rcStopReason is RemoteCtrlStopReason.SetupFailed && !directReconnectRejected(r.rcStopReason.chatError))
+        if (directReconnect.stopped(r.sessionSeq, retryable)) {
+          chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.let { session -> session.copy(sessionState = UIRemoteCtrlSessionState.Connecting(session.recoveryCtrl)) }
+          return
+        }
         val sess = chatModel.remoteCtrlSession.value
         if (sess != null) {
           chatModel.remoteCtrlSession.value = null
@@ -3715,6 +3820,7 @@ object ChatController {
             is RemoteCtrlStopReason.DiscoveryFailed -> showAlert(r.rcStopReason.chatError)
             is RemoteCtrlStopReason.ConnectionFailed -> showAlert(r.rcStopReason.chatError)
             is RemoteCtrlStopReason.SetupFailed -> showAlert(r.rcStopReason.chatError)
+            is RemoteCtrlStopReason.Stopped -> {}
             is RemoteCtrlStopReason.Disconnected -> {
               /*AlertManager.shared.showAlertMsg(
                 generalGetString(MR.strings.remote_ctrl_was_disconnected_title),
@@ -4279,11 +4385,15 @@ sealed class CC {
   class DeleteRemoteHost(val remoteHostId: Long): CC()
   class StoreRemoteFile(val remoteHostId: Long, val storeEncrypted: Boolean?, val localPath: String): CC()
   class GetRemoteFile(val remoteHostId: Long, val file: RemoteFile): CC()
+  class RestoreRemoteHosts: CC()
+  class SetRemoteCtrlAddress(val remoteCtrlId: Long, val host: String): CC()
+  class ResumeRemoteCtrl(val remoteCtrlId: Long): CC()
   class ConnectRemoteCtrl(val xrcpInvitation: String): CC()
   class FindKnownRemoteCtrl(): CC()
   class ConfirmRemoteCtrl(val remoteCtrlId: Long): CC()
   class VerifyRemoteCtrlSession(val sessionCode: String): CC()
   class ListRemoteCtrls(): CC()
+  class AbortRemoteCtrl(val sequence: Int): CC()
   class StopRemoteCtrl(): CC()
   class DeleteRemoteCtrl(val remoteCtrlId: Long): CC()
   class ApiUploadStandaloneFile(val userId: Long, val file: CryptoFile): CC()
@@ -4510,11 +4620,15 @@ sealed class CC {
           (if (storeEncrypted == null) "" else "encrypt=${onOff(storeEncrypted)} ") +
           localPath
     is GetRemoteFile -> "/get remote file $remoteHostId ${json.encodeToString(file)}"
+    is RestoreRemoteHosts -> "/_restore remote hosts"
+    is SetRemoteCtrlAddress -> "/_remote ctrl address $remoteCtrlId $host"
+    is ResumeRemoteCtrl -> "/_resume remote ctrl $remoteCtrlId"
     is ConnectRemoteCtrl -> "/connect remote ctrl $xrcpInvitation"
     is FindKnownRemoteCtrl -> "/find remote ctrl"
     is ConfirmRemoteCtrl -> "/confirm remote ctrl $remoteCtrlId"
     is VerifyRemoteCtrlSession -> "/verify remote ctrl $sessionCode"
     is ListRemoteCtrls -> "/list remote ctrls"
+    is AbortRemoteCtrl -> "/_abort remote ctrl $sequence"
     is StopRemoteCtrl -> "/stop remote ctrl"
     is DeleteRemoteCtrl -> "/delete remote ctrl $remoteCtrlId"
     is ApiUploadStandaloneFile -> "/_upload $userId ${file.filePath}"
@@ -4699,11 +4813,15 @@ sealed class CC {
     is DeleteRemoteHost -> "deleteRemoteHost"
     is StoreRemoteFile -> "storeRemoteFile"
     is GetRemoteFile -> "getRemoteFile"
+    is RestoreRemoteHosts -> "restoreRemoteHosts"
+    is SetRemoteCtrlAddress -> "setRemoteCtrlAddress"
+    is ResumeRemoteCtrl -> "resumeRemoteCtrl"
     is ConnectRemoteCtrl -> "connectRemoteCtrl"
     is FindKnownRemoteCtrl -> "FindKnownRemoteCtrl"
     is ConfirmRemoteCtrl -> "confirmRemoteCtrl"
     is VerifyRemoteCtrlSession -> "verifyRemoteCtrlSession"
     is ListRemoteCtrls -> "listRemoteCtrls"
+    is AbortRemoteCtrl -> "abortRemoteCtrl"
     is StopRemoteCtrl -> "stopRemoteCtrl"
     is DeleteRemoteCtrl -> "deleteRemoteCtrl"
     is ApiUploadStandaloneFile -> "apiUploadStandaloneFile"
@@ -6729,7 +6847,8 @@ data class RemoteCtrl (
 data class RemoteCtrlInfo (
   val remoteCtrlId: Long,
   val ctrlDeviceName: String,
-  val sessionState: RemoteCtrlSessionState?
+  val sessionState: RemoteCtrlSessionState?,
+  val recoveryEnabled: Boolean = false
 ) {
   val deviceViewName: String
     get() = ctrlDeviceName.ifEmpty { remoteCtrlId.toString() }
@@ -7122,10 +7241,10 @@ sealed class CR {
   // remote events (mobile)
   @Serializable @SerialName("remoteCtrlList") class RemoteCtrlList(val remoteCtrls: List<RemoteCtrlInfo>): CR()
   @Serializable @SerialName("remoteCtrlFound") class RemoteCtrlFound(val remoteCtrl: RemoteCtrlInfo, val ctrlAppInfo_: CtrlAppInfo?, val appVersion: String, val compatible: Boolean): CR()
-  @Serializable @SerialName("remoteCtrlConnecting") class RemoteCtrlConnecting(val remoteCtrl_: RemoteCtrlInfo?, val ctrlAppInfo: CtrlAppInfo, val appVersion: String): CR()
-  @Serializable @SerialName("remoteCtrlSessionCode") class RemoteCtrlSessionCode(val remoteCtrl_: RemoteCtrlInfo?, val sessionCode: String): CR()
+  @Serializable @SerialName("remoteCtrlConnecting") class RemoteCtrlConnecting(val remoteCtrl_: RemoteCtrlInfo?, val ctrlAppInfo: CtrlAppInfo, val appVersion: String, val sessionSeq: Int = 0): CR()
+  @Serializable @SerialName("remoteCtrlSessionCode") class RemoteCtrlSessionCode(val remoteCtrl_: RemoteCtrlInfo?, val sessionCode: String, val sessionSeq: Int = 0): CR()
   @Serializable @SerialName("remoteCtrlConnected") class RemoteCtrlConnected(val remoteCtrl: RemoteCtrlInfo): CR()
-  @Serializable @SerialName("remoteCtrlStopped") class RemoteCtrlStopped(val rcsState: RemoteCtrlSessionState, val rcStopReason: RemoteCtrlStopReason): CR()
+  @Serializable @SerialName("remoteCtrlStopped") class RemoteCtrlStopped(val rcsState: RemoteCtrlSessionState, val rcStopReason: RemoteCtrlStopReason, val sessionSeq: Int = 0): CR()
   // pq
   @Serializable @SerialName("contactPQAllowed") class ContactPQAllowed(val user: UserRef, val contact: Contact, val pqEncryption: Boolean): CR()
   @Serializable @SerialName("contactPQEnabled") class ContactPQEnabled(val user: UserRef, val contact: Contact, val pqEnabled: Boolean): CR()
@@ -8021,7 +8140,7 @@ data class SomeRemoteCtrl(
 )
 
 @Serializable
-data class CtrlAppInfo(val appVersionRange: AppVersionRange, val deviceName: String)
+data class CtrlAppInfo(val appVersionRange: AppVersionRange, val deviceName: String, val reconnect: Boolean = false, val restart: Boolean = false)
 
 @Serializable
 data class AppVersionRange(val minVersion: String, val maxVersion: String)
@@ -8751,6 +8870,7 @@ sealed class RCErrorType {
     is CTRL_AUTH -> "CTRL_AUTH"
     is CTRL_NOT_FOUND -> "CTRL_NOT_FOUND"
     is CTRL_ERROR -> "CTRL_ERROR $ctrlErr"
+    is INVITATION -> "INVITATION"
     is VERSION -> "VERSION"
     is ENCRYPT -> "ENCRYPT"
     is DECRYPT -> "DECRYPT"
@@ -8767,6 +8887,7 @@ sealed class RCErrorType {
   @Serializable @SerialName("ctrlAuth") object CTRL_AUTH: RCErrorType()
   @Serializable @SerialName("ctrlNotFound") object CTRL_NOT_FOUND: RCErrorType()
   @Serializable @SerialName("ctrlError") data class CTRL_ERROR(val ctrlErr: String): RCErrorType()
+  @Serializable @SerialName("invitation") object INVITATION: RCErrorType()
   @Serializable @SerialName("version") object VERSION: RCErrorType()
   @Serializable @SerialName("encrypt") object ENCRYPT: RCErrorType()
   @Serializable @SerialName("decrypt") object DECRYPT: RCErrorType()
