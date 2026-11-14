@@ -252,8 +252,9 @@ runner currently provides the small `local_checks` mode only.
 ### Workpool packaging
 
 Cabal and Gradle do not currently have automatic Workpool command profiles.
-Use `scripts/ci/workpool/device-build.sh <installed-image@sha256:digest> linux`
-(or `android`) to offload them explicitly. It submits a clean filesystem
+Use `scripts/ci/workpool/device-build.sh linux` (or `android`) to offload them
+explicitly using the installed image pinned in `scripts/ci/workpool/image.txt`.
+To select another installed image, pass `<image@sha256:digest> linux` instead. It submits a clean filesystem
 snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and one CPU,
 and collects `artifacts/` in the Workpool result directory printed by the CLI.
 There is no unrestricted local fallback. Workpool's receipt records the source
