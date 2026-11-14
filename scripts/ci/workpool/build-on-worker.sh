@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 mkdir -p "$HOME"
+export GRADLE_USER_HOME="$HOME/.gradle"
+export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Duser.home=$HOME"
 # Jobs have no host credentials or Cabal cache. Use HTTPS for the public index.
 export CABAL_CONFIG=/tmp/simplex-cabal/config
 mkdir -p /tmp/simplex-cabal
