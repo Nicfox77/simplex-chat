@@ -2,6 +2,11 @@
 # Docker's installed Workpool shim builds this toolchain on an admitted host.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
+docker_wrapper=$(readlink -f "$(command -v docker)")
+if [[ "$docker_wrapper" != */workpool-command ]]; then
+  echo 'Install the Workpool Docker shim before building the toolchain image.' >&2
+  exit 1
+fi
 image_context=$(mktemp -d)
 trap 'rm -rf "$image_context"' EXIT
 cp Dockerfile.build "$image_context/Dockerfile"
