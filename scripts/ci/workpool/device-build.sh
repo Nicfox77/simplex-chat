@@ -12,7 +12,7 @@ fi
 case "$build_target" in linux|android) ;; *) echo 'Choose linux or android' >&2; exit 2 ;; esac
 pool_artifacts=(--artifact artifacts)
 if [[ "$build_target" == android ]]; then pool_artifacts+=(--artifact .signing); fi
-pool_memory=4
+pool_memory=6
 pool_cpus=1
 if [[ "$build_target" == android ]]; then pool_memory=8; pool_cpus=2; fi
 source_revision=$(git rev-parse HEAD)

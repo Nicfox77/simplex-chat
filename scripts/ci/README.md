@@ -255,7 +255,7 @@ Cabal and Gradle do not currently have automatic Workpool command profiles.
 Use `scripts/ci/workpool/device-build.sh linux` (or `android`) to offload them
 explicitly using the installed image pinned in `scripts/ci/workpool/image.txt`.
 To select another installed image, pass `<image@sha256:digest> linux` instead. It submits a clean filesystem
-snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and one CPU for Linux (8 GiB and two CPUs for Android),
+snapshot with `.workpoolignore` exclusions, requests 6 GiB RAM and one CPU for Linux (8 GiB and two CPUs for Android),
 and collects `artifacts/` in the Workpool result directory printed by the CLI.
 Android also preserves its generated debug signing key as a separate private
 `.signing/` result, so the test app's signing identity can be retained for future
