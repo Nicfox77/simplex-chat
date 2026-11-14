@@ -14,11 +14,6 @@ on:
         default: false
   workflow_dispatch:
     inputs:
-      local_package:
-        description: Package an app on simplex-local without cloud jobs
-        type: choice
-        options: [none, linux, android]
-        default: none
       local_checks:
         description: Run concurrency checks on the simplex-local runner without cloud jobs
         type: boolean
@@ -68,28 +63,8 @@ jobs:
           "$RUNNER_TEMP/concurrency/check"
           bash -n scripts/ci/android/ui scripts/ci/android/smoke-test.sh
 
-  local-package:
-    if: github.event_name == 'workflow_dispatch' && inputs.local_package != '' && inputs.local_package != 'none' && github.repository == 'Nicfox77/simplex-chat' && github.actor == github.repository_owner
-    runs-on: [simplex-local]
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - name: Build local package
-        env:
-          BUILD_TARGET: ${{ inputs.local_package }}
-        run: scripts/ci/local-device-build.sh "$BUILD_TARGET"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: local-${{ inputs.local_package }}-app
-          path: artifacts/
-          retention-days: 14
-          if-no-files-found: error
-
   plan:
-    if: inputs.local_checks != true && (inputs.local_package == '' || inputs.local_package == 'none')
+    if: inputs.local_checks != true
     name: choose jobs, find earlier builds
     runs-on: ubuntu-24.04
     timeout-minutes: 10

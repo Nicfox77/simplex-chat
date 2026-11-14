@@ -245,21 +245,9 @@ jobs. It compiles and runs the standalone concurrency tests using the local
 GHC, hspec and async packages, and checks the Android smoke scripts' shell
 syntax. It does not build an APK or desktop package.
 
-To package on the same local runner instead of the cloud jobs:
-
-```sh
-gh workflow run desktop-linux.yml -R Nicfox77/simplex-chat \
-  --ref testing/phone-hosted-desktop-20261113 -f local_package=linux
-# Repeat with -f local_package=android for the arm64 test APK.
-```
-
-The local package job runs `scripts/ci/local-device-build.sh` and uploads
-`local-linux-app` or `local-android-app` with a SHA-256 checksum. It requires a
-provisioned Android SDK (`ANDROID_HOME`), Java and CMake. Linux also
-needs GHC, Cabal and patchelf; Android needs Nix with the repository's binary
-caches configured. It checks free space before starting (15 GB for Linux,
-40 GB for Android). These packaging jobs do not run the GUI smoke tests.
-The ordinary native app workflows still use hosted runners.
+Native app packaging should use the explicit Workpool commands below. The
+ordinary native app workflows still use hosted runners; the local Actions
+runner currently provides the small `local_checks` mode only.
 
 ### Workpool packaging
 
@@ -281,5 +269,5 @@ and never inherits host credentials. This image disables Nix's inner sandbox
 because the Workpool container already runs without extra capabilities.
 
 The GitHub runner's `local_checks` mode remains suitable for the small standalone
-concurrency checks. Its direct `local_package` mode requires the native local
-toolchain and does not automatically delegate to Workpool.
+concurrency checks. Native Workpool dispatch currently runs from the operator's
+configured Workpool CLI; the isolated runner does not inherit its SSH keys.
