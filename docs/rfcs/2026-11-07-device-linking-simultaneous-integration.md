@@ -191,3 +191,32 @@ src/Simplex/Chat/Store/SQLite/Migrations/M20261106_remote_link_recovery.hs
 src/Simplex/Chat/Store/SQLite/Migrations/chat_schema.sql
 tests/RemoteTests.hs
 ```
+
+## Upstream refresh and Workpool validation, 2026-11-13
+
+`testing/phone-hosted-desktop-20261113` merges upstream master `953389322`
+into the integration without rewriting either original feature branch. The
+messaging dependency is now `Nicfox77/simplexmq` at
+`c3ebc2478af99a7af0b83036cf0b89339d884181`, merging upstream's
+`71179c4d4e96893fbddc25770d279a0f52fc41f7` while preserving owned,
+authenticated reconnects. Its Nix source hash was recomputed; the same hashing
+procedure reproduced the previous pinned source hash before use.
+
+The refreshed core and test executable compiled with GHC 9.6.6 and Cabal
+3.10.3.0. The standalone concurrency suite passed all 12 examples, including
+when compiled and run as the separate local Actions runner user.
+
+Workpool job `a85753c028d04bd9951b44f8059ad3ff` on `alpine-2` ran the complete
+Remote selection with multicast discovery excluded: **181 examples, zero
+failures, 117 pending**, in 751.63 seconds. The pending cases are the three
+upstream-disabled compression variants. The job had 2 GiB memory and half a
+CPU, and returned its log and successful receipt to the private Workpool result
+directory. It ran the freshly compiled test executable with its matching
+runtime libraries and the repository's public test fixtures.
+
+Earlier local whole-suite runs and native/Kotlin build attempts received
+SIGKILL or lost their compiler daemon; those attempts are not counted as passes.
+Native APK/Linux packaging and physical device acceptance remain separate from
+these successful core tests. The current phone-hosted protocol still admits
+only one desktop at a time; multiple simultaneous desktop sessions and iOS
+hosting have not been implemented.
