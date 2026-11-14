@@ -48,7 +48,9 @@ if [[ "$target" == android ]]; then
   printf '%s\n' 'application_id.suffix=.devlink' 'app.name=SimpleX Device Test' > local.properties
   ./gradlew --no-daemon --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process \
     '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
-    -Pandroid.injected.build.abi=arm64-v8a :android:assembleFossDebug
+    -Pandroid.injected.build.abi=arm64-v8a -Pandroid.injected.testOnly=false :android:assembleFossDebug
+  "$device_build_root/scripts/ci/android/check-installable-apk.sh" \
+    "android/build/intermediates/apk/foss/debug/android-foss-arm64-v8a-debug.apk"
   mkdir -p "$device_build_root/.signing"
   chmod 700 "$device_build_root/.signing"
   if [[ -f "$HOME/.android/debug.keystore" ]]; then
