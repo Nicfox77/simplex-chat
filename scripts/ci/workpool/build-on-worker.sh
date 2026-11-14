@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
+mkdir -p "$HOME"
 # Jobs have no host credentials or Cabal cache. Use HTTPS for the public index.
 export CABAL_CONFIG=/tmp/simplex-cabal/config
 mkdir -p /tmp/simplex-cabal
