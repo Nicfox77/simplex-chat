@@ -220,3 +220,39 @@ Native APK/Linux packaging and physical device acceptance remain separate from
 these successful core tests. The current phone-hosted protocol still admits
 only one desktop at a time; multiple simultaneous desktop sessions and iOS
 hosting have not been implemented.
+
+## Device packages and Workpool validation, 2026-11-14
+
+Both matching native applications have now been built successfully with GHC
+9.6.3 and Java 17 on Workpool:
+
+- Android job `159d282631e94becbc1d92940b0897d1` on `alpine-3`, with 8 GiB
+  and two CPUs, built source `7c6c4212b`. It produced the ARM64 FOSS debug APK,
+  version 7.1.3, named **SimpleX Device Test** (`chat.simplex.app.devlink`).
+  Its checksum and APK v2 signature verified. Every packaged native library
+  is AArch64 with at least 16 KiB ELF load alignment; uncompressed native
+  libraries also have 16 KiB ZIP alignment. The generated debug signing key
+  is retained privately, separately from the distributable files.
+- Linux job `9036c97d535e4c7c955beb973443af83` on `alpine-5`, with 6 GiB
+  and one CPU, built source `703b449bd`. All **292 Kotlin tests passed**, with
+  no failures, errors or skips. Desktop app and Android FOSS Kotlin compilation
+  passed, followed by native core compilation and desktop packaging with VLC.
+  The earlier 4 GiB attempt exceeded its memory limit; the successful job did
+  not report an OOM kill.
+- Fresh-worker job `82ce8c83ba3e4e2fa7e68e39cd112d36` on `alpine-3`, with
+  1 GiB and half a CPU, unpacked the Linux archive, checked native dependencies,
+  and loaded its JNI library. All 167 loaded Haskell/JNI libraries came from
+  the package. Its archive checksum matched the original build output.
+
+The Android and Linux revisions have identical application, core and dependency
+sources. Only the worker Nix permission fix differs: clearing the store
+directory's inherited setgid bit prevents Cabal installation from conflicting
+with Nix's syscall filter. A focused Workpool derivation reproduced the failure
+and passed after that change; the full Android build then passed as well.
+
+The operator's ignored `artifacts/android/` and `artifacts/linux/` directories
+contain the packages, checksums, receipts and verification reports. Linux also
+includes the Kotlin test XML. The build receipts record immutable worker image
+and source snapshot hashes. No physical Android/Linux GUI pairing, screen-off
+recovery, notification delivery or call test is claimed by these build checks.
+Follow `docs/tailscale-device-linking.md` for the device acceptance steps.

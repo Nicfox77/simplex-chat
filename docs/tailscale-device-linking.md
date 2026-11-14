@@ -19,8 +19,9 @@ store and messaging connections; the desktop is a remote viewer/controller.
 This version supports one active desktop per phone. Concurrent connections
 from several desktops are not implemented.
 
-The integrated `build.yml` native-app dispatch selects a separate Android test
-application: **SimpleX Device Test**, package `chat.simplex.app.devlink`. The
+Workpool packaging and the integrated `build.yml` native-app dispatch select a
+separate Android test application: **SimpleX Device Test**, package
+`chat.simplex.app.devlink`. The
 standalone `android-emu` workflow selects it with `test_app=true`. It can coexist
 with the released application and starts with separate app data. Create a test
 profile rather than importing the main profile for initial testing.
@@ -30,6 +31,7 @@ Run the unpacked Linux test app with separate settings and data:
 ```sh
 XDG_CONFIG_HOME="$HOME/.config/simplex-device-test" \
 XDG_DATA_HOME="$HOME/.local/share/simplex-device-test" \
+LD_LIBRARY_PATH="$PWD/simplex/lib/app/resources${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   ./simplex/bin/simplex
 ```
 

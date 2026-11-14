@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package matching native code and Kotlin UI on a provisioned local runner.
+# Package matching native code and Kotlin UI on a provisioned build worker.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 device_build_root=$PWD
