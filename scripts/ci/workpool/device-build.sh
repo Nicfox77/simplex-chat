@@ -10,8 +10,11 @@ else
   build_target=${2:?choose linux or android}
 fi
 case "$build_target" in linux|android) ;; *) echo 'Choose linux or android' >&2; exit 2 ;; esac
+pool_memory=4
+pool_cpus=1
+if [[ "$build_target" == android ]]; then pool_memory=8; pool_cpus=2; fi
 source_revision=$(git rev-parse HEAD)
 if [[ -n $(git status --porcelain) ]]; then source_revision+=+dirty; fi
 exec workpool run --cwd "$PWD" --image "$pool_image" \
-  --memory-gib 4 --cpus 1 --timeout 10800 --queue-timeout 900 \
+  --memory-gib "$pool_memory" --cpus "$pool_cpus" --timeout 10800 --queue-timeout 900 \
   --artifact artifacts -- scripts/ci/workpool/build-on-worker.sh "$build_target" "$source_revision"
