@@ -18,7 +18,7 @@ if (( available_kb < minimum_gb * 1024 * 1024 )); then
   exit 1
 fi
 : "${ANDROID_HOME:?Set ANDROID_HOME to a provisioned Android SDK}"
-for tool in java cmake ninja; do command -v "$tool" >/dev/null; done
+for tool in java cmake; do command -v "$tool" >/dev/null; done
 mkdir -p artifacts
 artifacts=$(cd artifacts && pwd)
 if [[ "$target" == linux ]]; then
@@ -27,6 +27,7 @@ if [[ "$target" == linux ]]; then
     cp scripts/cabal.project.local.linux cabal.project.local
     printf '\njobs: 2\n' >> cabal.project.local
   fi
+  cabal update
   SKIP_VLC=1 scripts/desktop/build-lib-linux.sh
 else
   command -v nix >/dev/null

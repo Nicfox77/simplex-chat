@@ -92,3 +92,5 @@ badge_service.ini
 
 # Local SDKs, dependency checkouts, and validation logs
 /.task-tools/
+
+/artifacts/

@@ -1,0 +1,11 @@
+# Keep local tools, caches, device settings and previous packages off workers.
+.task-tools
+.git
+.gradle
+**/.gradle/**
+**/build/**
+**/local.properties
+cabal.project.local
+tests/tmp
+artifacts
+apps/multiplatform/release
