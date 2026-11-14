@@ -256,3 +256,30 @@ includes the Kotlin test XML. The build receipts record immutable worker image
 and source snapshot hashes. No physical Android/Linux GUI pairing, screen-off
 recovery, notification delivery or call test is claimed by these build checks.
 Follow `docs/tailscale-device-linking.md` for the device acceptance steps.
+
+## Android installer correction, 2026-11-14
+
+The initial APK was marked `android:testOnly=true` by the injected ABI build
+option. Signature and alignment checks did not detect this installation
+restriction. The Pixel's ordinary installer rejected it; a physical ADB retry
+confirmed `INSTALL_FAILED_TEST_ONLY`. Installing it with ADB's `-t` option
+succeeded, and the app cold-launched on a Pixel 10 Pro XL running GrapheneOS
+Android 17 (API 37).
+
+Both APK build commands now explicitly set `android.injected.testOnly=false`.
+The shared `check-installable-apk.sh` inspects the final APK's badging and
+rejects a test-only artifact before publication. It rejected the original APK
+and accepted the corrected Workpool output from job
+`7143eec4171f462e8908abb4044976c5`, source `0ec5b9f25`.
+
+The corrected package reuses the already-built matching core from the original
+APK; application and core sources are unchanged. All six final native library
+payloads are byte-identical to the original. The retained debug key preserves
+the signing certificate for updates. Signature and 16 KiB ELF/ZIP alignment
+checks pass again. Signing provenance is recorded separately from the raw
+Workpool build receipt in the ignored Android artifacts directory.
+
+The corrected APK was then installed on the same Pixel with `pm install -r`,
+without `-t`, successfully updating the separate test app. Its corrected copy
+and checksum replaced the original files in Termux and Downloads. Phone/desktop
+pairing and concurrent UI behavior still require the planned acceptance tests.
