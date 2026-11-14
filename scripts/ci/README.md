@@ -266,7 +266,7 @@ The ordinary native app workflows still use hosted runners.
 Cabal and Gradle do not currently have automatic Workpool command profiles.
 Use `scripts/ci/workpool/device-build.sh <installed-image@sha256:digest> linux`
 (or `android`) to offload them explicitly. It submits a clean filesystem
-snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and half a CPU,
+snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and one CPU,
 and collects `artifacts/` in the Workpool result directory printed by the CLI.
 There is no unrestricted local fallback. Workpool's receipt records the source
 snapshot hash, exact image, host and resource budget; `BUILD_SOURCE.txt` also

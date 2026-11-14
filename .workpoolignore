@@ -1,5 +1,7 @@
 # Keep local tools, caches, device settings and previous packages off workers.
 .task-tools
+dist-newstyle
+.stack-work
 .git
 .gradle
 **/.gradle/**
