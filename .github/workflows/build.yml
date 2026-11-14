@@ -88,6 +88,8 @@ jobs:
       contents: read
       actions: read
     uses: ./.github/workflows/android-emu.yml
+    with:
+      test_app: true
 
   simultaneous-native-desktop:
     if: github.event_name == 'workflow_dispatch' && inputs.native_apps == true

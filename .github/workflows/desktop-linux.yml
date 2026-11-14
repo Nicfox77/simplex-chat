@@ -14,6 +14,10 @@ on:
         default: false
   workflow_dispatch:
     inputs:
+      local_checks:
+        description: Run concurrency checks on the simplex-local runner without cloud jobs
+        type: boolean
+        default: false
       claude:
         description: Also run the Claude job, which spends the Claude subscription's usage limits
         type: boolean
@@ -43,7 +47,24 @@ env:
   BACKEND_PKG: desktop-linux-backend.tar.gz
 
 jobs:
+  local-checks:
+    if: github.event_name == 'workflow_dispatch' && inputs.local_checks == true && github.repository == 'Nicfox77/simplex-chat' && github.actor == github.repository_owner
+    runs-on: [simplex-local]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Run concurrency checks
+        run: |
+          ghc --version
+          mkdir -p "$RUNNER_TEMP/concurrency"
+          ghc -threaded -isrc -itests -outputdir "$RUNNER_TEMP/concurrency" tests/ConcurrentMain.hs -o "$RUNNER_TEMP/concurrency/check"
+          "$RUNNER_TEMP/concurrency/check"
+          bash -n scripts/ci/android/ui scripts/ci/android/smoke-test.sh
+
   plan:
+    if: inputs.local_checks != true
     name: choose jobs, find earlier builds
     runs-on: ubuntu-24.04
     timeout-minutes: 10

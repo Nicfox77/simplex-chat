@@ -224,3 +224,25 @@ Each run uploads the app it built, for manual tests, as an artifact kept 14 days
 ## The Claude job
 
 It needs the GitHub environment `app-sim-claude` with the secret `CLAUDE_CODE_OAUTH_TOKEN`, a Claude subscription token. The environment's branch rule alone decides which branches may use it: on a branch it doesn't allow, a run that asks for Claude fails at the Claude job's environment check, and the scripted test runs as usual. Each run spends the subscription's usage limits; the job summary gives its tokens and cost estimated at API prices.
+
+## Local concurrency checks
+
+The fork has a repository-scoped self-hosted runner named
+`portable-dev-simplex`, labelled only `simplex-local`. It runs as the separate
+`simplex-runner` system user through `simplex-actions-runner.service`. Its work
+and credentials live under `/var/lib/simplex-actions-runner`; it has no sudo or
+Docker group membership, and the service hides home directories.
+
+On the integrated testing branch, run only its local checks with:
+
+```sh
+gh workflow run desktop-linux.yml -R Nicfox77/simplex-chat \
+  --ref testing/phone-hosted-desktop-20261113 -f local_checks=true
+```
+
+This manual, repository-owner-only mode skips the cloud plan and native build
+jobs. It compiles and runs the standalone concurrency tests using the local
+GHC, hspec and async packages, and checks the Android smoke scripts' shell
+syntax. It does not build an APK or desktop package. The ordinary native app
+workflows still use hosted runners; local native packaging needs additional
+Android/Nix tooling and build storage.

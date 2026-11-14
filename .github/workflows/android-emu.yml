@@ -3,6 +3,9 @@ name: android-emu
 on:
   workflow_call:
     inputs:
+      test_app:
+        type: boolean
+        default: false
       claude:
         type: boolean
         default: false
@@ -26,6 +29,10 @@ on:
       - "apps/multiplatform/**"
   workflow_dispatch:
     inputs:
+      test_app:
+        description: Install alongside the released app with a separate test profile
+        type: boolean
+        default: false
       claude:
         description: Also run the Claude job, which spends the Claude subscription's usage limits
         type: boolean
@@ -231,6 +238,8 @@ jobs:
 
   app:
     name: Android app in the emulator
+    env:
+      ANDROID_APP_ID: ${{ inputs.test_app && 'chat.simplex.app.devlink' || 'chat.simplex.app' }}
     needs: [plan, core, backend]
     # core and backend are skipped when an earlier run built them, and backend also when the run doesn't start it
     if: ${{ !cancelled() && !failure() && needs.plan.result == 'success' && needs.core.result != 'cancelled' && needs.backend.result != 'cancelled' }}
@@ -292,6 +301,12 @@ jobs:
         with:
           distribution: corretto
           java-version: ${{ env.JAVA_VER }}
+
+      - name: Configure separate test app
+        if: inputs.test_app == true
+        working-directory: apps/multiplatform
+        run: |
+          printf '%s\n' 'application_id.suffix=.devlink' 'app.name=SimpleX Device Test' > local.properties
 
       # the injected ABI builds only arm64-v8a, whose core the job has, and puts the APK under build/intermediates
       - name: Build app
@@ -378,6 +393,7 @@ jobs:
       group: android-emu-claude-${{ github.ref }}
       cancel-in-progress: true
     env:
+      ANDROID_APP_ID: ${{ inputs.test_app && 'chat.simplex.app.devlink' || 'chat.simplex.app' }}
       # the same in all app workflows
       CLAUDE_CODE_VERSION: 2.1.300
       CLAUDE_MODEL: claude-haiku-5-5

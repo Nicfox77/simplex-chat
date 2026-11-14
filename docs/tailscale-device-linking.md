@@ -10,6 +10,40 @@ Both applications need this fork's rebuilt native library. Existing pairings
 from earlier versions have recovery disabled until a direct session is verified
 with the new version. iOS application code and LAN multicast behavior are unchanged.
 
+## Integrated device testing
+
+The `testing/phone-hosted-desktop-20261113` branch combines reconnect recovery
+and simultaneous Android/Linux UI with the current upstream master. Both apps
+must use native libraries built from that branch. The phone owns the chat
+store and messaging connections; the desktop is a remote viewer/controller.
+This version supports one active desktop per phone. Concurrent connections
+from several desktops are not implemented.
+
+The integrated `build.yml` native-app dispatch selects a separate Android test
+application: **SimpleX Device Test**, package `chat.simplex.app.devlink`. The
+standalone `android-emu` workflow selects it with `test_app=true`. It can coexist
+with the released application and starts with separate app data. Create a test
+profile rather than importing the main profile for initial testing.
+
+Run the unpacked Linux test app with separate settings and data:
+
+```sh
+XDG_CONFIG_HOME="$HOME/.config/simplex-device-test" \
+XDG_DATA_HOME="$HOME/.local/share/simplex-device-test" \
+  ./simplex/bin/simplex
+```
+
+After pairing, first send messages from the Pixel and desktop at the same time,
+then edit, react, delete and read from each. Use an ordinary iPhone client as a
+third chat participant to check incoming messages and phone-owned calls. iOS
+hosting of the new concurrent UI protocol is not implemented.
+
+Next interrupt Tailscale or the network, restore it, and check reconnect and
+messages received while disconnected. Repeat with the phone screen off and
+with each application restarted. An explicit **Disconnect** disables recovery;
+it is different from a network interruption. Finally unlink and verify that
+the old desktop can no longer reconnect.
+
 ## Pair once
 
 1. Enable Tailscale on Android and Linux.

@@ -24,7 +24,7 @@ case "$cases" in
     exit 1
     ;;
 esac
-package=chat.simplex.app
+package=${ANDROID_APP_ID:-chat.simplex.app}
 local_chat="seeded notes"
 search_field="Search or paste SimpleX link"
 ui=$(dirname "$0")/ui

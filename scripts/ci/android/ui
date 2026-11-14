@@ -35,8 +35,8 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 : "${UI_OUT:?UI_OUT must be the output directory}"
 # Claude Code's Bash tool builds its own PATH, without the SDK that install-sdk.sh put on the job's
 PATH=${ANDROID_HOME:?ANDROID_HOME must be the SDK from install-sdk.sh}/platform-tools:$PATH
-package=chat.simplex.app
-prefs_file=$package.SIMPLEX_APP_PREFS.xml
+package=${ANDROID_APP_ID:-chat.simplex.app}
+prefs_file=chat.simplex.app.SIMPLEX_APP_PREFS.xml
 # the button that opens New chat, in the toolbar or floating, whenever the chat list shows
 chat_list_button="Start new chat"
 state=${UI_STATE:-${RUNNER_TEMP:-/tmp}/ui}
