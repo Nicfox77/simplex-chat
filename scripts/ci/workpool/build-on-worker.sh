@@ -14,6 +14,13 @@ jobs: 2
 CABAL
 mkdir -p artifacts
 printf '%s\n' "source=${2:-unknown}" "target=${1:-unknown}" > artifacts/BUILD_SOURCE.txt
+# The Android flake uses cleanGit; snapshots deliberately omit host Git data.
+if [[ "${1:-}" == android ]] && ! git rev-parse --git-dir >/dev/null 2>&1; then
+  git init --quiet
+  git add --all
+  git -c user.name='Workpool Snapshot' -c user.email=workpool@localhost \
+    -c commit.gpgsign=false commit --quiet -m 'filesystem snapshot'
+fi
 if [[ "${1:-}" == linux ]]; then
   (
     cd apps/multiplatform
