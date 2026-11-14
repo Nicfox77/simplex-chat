@@ -28,7 +28,7 @@ if [[ "$target" == linux ]]; then
     printf '\njobs: 2\n' >> cabal.project.local
   fi
   cabal update
-  SKIP_VLC=1 scripts/desktop/build-lib-linux.sh
+  scripts/desktop/build-lib-linux.sh
 else
   command -v nix >/dev/null
   native_dir=$(mktemp -d)
