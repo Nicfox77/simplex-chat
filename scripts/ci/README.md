@@ -260,3 +260,26 @@ needs GHC, Cabal and patchelf; Android needs Nix with the repository's binary
 caches configured. It checks free space before starting (15 GB for Linux,
 40 GB for Android). These packaging jobs do not run the GUI smoke tests.
 The ordinary native app workflows still use hosted runners.
+
+### Workpool packaging
+
+Cabal and Gradle do not currently have automatic Workpool command profiles.
+Use `scripts/ci/workpool/device-build.sh <installed-image@sha256:digest> linux`
+(or `android`) to offload them explicitly. It submits a clean filesystem
+snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and half a CPU,
+and collects `artifacts/` in the Workpool result directory printed by the CLI.
+There is no unrestricted local fallback. Workpool's receipt records the source
+snapshot hash, exact image, host and resource budget; `BUILD_SOURCE.txt` also
+records the Git revision and whether the source had local changes.
+
+`scripts/ci/workpool/prepare-image.sh` prepares the toolchain from
+`Dockerfile.build` plus the pinned Android Nix installer. It relies on the
+installed Workpool Docker shim to perform the image build remotely. The result
+must be installed by immutable digest on the chosen workers before submitting
+packaging jobs. The worker entry point uses an isolated HTTPS Cabal index/cache
+and never inherits host credentials. This image disables Nix's inner sandbox
+because the Workpool container already runs without extra capabilities.
+
+The GitHub runner's `local_checks` mode remains suitable for the small standalone
+concurrency checks. Its direct `local_package` mode requires the native local
+toolchain and does not automatically delegate to Workpool.
