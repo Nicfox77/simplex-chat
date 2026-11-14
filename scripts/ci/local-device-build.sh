@@ -2,6 +2,7 @@
 # Package matching native code and Kotlin UI on a provisioned local runner.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+device_build_root=$PWD
 target=${1:?usage: local-device-build.sh linux or android}
 case "$target" in
   linux) minimum_gb=15 ;;
@@ -48,6 +49,12 @@ if [[ "$target" == android ]]; then
   ./gradlew --no-daemon --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process \
     '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
     -Pandroid.injected.build.abi=arm64-v8a :android:assembleFossDebug
+  mkdir -p "$device_build_root/.signing"
+  chmod 700 "$device_build_root/.signing"
+  if [[ -f "$HOME/.android/debug.keystore" ]]; then
+    cp "$HOME/.android/debug.keystore" "$device_build_root/.signing/debug.keystore"
+    chmod 600 "$device_build_root/.signing/debug.keystore"
+  fi
   package_artifact=android-foss-arm64-v8a-debug.apk
   cp "android/build/intermediates/apk/foss/debug/$package_artifact" "$artifacts/"
 else

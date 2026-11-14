@@ -94,3 +94,4 @@ badge_service.ini
 /.task-tools/
 
 /artifacts/
+/.signing/

@@ -257,6 +257,9 @@ explicitly using the installed image pinned in `scripts/ci/workpool/image.txt`.
 To select another installed image, pass `<image@sha256:digest> linux` instead. It submits a clean filesystem
 snapshot with `.workpoolignore` exclusions, requests 4 GiB RAM and one CPU for Linux (8 GiB and two CPUs for Android),
 and collects `artifacts/` in the Workpool result directory printed by the CLI.
+Android also preserves its generated debug signing key as a separate private
+`.signing/` result, so the test app's signing identity can be retained for future
+updates. Distribute the APK and checksum; keep that signing result private.
 There is no unrestricted local fallback. Workpool's receipt records the source
 snapshot hash, exact image, host and resource budget; `BUILD_SOURCE.txt` also
 records the Git revision and whether the source had local changes.

@@ -13,3 +13,4 @@ artifacts
 apps/multiplatform/release
 apps/multiplatform/common/src/commonMain/cpp/android/libs
 apps/multiplatform/common/src/commonMain/cpp/desktop/libs
+.signing
