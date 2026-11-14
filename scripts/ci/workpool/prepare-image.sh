@@ -25,7 +25,7 @@ USER 65534:65534
 WORKDIR /home/builder
 RUN curl --proto '=https' --tlsv1.2 -sSf https://releases.nixos.org/nix/nix-2.22.0/install -o /tmp/nix-install && \
     echo '4fed7db867186c01ce2a2077da4a6950ed16232efbf78d0cd19700cff80559f9  /tmp/nix-install' | sha256sum -c - && \
-    sh /tmp/nix-install --no-daemon && rm /tmp/nix-install
+    sh /tmp/nix-install --no-daemon && chmod g-s /nix/store && rm /tmp/nix-install
 ENV PATH="/home/builder/.nix-profile/bin:$PATH"
 WORKDIR /workspace
 DOCKERFILE

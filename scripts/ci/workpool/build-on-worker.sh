@@ -17,6 +17,9 @@ jobs: 2
 CABAL
 mkdir -p artifacts
 printf '%s\n' "source=${2:-unknown}" "target=${1:-unknown}" > artifacts/BUILD_SOURCE.txt
+# Single-user Nix builds inherit this directory's setgid bit, which Nix's
+# syscall filter then prevents Cabal from preserving during installation.
+if [[ "${1:-}" == android ]]; then chmod g-s /nix/store; fi
 # The Android flake uses cleanGit; snapshots deliberately omit host Git data.
 if [[ "${1:-}" == android ]] && ! git rev-parse --git-dir >/dev/null 2>&1; then
   git init --quiet
