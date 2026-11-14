@@ -14,4 +14,15 @@ jobs: 2
 CABAL
 mkdir -p artifacts
 printf '%s\n' "source=${2:-unknown}" "target=${1:-unknown}" > artifacts/BUILD_SOURCE.txt
+if [[ "${1:-}" == linux ]]; then
+  (
+    cd apps/multiplatform
+    ./gradlew --no-daemon --max-workers=1 -Pkotlin.compiler.execution.strategy=in-process \
+      '-Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' \
+      :common:desktopTest :desktop:compileKotlinJvm -x :desktop:cmakeBuildAndCopy \
+      :android:compileFossDebugKotlin
+  )
+  mkdir -p artifacts/kotlin-test-results
+  cp apps/multiplatform/common/build/test-results/desktopTest/*.xml artifacts/kotlin-test-results/
+fi
 exec scripts/ci/local-device-build.sh "${1:?choose linux or android}"

@@ -264,8 +264,10 @@ records the Git revision and whether the source had local changes.
 `Dockerfile.build` plus the pinned Android Nix installer. It relies on the
 installed Workpool Docker shim to perform the image build remotely. The result
 must be installed by immutable digest on the chosen workers before submitting
-packaging jobs. The worker entry point uses an isolated HTTPS Cabal index/cache
-and never inherits host credentials. This image disables Nix's inner sandbox
+packaging jobs. The Linux worker first runs desktop Kotlin tests and compiles desktop/Android
+Kotlin without native packaging, then builds the matching native desktop app.
+Its test XML is collected with the package. The worker entry point uses an
+isolated HTTPS Cabal index/cache and never inherits host credentials. This image disables Nix's inner sandbox
 because the Workpool container already runs without extra capabilities.
 
 The GitHub runner's `local_checks` mode remains suitable for the small standalone

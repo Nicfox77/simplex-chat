@@ -34,7 +34,7 @@ else
   native_dir=$(mktemp -d)
   trap 'rm -rf "$native_dir"' EXIT
   for component in simplex-chat support; do
-    nix --extra-experimental-features 'nix-command flakes' build -L --cores 2 --max-jobs 2 \
+    nix --extra-experimental-features 'nix-command flakes' build -L --cores 2 --max-jobs 1 \
       --out-link "$native_dir/result-$component" \
       ".#hydraJobs.x86_64-linux.aarch64-android:lib:$component"
     unzip -o "$native_dir/result-$component"/pkg-*.zip -d "$native_dir/libs"
