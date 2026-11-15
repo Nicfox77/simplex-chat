@@ -12,8 +12,9 @@ encryption.
 
 To link the devices:
 
-- The mobile and the desktop must be connected to the same local network, and
-  the desktop firewall must allow the connection.
+- The mobile and the desktop must be connected to the same local network, or
+  Android and Linux can use [Tailscale](#android-and-linux-over-tailscale). The
+  desktop firewall must allow the connection.
 - Both apps must have compatible versions. Otherwise the mobile shows **Not
   compatible!** or **Incompatible version**.
 

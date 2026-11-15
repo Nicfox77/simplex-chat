@@ -144,9 +144,7 @@ forward the port from a public router. Check `ss -ltnp`: the listener should sho
 `100.x.y.z:port`, not `0.0.0.0:port` or `[::]:port`. Check denial from an
 unauthorized peer and the desktop LAN address, as well as intended phone access.
 
-`cabal.project` pins `Nicfox77/simplexmq@10e75b56891deef9064474265208ba39beb08dd9`.
-[Restart transport diff](https://github.com/Nicfox77/simplexmq/compare/985cf2b3e992884d2d8536458c012c456b889785...10e75b56891deef9064474265208ba39beb08dd9). Its
-baseline is upstream `a0eec710` plus certificate-chain validation `c89b00cf`, owned
-listener/session cleanup, and the mutual-TLS invitation fetch described above.
-The dependency contains the transport lifecycle/security tests. Nix and backend
-build scripts use the same pinned revision; the Nix hash includes submodules.
+`cabal.project` pins the companion `simplexmq` transport changes. The dependency
+contains the owned-listener lifecycle, mutual-TLS invitation-fetch and identity
+rejection tests. Nix and backend build scripts use the same pinned revision;
+the Nix source hash includes the dependency's submodules.

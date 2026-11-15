@@ -67,8 +67,8 @@ import Simplex.Messaging.Transport
 import Simplex.Messaging.Transport.Server (ServerCredentials (..), mkTransportServerConfig)
 import Simplex.Messaging.Version
 import Simplex.Messaging.Version.Internal
-import System.Environment (lookupEnv)
 import System.Directory (createDirectoryIfMissing, listDirectory, removePathForcibly)
+import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import qualified System.Terminal as C
 import System.Terminal.Internal (Command (..), Terminal (..), VirtualTerminal (..), VirtualTerminalSettings (..), withVirtualTerminal)
