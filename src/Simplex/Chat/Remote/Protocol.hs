@@ -53,7 +53,7 @@ import Simplex.Messaging.Transport (TSbChainKeys)
 import Simplex.Messaging.Transport.Buffer (getBuffered)
 import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..), HTTP2BodyChunk, getBodyChunk)
 import Simplex.Messaging.Transport.HTTP2.Client (HTTP2Client, HTTP2Response (..), closeHTTP2Client, sendRequestDirect)
-import Simplex.Messaging.Util (liftError', liftEitherWith, liftError, tshow)
+import Simplex.Messaging.Util (liftEitherWith, liftError, liftError', tshow)
 import Simplex.RemoteControl.Client (xrcpBlockSize)
 import qualified Simplex.RemoteControl.Client as RC
 import Simplex.RemoteControl.Types (CtrlSessKeys (..), HostSessKeys (..), RCErrorType (..), SessionCode)
@@ -181,13 +181,14 @@ remoteStoreFile c localPath fileName = do
     r -> badResponse r
 
 remoteGetFile :: RemoteHostClient -> FilePath -> RemoteFile -> ExceptT RemoteProtocolError IO ()
-remoteGetFile c destDir rf@RemoteFile {fileSource = CryptoFile {filePath}} = withActiveRemoteHostClient c $
-  sendRemoteCommand c Nothing RCGetFile {file = rf} >>= \case
-    (rfKN, getChunk, RRFile {fileSize, fileDigest}) -> do
-      -- TODO we could optimize by checking size and hash before receiving the file
-      let localPath = destDir </> takeFileName filePath
-      receiveEncryptedFile rfKN getChunk fileSize fileDigest localPath
-    (_, _, r) -> badResponse r
+remoteGetFile c destDir rf@RemoteFile {fileSource = CryptoFile {filePath}} =
+  withActiveRemoteHostClient c $
+    sendRemoteCommand c Nothing RCGetFile {file = rf} >>= \case
+      (rfKN, getChunk, RRFile {fileSize, fileDigest}) -> do
+        -- TODO we could optimize by checking size and hash before receiving the file
+        let localPath = destDir </> takeFileName filePath
+        receiveEncryptedFile rfKN getChunk fileSize fileDigest localPath
+      (_, _, r) -> badResponse r
 
 -- TODO validate there is no attachment in response
 sendRemoteCommand' :: RemoteHostClient -> Maybe (Handle, Word32) -> RemoteCommand -> ExceptT RemoteProtocolError IO RemoteResponse

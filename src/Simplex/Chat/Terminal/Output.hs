@@ -181,8 +181,9 @@ markChatItemRead cc outputRH u (AChatItem _ _ chat ci@ChatItem {chatDir, meta = 
 -- identifiers are scoped to the owning phone's store; using the local command
 -- path can mark an unrelated desktop chat read when its IDs happen to match.
 remoteReadCommand :: ChatRef -> ChatItemId -> ByteString
-remoteReadCommand (ChatRef cType cId scope) itemId = encodeUtf8 $
-  "/_read chat items " <> chatTypeStr cType <> tshow cId <> scopeText <> " " <> tshow itemId
+remoteReadCommand (ChatRef cType cId scope) itemId =
+  encodeUtf8 $
+    "/_read chat items " <> chatTypeStr cType <> tshow cId <> scopeText <> " " <> tshow itemId
   where
     scopeText = case scope of
       Nothing -> ""
@@ -222,8 +223,9 @@ chatEventNotification t@ChatTerminal {sendNotification} cc = \case
     sendNtf ("#" <> viewGroupName g, "you are connected to group")
   CEvtJoinedGroupMember u g m ->
     when (groupNtf u g False) $ sendNtf ("#" <> viewGroupName g, "member " <> viewMemberName m <> " is connected")
-  CEvtJoinedGroupMemberConnecting u g _ m | memberStatus m == GSMemPendingReview ->
-    when (groupNtf u g False) $ sendNtf ("#" <> viewGroupName g, "member " <> viewMemberName m <> " is pending review")
+  CEvtJoinedGroupMemberConnecting u g _ m
+    | memberStatus m == GSMemPendingReview ->
+        when (groupNtf u g False) $ sendNtf ("#" <> viewGroupName g, "member " <> viewMemberName m <> " is pending review")
   CEvtConnectedToGroupMember u g m _ ->
     when (groupNtf u g False) $ sendNtf ("#" <> viewGroupName g, "member " <> viewMemberName m <> " is connected")
   CEvtReceivedContactRequest u UserContactRequest {localDisplayName = n} _ ->

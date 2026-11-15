@@ -21,7 +21,7 @@ import Control.Concurrent (ThreadId)
 import Control.Concurrent.Async (Async)
 import Control.Exception (Exception)
 import qualified Control.Exception as E
-import Control.Monad (when, void)
+import Control.Monad (void, when)
 import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader

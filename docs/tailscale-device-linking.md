@@ -6,7 +6,7 @@ remains the chat host; Linux uses its remote UI. Recovery uses the existing
 pairing identities in the encrypted chat database and a fresh, authenticated
 invitation exchange. Desktop invitation private keys are never persisted.
 
-Both applications need this fork's rebuilt native library. Existing pairings
+Both applications need native libraries rebuilt from matching sources. Existing pairings
 from earlier versions have recovery disabled until a direct session is verified
 with the new version. iOS application code and LAN multicast behavior are unchanged.
 

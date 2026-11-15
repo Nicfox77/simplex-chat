@@ -36,8 +36,8 @@ import qualified Data.Text as T
 import Data.Text.Encoding (decodeLatin1, encodeUtf8)
 import Data.Word (Word16, Word32)
 import qualified Network.HTTP.Types as N
-import qualified Network.TLS as NT
 import Network.HTTP2.Server (responseStreaming)
+import qualified Network.TLS as NT
 import qualified Paths_simplex_chat as SC
 import Simplex.Chat.Controller
 import Simplex.Chat.Controller.Concurrent
@@ -61,8 +61,8 @@ import Simplex.Messaging.Crypto.File (CryptoFile (..), CryptoFileArgs (..))
 import qualified Simplex.Messaging.Crypto.File as CF
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
 import qualified Simplex.Messaging.TMap as TM
-import Simplex.Messaging.Transport.Client (TransportHost (..))
 import Simplex.Messaging.Transport (TLS (..), TransportPeer (..), closeConnection, tlsUniq)
+import Simplex.Messaging.Transport.Client (TransportHost (..))
 import Simplex.Messaging.Transport.HTTP2.Client (HTTP2ClientError)
 import qualified Simplex.Messaging.Transport.HTTP2.Client as H2
 import Simplex.Messaging.Transport.HTTP2.Server (HTTP2Request (..))
@@ -188,12 +188,13 @@ startRemoteHostWith_ persistent restoring rh_ rcAddrPrefs_ port_ = do
       pure (multicast, Just $ remoteHostInfo rh $ Just RHSStarting, hostPairing) -- get from the database, start multicast if requested
     Nothing -> lift . withAgent' $ \a -> (False,Nothing,) <$> rcNewHostPairing a
   ctrlAppInfo <- mkCtrlAppInfo
-  (localAddrs, invitation, rchClient, vars) <- handleConnectError rhKey sseq $
-    if persistent
-      then do
-        drg <- asks random
-        liftError (chatErrorAgent . RCP) $ connectRCHostPersistent drg pairing (J.toJSON ctrlAppInfo) multicast rcAddrPrefs_ port_
-      else withAgent $ \a -> rcConnectHost a pairing (J.toJSON ctrlAppInfo) multicast rcAddrPrefs_ port_
+  (localAddrs, invitation, rchClient, vars) <-
+    handleConnectError rhKey sseq $
+      if persistent
+        then do
+          drg <- asks random
+          liftError (chatErrorAgent . RCP) $ connectRCHostPersistent drg pairing (J.toJSON ctrlAppInfo) multicast rcAddrPrefs_ port_
+        else withAgent $ \a -> rcConnectHost a pairing (J.toJSON ctrlAppInfo) multicast rcAddrPrefs_ port_
   let inv = decodeLatin1 $ strEncode invitation
   let rcAddr_ = L.head localAddrs <$ rcAddrPrefs_
   cmdOk <- newEmptyTMVarIO
@@ -203,9 +204,11 @@ startRemoteHostWith_ persistent restoring rh_ rcAddrPrefs_ port_ = do
     atomically $ takeTMVar cmdOk
     handleHostError sseq rhKeyVar $ waitForHostSession remoteHost_ rhKey sseq rcAddr_ rhKeyVar activateOnConnect inv (knownHost pairing) restoring vars
   let rhs = RHPendingSession {rhKey, rchClient, rhsWaitSession, remoteHost_}
-  (withRemoteHostSession rhKey sseq $ \case
-    RHSessionStarting -> Right ((), RHSessionConnecting inv rhs)
-    _ -> Left $ ChatErrorRemoteHost rhKey RHEBadState) `catchAllErrors` \e -> do
+  ( withRemoteHostSession rhKey sseq $ \case
+      RHSessionStarting -> Right ((), RHSessionConnecting inv rhs)
+      _ -> Left $ ChatErrorRemoteHost rhKey RHEBadState
+    )
+    `catchAllErrors` \e -> do
       liftIO $ cancelHostClient rchClient >> cancel rhsWaitSession
       throwError e
   (localAddrs, remoteHost_, invitation) <$ atomically (putTMVar cmdOk ())
@@ -356,19 +359,20 @@ startRemoteHostWith_ persistent restoring rh_ rcAddrPrefs_ port_ = do
       cc <- ask
       let receiveEvent = liftRH rhId $ remoteRecv rhClient (if persistent then remoteHostPollWait else 10000000)
           receiveWithTimeout = if persistent then timeoutThrow (ChatErrorRemoteHost (RHId rhId) RHETimeout) remoteHostPollTimeout receiveEvent else receiveEvent
-          loop = tryAllErrors receiveWithTimeout >>= \case
-            Left e -> do
-              logDebug $ "Remote host poll stopped: " <> tshow e
-              -- Every receive failure ends this poller once. Only outages and
-              -- revoked buffers may recover through a fresh authenticated session.
-              atomically $ signalDisconnected $ case e of
-                ChatErrorRemoteHost _ RHETimeout -> RHTransportLost
-                ChatErrorRemoteHost _ (RHEProtocolError RPEHTTP2 {}) -> RHTransportLost
-                ChatErrorRemoteHost _ (RHEProtocolError RPESessionClosed) -> RHTransportLost
-                _ -> RHReceiveFailed e
-            Right Nothing -> loop
-            Right (Just (Right CEvtRemoteCtrlStopped {})) -> atomically $ signalDisconnected RHControllerStopped
-            Right (Just r) -> atomically (writeUIOutput cc (Just rhId, r)) >> loop
+          loop =
+            tryAllErrors receiveWithTimeout >>= \case
+              Left e -> do
+                logDebug $ "Remote host poll stopped: " <> tshow e
+                -- Every receive failure ends this poller once. Only outages and
+                -- revoked buffers may recover through a fresh authenticated session.
+                atomically $ signalDisconnected $ case e of
+                  ChatErrorRemoteHost _ RHETimeout -> RHTransportLost
+                  ChatErrorRemoteHost _ (RHEProtocolError RPEHTTP2 {}) -> RHTransportLost
+                  ChatErrorRemoteHost _ (RHEProtocolError RPESessionClosed) -> RHTransportLost
+                  _ -> RHReceiveFailed e
+              Right Nothing -> loop
+              Right (Just (Right CEvtRemoteCtrlStopped {})) -> atomically $ signalDisconnected RHControllerStopped
+              Right (Just r) -> atomically (writeUIOutput cc (Just rhId, r)) >> loop
       loop
     httpError :: RemoteHostId -> HTTP2ClientError -> ChatError
     httpError rhId = ChatErrorRemoteHost (RHId rhId) . RHEProtocolError . RPEHTTP2 . tshow
@@ -402,9 +406,11 @@ closeRemoteHost rhKey = do
   forM_ (case rhKey of RHId rhId -> Just rhId; RHNew -> Nothing) $ \rhId ->
     withStore' $ \db -> setRemoteHostRecovery db rhId False
   sessions <- asks remoteHostSessions
-  client <- atomically $ TM.lookup rhKey sessions >>= \case
-    Just (_, RHSessionConnected {hostStopRequested, rhClient, canReconnect}) -> (if canReconnect then Just rhClient else Nothing) <$ writeTVar hostStopRequested True
-    _ -> pure Nothing
+  client <-
+    atomically $
+      TM.lookup rhKey sessions >>= \case
+        Just (_, RHSessionConnected {hostStopRequested, rhClient, canReconnect}) -> (if canReconnect then Just rhClient else Nothing) <$ writeTVar hostStopRequested True
+        _ -> pure Nothing
   forM_ client $ \c -> liftIO . void . timeout 2000000 . runExceptT $ remoteSend c "/_stop remote ctrl" 0
   cancelRemoteHostSession Nothing rhKey
   forM_ (case rhKey of RHId rhId -> Just rhId; RHNew -> Nothing) $ \rhId ->
@@ -705,9 +711,11 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
   rcsWaitSession <- async $ do
     atomically $ takeTMVar cmdOk
     handleCtrlError sseq RCSRConnectionFailed "waitForCtrlSession" $ waitForCtrlSession rc_ ctrlInfo rcsClient vars
-  (updateRemoteCtrlSession sseq $ \case
-    RCSessionStarting -> Right RCSessionConnecting {remoteCtrlId_ = remoteCtrlId' <$> rc_, rcsClient, rcsWaitSession, recoveryEndpoint, ctrlAppInfo = ctrlInfo}
-    _ -> Left $ ChatErrorRemoteCtrl RCEBadState) `catchAllErrors` \e -> do
+  ( updateRemoteCtrlSession sseq $ \case
+      RCSessionStarting -> Right RCSessionConnecting {remoteCtrlId_ = remoteCtrlId' <$> rc_, rcsClient, rcsWaitSession, recoveryEndpoint, ctrlAppInfo = ctrlInfo}
+      _ -> Left $ ChatErrorRemoteCtrl RCEBadState
+    )
+    `catchAllErrors` \e -> do
       liftIO $ cancelCtrlClient rcsClient >> cancel rcsWaitSession
       throwError e
   atomically $ putTMVar cmdOk ()
@@ -756,10 +764,11 @@ handleRemoteCommand execCC stopAction encryption remoteOutputQ remoteStopEvent H
     Right (rfKN, getNext, rc) -> do
       -- Decryption can wait for body data while this session is revoked. Check
       -- admission after parsing, before executing commands or receiving files.
-      admitted <- withRemoteSession remoteOutputQ $
-        chatReadVar' currentUser >>= \case
-          Nothing -> replyError $ ChatError CENoActiveUser
-          Just user -> processCommand user rfKN getNext rc `catchAllErrors'` replyError
+      admitted <-
+        withRemoteSession remoteOutputQ $
+          chatReadVar' currentUser >>= \case
+            Nothing -> replyError $ ChatError CENoActiveUser
+            Just user -> processCommand user rfKN getNext rc `catchAllErrors'` replyError
       either reply pure admitted
     Left e -> reply $ RRProtocolError e
   where
@@ -844,9 +853,11 @@ withRemoteSession events action = do
 withRemoteCommandLease :: EventBuffer a -> CM' b -> CM' (Either RemoteResponse b)
 withRemoteCommandLease events action = do
   leases <- asks remoteCommandLeases
-  let acquire = atomically $ eventBufferClosed events >>= \case
-        Just _ -> pure False
-        Nothing -> modifyTVar' leases (+ 1) $> True
+  let acquire =
+        atomically $
+          eventBufferClosed events >>= \case
+            Just _ -> pure False
+            Nothing -> modifyTVar' leases (+ 1) $> True
       release admitted = when admitted $ atomically $ modifyTVar' leases (subtract 1)
   bracket acquire release $ \admitted ->
     if admitted then Right <$> action else pure $ Left remoteSessionClosed
@@ -948,9 +959,11 @@ verifyRemoteCtrlSession execCC sessCode' = do
           stopped = atomically (readTMVar desktopStop) >> closeRemoteHostTransport tls
           idle = remoteCtrlWatchdog remoteCtrlIdleTimeout activity (closeRemoteHostTransport tls)
       race_ server $ if retainLink then race_ stopped idle else stopped
-    (updateRemoteCtrlSession sseq $ \case
-      RCSessionPendingConfirmation {ctrlAppInfo} -> Right RCSessionConnected {remoteCtrlId, rcsClient = client, rcsSession, tls, http2Server, remoteOutputQ, remoteStopEvent, recoveryEndpoint, ctrlAppInfo}
-      _ -> Left $ ChatErrorRemoteCtrl RCEBadState) `catchAllErrors` \e -> liftIO (cancel http2Server) >> throwError e
+    ( updateRemoteCtrlSession sseq $ \case
+        RCSessionPendingConfirmation {ctrlAppInfo} -> Right RCSessionConnected {remoteCtrlId, rcsClient = client, rcsSession, tls, http2Server, remoteOutputQ, remoteStopEvent, recoveryEndpoint, ctrlAppInfo}
+        _ -> Left $ ChatErrorRemoteCtrl RCEBadState
+      )
+      `catchAllErrors` \e -> liftIO (cancel http2Server) >> throwError e
     atomically $ putTMVar serverReady ()
     void . forkIO $ monitor sseq http2Server remoteOutputQ desktopStop
     let remoteCtrl = remoteCtrlInfo rc $ Just RCSConnected {sessionCode = tlsSessionCode tls}
@@ -973,9 +986,10 @@ verifyRemoteCtrlSession execCC sessCode' = do
       intentional <- atomically $ not <$> isEmptyTMVar desktopStop
       when intentional $ do
         sessionVar <- asks remoteCtrlSession
-        withStore' $ \db -> readTVarIO sessionVar >>= \case
-          Just (currentSeq, RCSessionConnected {remoteCtrlId}) | currentSeq == sseq -> setRemoteCtrlRecovery db remoteCtrlId Nothing
-          _ -> pure ()
+        withStore' $ \db ->
+          readTVarIO sessionVar >>= \case
+            Just (currentSeq, RCSessionConnected {remoteCtrlId}) | currentSeq == sseq -> setRemoteCtrlRecovery db remoteCtrlId Nothing
+            _ -> pure ()
       cancelActiveRemoteCtrl $ Just (sseq, if intentional then RCSRStopped else RCSRDisconnected)
 
 -- Check ownership INSIDE the database transaction that commits trust and enable
@@ -986,19 +1000,23 @@ commitRemoteCtrlPairing :: SessionSeq -> Text -> RCCtrlPairing -> Maybe RCEndpoi
 commitRemoteCtrlPairing sseq ctrlName rcCtrlPairing endpoint = do
   sessionVar <- asks remoteCtrlSession
   committed <- withStore $ \db -> do
-    owns <- liftIO $ readTVarIO sessionVar >>= \case
-      Just (currentSeq, RCSessionPendingConfirmation {}) -> pure $ currentSeq == sseq
-      _ -> pure False
-    if not owns then pure Nothing else do
-      existing <- liftIO $ getRemoteCtrlByFingerprint db (ctrlFingerprint rcCtrlPairing)
-      rc@RemoteCtrl {remoteCtrlId} <- case existing of
-        Nothing -> insertRemoteCtrl db ctrlName rcCtrlPairing >>= getRemoteCtrl db
-        Just rc@RemoteCtrl {ctrlPairing} -> do
-          let dhPrivKey' = dhPrivKey rcCtrlPairing
-          liftIO $ updateRemoteCtrl db rc ctrlName dhPrivKey'
-          pure rc {ctrlDeviceName = ctrlName, ctrlPairing = ctrlPairing {dhPrivKey = dhPrivKey'}}
-      liftIO $ disableRemoteCtrlRecovery db >> setRemoteCtrlRecovery db remoteCtrlId endpoint
-      pure $ Just (rc :: RemoteCtrl) {recoveryEndpoint = endpoint}
+    owns <-
+      liftIO $
+        readTVarIO sessionVar >>= \case
+          Just (currentSeq, RCSessionPendingConfirmation {}) -> pure $ currentSeq == sseq
+          _ -> pure False
+    if not owns
+      then pure Nothing
+      else do
+        existing <- liftIO $ getRemoteCtrlByFingerprint db (ctrlFingerprint rcCtrlPairing)
+        rc@RemoteCtrl {remoteCtrlId} <- case existing of
+          Nothing -> insertRemoteCtrl db ctrlName rcCtrlPairing >>= getRemoteCtrl db
+          Just rc@RemoteCtrl {ctrlPairing} -> do
+            let dhPrivKey' = dhPrivKey rcCtrlPairing
+            liftIO $ updateRemoteCtrl db rc ctrlName dhPrivKey'
+            pure rc {ctrlDeviceName = ctrlName, ctrlPairing = ctrlPairing {dhPrivKey = dhPrivKey'}}
+        liftIO $ disableRemoteCtrlRecovery db >> setRemoteCtrlRecovery db remoteCtrlId endpoint
+        pure $ Just (rc :: RemoteCtrl) {recoveryEndpoint = endpoint}
   maybe (throwError $ ChatErrorRemoteCtrl RCEInactive) pure committed
 
 stopRemoteCtrl :: CM ()
@@ -1008,13 +1026,15 @@ stopRemoteCtrl = do
   var <- asks remoteCtrlSession
   -- Claim the closing session before signalling the desktop. The monitor must
   -- neither report this explicit stop as loss nor cancel a replacement session.
-  closing <- atomically $ readTVar var >>= \case
-    Just (sseq, session@RCSessionConnected {ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}}) ->
-      do
-        let event = Right CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq}
-        void $ tryPutTMVar (remoteStopEvent session) event
-        fmap (sseq,) <$> takeRemoteCtrlSession var (Just sseq)
-    _ -> pure Nothing
+  closing <-
+    atomically $
+      readTVar var >>= \case
+        Just (sseq, session@RCSessionConnected {ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}}) ->
+          do
+            let event = Right CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq}
+            void $ tryPutTMVar (remoteStopEvent session) event
+            fmap (sseq,) <$> takeRemoteCtrlSession var (Just sseq)
+        _ -> pure Nothing
   case closing of
     Just (_, session@RCSessionConnected {http2Server}) -> do
       -- The desktop consumes this event and closes its retained listener first.

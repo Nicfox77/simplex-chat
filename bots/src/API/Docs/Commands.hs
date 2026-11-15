@@ -1,9 +1,9 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -14,8 +14,8 @@ import API.Docs.Responses
 import API.Docs.Syntax.Types
 import API.Docs.Types
 import API.TypeInfo
-import Data.String
 import Data.List (find)
+import Data.String
 import Data.Text (Text)
 import GHC.Generics
 import Simplex.Chat.Controller
@@ -69,7 +69,6 @@ data ErrorTypeDoc = TD
 data UsesNetwork = UNBackground | UNInteractive
 
 instance IsString ErrorTypeDoc where fromString s = TD s ""
-
 
 -- category name, category description, commands
 -- inner: constructor, hidden params, description, responses, errors (ChatErrorType constructors), network usage, syntax
