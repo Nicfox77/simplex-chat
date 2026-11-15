@@ -78,7 +78,7 @@ export type AgentErrorType =
   | AgentErrorType.INACTIVE
 
 export namespace AgentErrorType {
-  export type Tag =
+  export type Tag = 
     | "CMD"
     | "CONN"
     | "NO_USER"
@@ -260,7 +260,7 @@ export type BadgeRedeemError =
   | BadgeRedeemError.CredentialNotVerified
 
 export namespace BadgeRedeemError {
-  export type Tag =
+  export type Tag = 
     | "invalidCode"
     | "invalidReceipt"
     | "serviceNotConfigured"
@@ -369,7 +369,7 @@ export type BlockToken =
   | BlockToken.RuleMark
 
 export namespace BlockToken {
-  export type Tag =
+  export type Tag = 
     | "lineBreak"
     | "softBreak"
     | "hardBreak"
@@ -477,7 +477,7 @@ export type BrokerErrorType =
   | BrokerErrorType.TIMEOUT
 
 export namespace BrokerErrorType {
-  export type Tag =
+  export type Tag = 
     | "RESPONSE"
     | "UNEXPECTED"
     | "NETWORK"
@@ -581,7 +581,7 @@ export type CIContent =
   | CIContent.ChatBanner
 
 export namespace CIContent {
-  export type Tag =
+  export type Tag = 
     | "sndMsgContent"
     | "rcvMsgContent"
     | "sndDeleted"
@@ -844,7 +844,7 @@ export type CIDirection =
   | CIDirection.LocalRcv
 
 export namespace CIDirection {
-  export type Tag =
+  export type Tag = 
     | "directSnd"
     | "directRcv"
     | "groupSnd"
@@ -916,7 +916,7 @@ export type CIFileStatus =
   | CIFileStatus.Invalid
 
 export namespace CIFileStatus {
-  export type Tag =
+  export type Tag = 
     | "sndStored"
     | "sndTransfer"
     | "sndCancelled"
@@ -1140,7 +1140,7 @@ export type CIStatus =
   | CIStatus.Invalid
 
 export namespace CIStatus {
-  export type Tag =
+  export type Tag = 
     | "sndNew"
     | "sndSent"
     | "sndRcvd"
@@ -1361,7 +1361,7 @@ export type ChatErrorType =
   | ChatErrorType.Exception
 
 export namespace ChatErrorType {
-  export type Tag =
+  export type Tag = 
     | "noActiveUser"
     | "noConnectionUser"
     | "noSndFileUser"
@@ -2172,7 +2172,7 @@ export type ConnStatus =
   | ConnStatus.Failed
 
 export namespace ConnStatus {
-  export type Tag =
+  export type Tag = 
     | "new"
     | "prepared"
     | "joined"
@@ -2409,7 +2409,7 @@ export type ContactAddressPlan =
   | ContactAddressPlan.ContactViaAddress
 
 export namespace ContactAddressPlan {
-  export type Tag =
+  export type Tag = 
     | "ok"
     | "ownLink"
     | "connectingConfirmReconnect"
@@ -2526,6 +2526,7 @@ export interface CryptoFileArgs {
 // Remote controller application info.
 
 export interface CtrlAppInfo {
+  uiProtocol?: number // int
   appVersionRange: AppVersionRange
   deviceName: string
   compression: boolean
@@ -2562,7 +2563,7 @@ export type ErrorType =
   | ErrorType.DUPLICATE_
 
 export namespace ErrorType {
-  export type Tag =
+  export type Tag = 
     | "BLOCK"
     | "SESSION"
     | "CMD"
@@ -2809,7 +2810,7 @@ export type Format =
   | Format.Markup
 
 export namespace Format {
-  export type Tag =
+  export type Tag = 
     | "bold"
     | "italic"
     | "strikeThrough"
@@ -3065,7 +3066,7 @@ export type GroupLinkPlan =
   | GroupLinkPlan.UpdateRequired
 
 export namespace GroupLinkPlan {
-  export type Tag =
+  export type Tag = 
     | "ok"
     | "ownLink"
     | "connectingConfirmReconnect"
@@ -3268,7 +3269,7 @@ export type GroupSndStatus =
   | GroupSndStatus.Invalid
 
 export namespace GroupSndStatus {
-  export type Tag =
+  export type Tag = 
     | "new"
     | "forwarded"
     | "inactive"
@@ -3827,7 +3828,7 @@ export type NetworkError =
   | NetworkError.SubscribeError
 
 export namespace NetworkError {
-  export type Tag =
+  export type Tag = 
     | "connectError"
     | "tLSError"
     | "unknownCAError"
@@ -4103,7 +4104,7 @@ export type RCErrorType =
   | RCErrorType.Syntax
 
 export namespace RCErrorType {
-  export type Tag =
+  export type Tag = 
     | "internal"
     | "identity"
     | "noLocalAddress"
@@ -4344,7 +4345,7 @@ export type RcvGroupEvent =
   | RcvGroupEvent.MsgBadSignature
 
 export namespace RcvGroupEvent {
-  export type Tag =
+  export type Tag = 
     | "memberAdded"
     | "memberConnected"
     | "memberAccepted"
@@ -4529,7 +4530,7 @@ export type RemoteCtrlSessionState =
   | RemoteCtrlSessionState.Connected
 
 export namespace RemoteCtrlSessionState {
-  export type Tag =
+  export type Tag = 
     | "starting"
     | "searching"
     | "connecting"
@@ -4571,7 +4572,7 @@ export type RemoteCtrlStopReason =
   | RemoteCtrlStopReason.Stopped
 
 export namespace RemoteCtrlStopReason {
-  export type Tag =
+  export type Tag = 
     | "discoveryFailed"
     | "connectionFailed"
     | "setupFailed"
@@ -4630,7 +4631,7 @@ export type SMPAgentError =
   | SMPAgentError.A_SERVICE
 
 export namespace SMPAgentError {
-  export type Tag =
+  export type Tag = 
     | "A_MESSAGE"
     | "A_PROHIBITED"
     | "A_VERSION"
@@ -4909,7 +4910,7 @@ export type SndGroupEvent =
   | SndGroupEvent.UserPendingReview
 
 export namespace SndGroupEvent {
-  export type Tag =
+  export type Tag = 
     | "memberRole"
     | "memberBlocked"
     | "userRole"
@@ -5101,7 +5102,7 @@ export type StoreError =
   | StoreError.WorkItemError
 
 export namespace StoreError {
-  export type Tag =
+  export type Tag = 
     | "duplicateName"
     | "userNotFound"
     | "relayUserNotFound"
@@ -5899,7 +5900,7 @@ export type XFTPErrorType =
   | XFTPErrorType.DUPLICATE_
 
 export namespace XFTPErrorType {
-  export type Tag =
+  export type Tag = 
     | "BLOCK"
     | "SESSION"
     | "HANDSHAKE"

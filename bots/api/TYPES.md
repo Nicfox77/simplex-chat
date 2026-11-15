@@ -2265,6 +2265,7 @@ connFullLink + ((' ' + connShortLink) if connShortLink is not None else '') # Py
 Remote controller application info.
 
 **Record type**:
+- uiProtocol: int?
 - appVersionRange: [AppVersionRange](#appversionrange)
 - deviceName: string
 - compression: bool

@@ -1,5 +1,5 @@
-{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
@@ -43,7 +43,7 @@ chatEventsDocs = map toCategory chatEventsDocsData
           Just RecordTypeInfo {fieldInfos} ->
             let fields = map (toAPIField consName) fieldInfos
                 eventType = ATUnionMember (dropPrefix "CEvt" consName) fields
-            in CEDoc {consName, eventType, eventDescr}
+             in CEDoc {consName, eventType, eventDescr}
           Nothing -> error $ "Missing event type info for " <> consName
 
 deriving instance Generic ChatEvent
@@ -60,10 +60,9 @@ chatEventsDocsData =
       \- [APIShowMyAddress](./COMMANDS.md#apishowmyaddress) to check if address exists,\n\
       \- [APICreateMyAddress](./COMMANDS.md#apicreatemyaddress) to create address,\n\
       \- [APISetAddressSettings](./COMMANDS.md#apisetaddresssettings) to enable auto-access.",
-      [ ( "CEvtContactConnected", "This event is sent after a user connects via bot SimpleX address (not a business address).")
+      [ ("CEvtContactConnected", "This event is sent after a user connects via bot SimpleX address (not a business address).")
       ],
-      [
-        ("CEvtContactUpdated", "Contact profile of another user is updated."),
+      [ ("CEvtContactUpdated", "Contact profile of another user is updated."),
         ("CEvtContactDeletedByContact", "Bot user's connection with another contact is deleted (conversation is kept)."),
         ("CEvtReceivedContactRequest", "Contact request received.\n\nThis event is only sent when auto-accept is disabled.\n\nThe request needs to be accepted using [APIAcceptContact](./COMMANDS.md#apiacceptcontact) command"),
         ("CEvtNewMemberContactReceivedInv", "Received invitation to connect directly with a group member.\n\nThis event only needs to be processed to associate contact with group, the connection will proceed automatically."),
@@ -228,6 +227,7 @@ undocumentedEvents =
     "CEvtConnectionsDiff",
     "CEvtSubscriptionEnd",
     "CEvtTerminalEvent",
+    "CEvtUiStateChanged",
     "CEvtTimedAction",
     "CEvtUnknownMemberAnnounced",
     "CEvtUnknownMemberBlocked",

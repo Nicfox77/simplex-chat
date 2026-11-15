@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -35,7 +35,7 @@ chatResponsesDocs = map toResp chatResponsesDocsData
           Just RecordTypeInfo {fieldInfos} ->
             let fields = map (toAPIField consName) fieldInfos
                 responseType = ATUnionMember (dropPrefix "CR" consName) fields
-            in CRDoc {consName, responseType, responseDescr}
+             in CRDoc {consName, responseType, responseDescr}
           Nothing -> error $ "Missing response type info for " <> consName
 
 deriving instance Generic ChatResponse
@@ -209,6 +209,7 @@ undocumentedResponses =
     "CRStandaloneFileInfo",
     "CRStoreReceiptNotRecorded",
     "CRTagsUpdated",
+    "CRUiState",
     "CRUsageConditions",
     "CRUserPrivacy",
     "CRUserProfile",

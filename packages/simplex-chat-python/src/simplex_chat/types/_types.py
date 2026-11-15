@@ -1770,6 +1770,7 @@ class CryptoFileArgs(TypedDict):
 # Remote controller application info.
 
 class CtrlAppInfo(TypedDict):
+    uiProtocol: NotRequired[int]  # int
     appVersionRange: "AppVersionRange"
     deviceName: str
     compression: bool
