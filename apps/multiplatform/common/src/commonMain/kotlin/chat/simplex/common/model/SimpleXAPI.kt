@@ -1305,6 +1305,14 @@ object ChatController {
         )
         null
       }
+      r is API.Error && r.err is ChatError.ChatErrorRemoteHost && r.err.remoteHostError.connectionUnavailable -> {
+        Log.e(TAG, "processSendMessageCmd interrupted: ${r.details}")
+        AlertManager.shared.showAlertMsg(
+          generalGetString(MR.strings.remote_send_connection_interrupted_title),
+          generalGetString(MR.strings.remote_send_connection_interrupted_message)
+        )
+        null
+      }
       else -> {
         if (!(networkErrorAlert(r))) {
           apiErrorAlert("processSendMessageCmd", generalGetString(MR.strings.error_sending_message), r)
@@ -8906,6 +8914,11 @@ sealed class ArchiveError {
 
 @Serializable
 sealed class RemoteHostError {
+  val connectionUnavailable: Boolean get() = when (this) {
+    is Missing, is Inactive, is Timeout, is BadState, is Disconnected -> true
+    is ProtocolError -> (data["type"] as? JsonPrimitive)?.contentOrNull == "sessionClosed"
+    else -> false
+  }
   val string: String get() = when (this) {
     is Missing -> "missing"
     is Inactive -> "inactive"
@@ -8914,6 +8927,7 @@ sealed class RemoteHostError {
     is BadState -> "badState"
     is BadVersion -> "badVersion"
     is Disconnected -> "disconnected"
+    is ProtocolError -> "protocolError ${json.encodeToString(data)}"
   }
   fun localizedString(name: String): String = when (this) {
     is Missing -> generalGetString(MR.strings.remote_host_error_missing)
@@ -8923,6 +8937,7 @@ sealed class RemoteHostError {
     is BadState -> generalGetString(MR.strings.remote_host_error_bad_state)
     is BadVersion -> generalGetString(MR.strings.remote_host_error_bad_version)
     is Disconnected -> generalGetString(MR.strings.remote_host_error_disconnected)
+    is ProtocolError -> generalGetString(if (connectionUnavailable) MR.strings.remote_host_error_disconnected else MR.strings.remote_host_error_protocol)
   }.format(name)
   @Serializable @SerialName("missing") object Missing: RemoteHostError()
   @Serializable @SerialName("inactive") object Inactive: RemoteHostError()
@@ -8931,6 +8946,7 @@ sealed class RemoteHostError {
   @Serializable @SerialName("badState") object BadState: RemoteHostError()
   @Serializable @SerialName("badVersion") object BadVersion: RemoteHostError()
   @Serializable @SerialName("disconnected") class Disconnected(val reason: String): RemoteHostError()
+  @Serializable @SerialName("protocolError") class ProtocolError(val data: JsonObject): RemoteHostError()
 }
 
 @Serializable

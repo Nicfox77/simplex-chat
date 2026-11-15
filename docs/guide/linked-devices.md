@@ -91,6 +91,12 @@ the desktop loads missed messages from the phone. A send interrupted by the
 outage may already have reached the phone, so check there before sending it
 again.
 
+If you try to send while the mobile connection is unavailable, the app shows
+**Mobile connection interrupted** and keeps failed text in the composer. It does
+not resend automatically. After reconnecting, check the conversation on the
+mobile before sending again, because an interrupted send may already have
+reached it.
+
 ## Local network discovery
 
 When the desktop shows the QR code for a linked mobile and **Discoverable via

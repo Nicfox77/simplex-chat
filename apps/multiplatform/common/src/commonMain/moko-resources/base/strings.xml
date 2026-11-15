@@ -2828,6 +2828,9 @@
   <string name="remote_host_error_bad_state"><![CDATA[Connection to the mobile <b>%s</b> is in a bad state]]></string>
   <string name="remote_host_error_bad_version"><![CDATA[Mobile <b>%s</b> has an unsupported version. Please, make sure you use the same version on both devices]]></string>
   <string name="remote_host_error_disconnected"><![CDATA[Mobile <b>%s</b> was disconnected]]></string>
+  <string name="remote_host_error_protocol"><![CDATA[Connection to mobile <b>%s</b> failed]]></string>
+  <string name="remote_send_connection_interrupted_title">Mobile connection interrupted</string>
+  <string name="remote_send_connection_interrupted_message">After reconnecting, check this conversation on your mobile before sending again. The message may already have been sent.</string>
   <string name="remote_ctrl_error_inactive">Desktop is inactive</string>
   <string name="remote_ctrl_error_bad_state">Connection to the desktop is in a bad state</string>
   <string name="remote_ctrl_error_busy">Desktop is busy</string>
