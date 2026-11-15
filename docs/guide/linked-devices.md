@@ -81,6 +81,16 @@ After the first link, the mobile and the desktop remember each other.
      is off. To scan the QR code instead, tap **Scan QR code**.
    - Otherwise, scan the QR code.
 
+## Tailscale test builds
+
+This fork's Android/Linux test builds also support simultaneous phone and
+desktop use and automatic recovery over Tailscale. See the
+[device testing guide](../tailscale-device-linking.md) for pairing and setup.
+After a network interruption, leave both apps running while they reconnect;
+the desktop loads missed messages from the phone. A send interrupted by the
+outage may already have reached the phone, so check there before sending it
+again.
+
 ## Local network discovery
 
 When the desktop shows the QR code for a linked mobile and **Discoverable via

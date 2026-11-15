@@ -40,9 +40,14 @@ then edit, react, delete and read from each. Use an ordinary iPhone client as a
 third chat participant to check incoming messages and phone-owned calls. iOS
 hosting of the new concurrent UI protocol is not implemented.
 
-Next interrupt Tailscale or the network, restore it, and check reconnect and
-messages received while disconnected. Repeat with the phone screen off and
-with each application restarted. An explicit **Disconnect** disables recovery;
+Next interrupt the laptop's Tailscale or network connection while leaving both
+apps open. Send a message from the phone during the outage. Restore the network
+and check that the laptop catches up without restarting, then send from each
+device and check that the numbered echoes appear on both. If a send was pending
+when the connection failed, check its status on the phone before sending it
+again; recovery does not automatically repeat an uncertain send.
+Repeat with the phone screen off and with each application restarted. An explicit
+**Disconnect** disables recovery;
 it is different from a network interruption. Finally unlink and verify that
 the old desktop can no longer reconnect.
 

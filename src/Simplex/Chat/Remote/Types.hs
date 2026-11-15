@@ -38,6 +38,7 @@ data RemoteHostClient = RemoteHostClient
   { hostEncoding :: PlatformEncoding,
     hostDeviceName :: Text,
     httpClient :: HTTP2Client,
+    hostSessionClosed :: TVar Bool,
     encryption :: RemoteCrypto,
     encryptHostFiles :: Bool,
     storePath :: FilePath

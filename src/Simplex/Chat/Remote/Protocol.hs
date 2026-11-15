@@ -12,6 +12,7 @@
 module Simplex.Chat.Remote.Protocol where
 
 import qualified Codec.Compression.Zstd as Z1
+import Control.Concurrent.STM (check)
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -110,11 +111,13 @@ mkRemoteHostClient httpClient sessionKeys sessionCode storePath HostAppInfo {enc
   let HostSessKeys {chainKeys, idPrivKey, sessPrivKey} = sessionKeys
       signatures = RSSign {idPrivKey, sessPrivKey}
   encryption <- mkRemoteCrypto sessionCode chainKeys signatures $ isTrue compression
+  hostSessionClosed <- newTVarIO False
   pure
     RemoteHostClient
       { hostEncoding = encoding,
         hostDeviceName = deviceName,
         httpClient,
+        hostSessionClosed,
         encryption,
         encryptHostFiles = encryptFiles,
         storePath
@@ -135,7 +138,25 @@ mkRemoteCrypto sessionCode chainKeys signatures peerCompression = do
   pure RemoteCrypto {sessionCode, sndCounter, rcvCounter, chainKeys, skippedKeys, signatures, compression = peerCompression && useCompression}
 
 closeRemoteHostClient :: RemoteHostClient -> IO ()
-closeRemoteHostClient RemoteHostClient {httpClient} = closeHTTP2Client httpClient
+closeRemoteHostClient c@RemoteHostClient {httpClient} = do
+  atomically $ invalidateRemoteHostClient c
+  closeHTTP2Client httpClient
+
+invalidateRemoteHostClient :: RemoteHostClient -> STM ()
+invalidateRemoteHostClient RemoteHostClient {hostSessionClosed} = writeTVar hostSessionClosed True
+
+-- An HTTP/2 caller can still be waiting on an old stream after its connection
+-- worker exits. Release every caller, including the UI snapshot receiver,
+-- before tearing down that transport. Valid long commands have no new deadline.
+withActiveRemoteHostClient :: RemoteHostClient -> ExceptT RemoteProtocolError IO a -> ExceptT RemoteProtocolError IO a
+withActiveRemoteHostClient RemoteHostClient {hostSessionClosed} action = ExceptT $ do
+  closed <- readTVarIO hostSessionClosed
+  if closed
+    then pure $ Left RPESessionClosed
+    else
+      race (atomically $ readTVar hostSessionClosed >>= check) (runExceptT action) >>= \case
+        Left () -> pure $ Left RPESessionClosed
+        Right result -> pure result
 
 -- ** Commands
 
@@ -160,7 +181,7 @@ remoteStoreFile c localPath fileName = do
     r -> badResponse r
 
 remoteGetFile :: RemoteHostClient -> FilePath -> RemoteFile -> ExceptT RemoteProtocolError IO ()
-remoteGetFile c destDir rf@RemoteFile {fileSource = CryptoFile {filePath}} =
+remoteGetFile c destDir rf@RemoteFile {fileSource = CryptoFile {filePath}} = withActiveRemoteHostClient c $
   sendRemoteCommand c Nothing RCGetFile {file = rf} >>= \case
     (rfKN, getChunk, RRFile {fileSize, fileDigest}) -> do
       -- TODO we could optimize by checking size and hash before receiving the file
@@ -175,7 +196,7 @@ sendRemoteCommand' c attachment_ rc = do
   pure r
 
 sendRemoteCommand :: RemoteHostClient -> Maybe (Handle, Word32) -> RemoteCommand -> ExceptT RemoteProtocolError IO (C.SbKeyNonce, Int -> IO ByteString, RemoteResponse)
-sendRemoteCommand RemoteHostClient {httpClient, hostEncoding, encryption} file_ cmd = do
+sendRemoteCommand c@RemoteHostClient {httpClient, hostEncoding, encryption} file_ cmd = withActiveRemoteHostClient c $ do
   (corrId, cmdKN, sfKN) <- atomically $ getRemoteSndKeys encryption
   encCmd <- encryptEncodeHTTP2Body corrId cmdKN encryption $ J.encode cmd
   encFile_ <- mapM (prepareEncryptedFile sfKN) file_

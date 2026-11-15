@@ -297,7 +297,8 @@ startRemoteHostWith_ persistent restoring rh_ rcAddrPrefs_ port_ = do
               remoteHost = rhi {sessionState = Just RHSConnected {sessionCode}} :: RemoteHostInfo
           toView $ CEvtRemoteHostConnected {remoteHost, compression}
           atomically $ putTMVar startPoll ()
-          atomically (takeTMVar disconnected) >>= \case
+          disconnectReason <- atomically $ takeTMVar disconnected <* invalidateRemoteHostClient rhClient
+          case disconnectReason of
             RHReceiveFailed err -> Nothing <$ cancelRemoteHostSession (Just (sseq, RHSRCrashed err)) rhKey'
             RHControllerStopped -> do
               withStore' $ \db -> setRemoteHostRecovery db remoteHostId False
@@ -419,6 +420,10 @@ cancelRemoteHostSession handlerInfo_ rhKey = do
         Nothing -> pure Nothing
         Just (sessSeq, _) | maybe False ((sessSeq /=) . fst) handlerInfo_ -> pure Nothing -- ignore cancel from a ghost session handler
         Just (_, rhs) -> do
+          case rhs of
+            RHSessionConnected {rhClient} -> invalidateRemoteHostClient rhClient
+            RHSessionDisconnecting {rhClient} -> invalidateRemoteHostClient rhClient
+            _ -> pure ()
           TM.delete rhKey sessions
           modifyTVar' crh $ \cur -> if (RHId <$> cur) == Just rhKey then Nothing else cur -- only wipe the closing RH
           pure $ Just rhs
@@ -442,12 +447,13 @@ cancelRemoteHost handlingError = \case
   RHSessionConfirmed tls rhs -> do
     cancelPendingSession rhs
     closeConnection tls
-  RHSessionConnected {rhPendingSession, tls, rhClient = RemoteHostClient {httpClient}, pollAction} ->
-    cancelConnected rhPendingSession tls httpClient pollAction
-  RHSessionDisconnecting {rhPendingSession, tls, rhClient = RemoteHostClient {httpClient}, pollAction} ->
-    cancelConnected rhPendingSession tls httpClient pollAction
+  RHSessionConnected {rhPendingSession, tls, rhClient, pollAction} ->
+    cancelConnected rhPendingSession tls rhClient pollAction
+  RHSessionDisconnecting {rhPendingSession, tls, rhClient, pollAction} ->
+    cancelConnected rhPendingSession tls rhClient pollAction
   where
-    cancelConnected rhs tls httpClient pollAction = do
+    cancelConnected rhs tls rhClient@RemoteHostClient {httpClient} pollAction = do
+      atomically $ invalidateRemoteHostClient rhClient
       closeRemoteHostTransport tls
       concurrently_ (cancel pollAction) (forM_ (H2.action httpClient) cancel)
       cancelPendingSession rhs

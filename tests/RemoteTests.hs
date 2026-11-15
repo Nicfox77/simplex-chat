@@ -38,7 +38,7 @@ import Simplex.Chat.Mobile.File
 import Simplex.Chat.Messages (AChat (..), AChatItem (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), CIMeta (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
 import Simplex.Chat.Options (ChatOpts (..))
 import Simplex.Chat.Remote (cancelActiveRemoteCtrl, handleRecv, remoteFilesFolder, remoteHostPollFailed, validRemoteFileName, withRemoteCommandLease, withRemoteSession)
-import Simplex.Chat.Remote.Protocol (RemoteResponse (..), RRResult (RRResult), encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteStoreFile)
+import Simplex.Chat.Remote.Protocol (RemoteResponse (..), RRResult (RRResult), closeRemoteHostClient, encryptEncodeHTTP2Body, parseDecryptHTTP2Body, remoteSend, remoteStoreFile)
 import qualified Simplex.Chat.Remote as Remote
 import qualified Simplex.Chat.Store.Remote as RemoteStore
 import Simplex.Chat.Remote.Types
@@ -241,6 +241,7 @@ runRemoteTests = do
     it "does not reopen a stopped listener from a stale startup snapshot" (delayedListenerRestoreTest False)
     it "does not reopen an unlinked listener from a stale startup snapshot" (delayedListenerRestoreTest True)
     it "retains a pinned listener after transport loss and reconnects without another invitation" persistentReconnectTest
+    it "releases an old in-flight request before reconnecting the live desktop" persistentRequestCancellationTest
     it "deletes an active remote host and closes its listener" persistentUnlinkTest
     xitMacCI "connects with multicast discovery" remoteHandshakeDiscoverTest
     it "refuses invalid client cert" remoteHandshakeRejectTest
@@ -325,7 +326,8 @@ simultaneousMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob 
   desktopId <- sentId desktopSend
   replicateM_ 2 $ getTermLine bob
   (_, items1, _, _) <- uiSnapshot remote
-  map snd items1 `shouldContain` ["phone simultaneous", "desktop simultaneous"]
+  lookup phoneId items1 `shouldBe` Just "phone simultaneous"
+  lookup desktopId items1 `shouldBe` Just "desktop simultaneous"
   (_, localItems, localUnread, localMarked) <- uiSnapshot local
   (localItems, localUnread, localMarked) `shouldBe` (items1, 0, False)
   local ("/_update item @2 " <> show phoneId <> " text edited phone") >>= \r -> r `shouldSatisfy` \case
@@ -907,6 +909,42 @@ resumeStoredRemote compress mobile desktop = do
   desktop ##> "/user"
   desktop <## "user profile: alice (Alice)"
   desktop <## "use /p <name> [<bio>] to change it"
+
+persistentRequestCancellationTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+persistentRequestCancellationTest = testRemote $ \compress mobile desktop -> do
+  enableSimultaneous mobile desktop
+  _ <- startPersistentRemote compress mobile desktop
+  client@RemoteHostClient {httpClient} <- runRemote desktop $ Remote.getRemoteHostClient 1
+  entered <- newEmptyTMVarIO
+  requests <- newIORef (0 :: Int)
+  let stalledHTTP =
+        httpClient
+          { H2.sendReq = \_ _ -> do
+              modifyIORef' requests (+ 1)
+              atomically $ putTMVar entered ()
+              atomically retry
+          }
+      stalled = client {httpClient = stalledHTTP}
+      closedResult = \case
+        Left RPESessionClosed -> True
+        _ -> False
+  withAsync (runExceptT $ remoteSend stalled "/user" 0) $ \request -> do
+    atomically $ takeTMVar entered
+    forM_ (H2.action httpClient) cancel
+    result <- Timeout.timeout 1000000 $ wait request
+    result `shouldSatisfy` maybe False closedResult
+  -- A retired client must reject another call without replaying the old work.
+  runExceptT (remoteSend stalled "/user" 0) >>= (`shouldSatisfy` closedResult)
+  readIORef requests `shouldReturn` 1
+  eventually 3 $ mobile <## "remote controller stopped"
+  eventually 3 $ desktop <## "remote host 1 stopped"
+  resumeStoredRemote compress mobile desktop
+  -- The replacement owns a fresh lifetime; old cleanup cannot close it.
+  closeRemoteHostClient stalled
+  desktop ##> "/user"
+  desktop <## "user profile: alice (Alice)"
+  desktop <## "use /p <name> [<bio>] to change it"
+  stopDesktop mobile desktop
 
 persistentReconnectTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 persistentReconnectTest = testRemote $ \compress mobile desktop -> do
