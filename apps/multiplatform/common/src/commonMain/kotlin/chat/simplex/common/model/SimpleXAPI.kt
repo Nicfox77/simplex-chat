@@ -551,6 +551,7 @@ object ChatController {
 
   val chatModel = ChatModel
   private var receiverJob: Job? = null
+  private var recoveryRestored = false
   var lastMsgReceivedTimestamp: Long = System.currentTimeMillis()
     private set
 
@@ -561,7 +562,10 @@ object ChatController {
   fun setChatCtrl(ctrl: ChatCtrl?) {
     val wasRunning = receiverJob != null
     stopReceiver()
+    directReconnect.clear()
+    recoveryRestored = false
     chatCtrl = ctrl
+    chatModel.resetUIState()
     if (wasRunning && ctrl != null) startReceiver()
   }
 
@@ -713,6 +717,7 @@ object ChatController {
   suspend fun startChat(user: User) {
     Log.d(TAG, "user: $user")
     try {
+      check(sendCmd(null, CC.EnableUI()).ok) { "Core does not support simultaneous UI protocol 1" }
       apiSetNetworkConfig(getNetCfg())
       val chatRunning = apiCheckChatRunning()
       val users = listUsers(null)
@@ -738,6 +743,7 @@ object ChatController {
         Log.d(TAG, "startChat: running")
       }
       apiStartChat()
+      restoreDirectLinks()
       appPrefs.chatStopped.set(false)
       withLongRunningApi { BadgeStore.presentUnfinished() }
       if (appPrefs.shouldDeleteDatabaseBackups.get()) {
@@ -754,6 +760,7 @@ object ChatController {
     Log.d(TAG, "user: null")
     try {
       if (chatModel.chatRunning.value == true) return
+      check(sendCmd(null, CC.EnableUI()).ok) { "Core does not support simultaneous UI protocol 1" }
       chatModel.users.clear()
       chatModel.currentUser.value = null
       chatModel.localUserCreated.value = false
@@ -761,6 +768,7 @@ object ChatController {
       chatModel.chatRunning.value = true
       startReceiver()
       setLocalDeviceName(appPrefs.deviceNameForRemoteAccess.get()!!)
+      restoreDirectLinks()
       Log.d(TAG, "startChat: started without user")
     } catch (e: Throwable) {
       Log.e(TAG, "failed starting chat without user $e")
@@ -856,6 +864,12 @@ object ChatController {
           }
           val msg = recvMsg(ctrl)
           releaseLock = getWakeLock(timeout = 60000)
+          // A slow command caller may finish its optimistic model update after
+          // the event receiver already applied a newer snapshot. Periodic
+          // reconciliation while linked also repairs that response/event race.
+          if (msg == null && (uiSnapshotPending || chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true)) {
+            reconcileUI(chatModel.remoteHostId())
+          }
           if (msg != null) {
             val finishedWithoutTimeout = withTimeoutOrNull(60_000L) {
               processReceivedMsg(msg)
@@ -1011,7 +1025,9 @@ object ChatController {
 
   // Spec: spec/api.md#recvMsg
   fun recvMsg(ctrl: ChatCtrl): API? {
-    val rStr = chatRecvMsgWait(ctrl, MESSAGE_TIMEOUT)
+    val linked = chatModel.connectedToRemote() || chatModel.remoteCtrlSession.value?.active == true
+    val wait = if (uiSnapshotPending) 1_000_000 else if (linked) 5_000_000 else MESSAGE_TIMEOUT
+    val rStr = chatRecvMsgWait(ctrl, wait)
     return if (rStr == "") {
       null
     } else {
@@ -1142,9 +1158,9 @@ object ChatController {
     }
   }
 
-  suspend fun apiStopChat(): Boolean {
+  suspend fun apiStopChat(): Boolean = directReconnect.replace {
     val r = sendCmd(null, CC.ApiStopChat())
-    if (r.result is CR.ChatStopped) return true
+    if (r.result is CR.ChatStopped) return@replace true
     throw Exception("failed stopping chat: ${r.responseType} ${r.details}")
   }
 
@@ -1286,6 +1302,14 @@ object ChatController {
         AlertManager.shared.showAlertMsg(
           generalGetString(MR.strings.maximum_message_size_title),
           generalGetString(MR.strings.maximum_message_size_reached_forwarding)
+        )
+        null
+      }
+      r is API.Error && r.err is ChatError.ChatErrorRemoteHost && r.err.remoteHostError.connectionUnavailable -> {
+        Log.e(TAG, "processSendMessageCmd interrupted: ${r.details}")
+        AlertManager.shared.showAlertMsg(
+          generalGetString(MR.strings.remote_send_connection_interrupted_title),
+          generalGetString(MR.strings.remote_send_connection_interrupted_message)
         )
         null
       }
@@ -2415,7 +2439,7 @@ object ChatController {
     val chatItem = apiCancelFile(rh, fileId)
     if (chatItem != null) {
       chatItemSimpleUpdate(rh, user, chatItem)
-      cleanupFile(chatItem)
+      cleanupFile(rh, chatItem)
     }
   }
 
@@ -2743,10 +2767,93 @@ object ChatController {
 
   suspend fun getRemoteFile(rhId: Long, file: RemoteFile): Boolean = sendCmd(null, CC.GetRemoteFile(rhId, file)).result is CR.CmdOk
 
-  suspend fun connectRemoteCtrl(desktopAddress: String): Pair<SomeRemoteCtrl?, ChatError?> {
+  private var directVerifiedCtrl: RemoteCtrlInfo? = null
+  private var directNativeCtrl: ChatCtrl? = null
+  private val directReconnect = DirectLinkReconnect(
+    CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    connect = { invitation ->
+      val nativeCtrl = getChatCtrl() ?: throw DirectLinkReconnect.Rejected()
+      directNativeCtrl = nativeCtrl
+      val savedId = invitation.removePrefix("resume:").toLongOrNull().takeIf { invitation.startsWith("resume:") }
+      val r = sendCmd(null, if (savedId == null) CC.ConnectRemoteCtrl(invitation) else CC.ResumeRemoteCtrl(savedId), nativeCtrl)
+      when {
+        r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
+          val rc = r.res
+          if (!rc.ctrlAppInfo.reconnect || (savedId != null && !rc.ctrlAppInfo.restart)) {
+            sendCmd(null, CC.AbortRemoteCtrl(rc.sessionSeq), nativeCtrl)
+            throw DirectLinkReconnect.Rejected()
+          }
+          if (getChatCtrl() == nativeCtrl) chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(ctrlAppInfo = rc.ctrlAppInfo, appVersion = rc.appVersion)
+          DirectLinkReconnect.Attempt(rc.sessionSeq, rc.remoteCtrl_?.remoteCtrlId) {
+            sendCmd(null, CC.AbortRemoteCtrl(rc.sessionSeq), nativeCtrl); Unit
+          }
+        }
+        r is API.Error && directReconnectRejected(r.err) -> throw DirectLinkReconnect.Rejected()
+        else -> null
+      }
+    },
+    verify = { code ->
+      val r = sendCmd(null, CC.VerifyRemoteCtrlSession(code), directNativeCtrl)
+      if (r is API.Result && r.res is CR.RemoteCtrlConnected) {
+        directVerifiedCtrl = r.res.remoteCtrl
+        true
+      } else false
+    },
+    abort = { sequence -> sendCmd(null, CC.AbortRemoteCtrl(sequence)); Unit },
+    connected = { code ->
+      directVerifiedCtrl?.let { rc ->
+        chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = UIRemoteCtrlSessionState.Connected(rc, code))
+      }
+      directVerifiedCtrl = null
+    },
+    rejected = { chatModel.remoteCtrlSession.value = null }
+  )
+
+  // Called once after the unlocked main database and event receiver are ready.
+  // Endpoint and trust are read from the encrypted native DB; preferences contain
+  // no invitation, private session key or automatic-trust flag.
+  private suspend fun restoreDirectLinks() {
+    if (recoveryRestored) return
+    recoveryRestored = true
+    if (appPlatform.isDesktop) {
+      sendCmd(null, CC.RestoreRemoteHosts())
+      reloadRemoteHosts()
+    } else if (appPlatform.isAndroid) {
+      directReconnect.command {
+        if (chatModel.remoteCtrlSession.value == null) {
+          val saved = listRemoteCtrls()?.filter { it.recoveryEnabled } ?: emptyList()
+          // A phone has one remote-control session. Ambiguous legacy databases
+          // require the user to choose a target instead of selecting arbitrarily.
+          saved.singleOrNull()?.let { rc ->
+            // A restored owner also needs the service when the linking screen
+            // has not been opened in this process. Android may deny background
+            // starts; foreground recovery must still be able to proceed.
+            runCatching { platform.androidServiceStart(remoteSession = true) }.onFailure { Log.e(TAG, "restoreDirectLinks service: $it") }
+            chatModel.remoteCtrlSession.value = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connecting(rc))
+            directReconnect.restore(rc.remoteCtrlId)
+          }
+        }
+      }
+    }
+  }
+
+  private fun directReconnectRejected(error: ChatError): Boolean = when (error) {
+    is ChatError.ChatErrorAgent -> error.agentError is AgentErrorType.RCP &&
+      error.agentError.rcpErr.let { it !is RCErrorType.EXCEPTION && it !is RCErrorType.NOT_DISCOVERED && it !is RCErrorType.NO_LOCAL_ADDRESS }
+    is ChatError.ChatErrorRemoteCtrl -> error.remoteCtrlError !is RemoteCtrlError.Timeout && error.remoteCtrlError !is RemoteCtrlError.Busy
+    is ChatError.ChatErrorStore -> error.storeError is StoreError.RemoteCtrlNotFound
+    else -> false
+  }
+
+  suspend fun connectRemoteCtrl(desktopAddress: String): Pair<SomeRemoteCtrl?, ChatError?> = directReconnect.replace {
     val r = sendCmd(null, CC.ConnectRemoteCtrl(desktopAddress))
-    return when {
-      r is API.Result && r.res is CR.RemoteCtrlConnecting -> SomeRemoteCtrl(r.res.remoteCtrl_, r.res.ctrlAppInfo, r.res.appVersion) to null
+    when {
+      r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
+        if (appPlatform.isAndroid && r.res.ctrlAppInfo.reconnect) {
+          directReconnect.remember(desktopAddress, DirectLinkReconnect.Attempt(r.res.sessionSeq, r.res.remoteCtrl_?.remoteCtrlId))
+        }
+        SomeRemoteCtrl(r.res.remoteCtrl_, r.res.ctrlAppInfo, r.res.appVersion) to null
+      }
       r is API.Error -> null to r.err
       else -> {
         apiErrorAlert("connectRemoteCtrl", generalGetString(MR.strings.error_alert_title), r)
@@ -2755,7 +2862,7 @@ object ChatController {
     }
   }
 
-  suspend fun findKnownRemoteCtrl(): Boolean = sendCommandOkResp(null, CC.FindKnownRemoteCtrl())
+  suspend fun findKnownRemoteCtrl(): Boolean = directReconnect.replace { sendCommandOkResp(null, CC.FindKnownRemoteCtrl()) }
 
   suspend fun confirmRemoteCtrl(rcId: Long): Pair<SomeRemoteCtrl?, ChatError?> {
     val r = sendCmd(null, CC.ConfirmRemoteCtrl(remoteCtrlId = rcId))
@@ -2769,11 +2876,14 @@ object ChatController {
     }
   }
 
-  suspend fun verifyRemoteCtrlSession(sessionCode: String): RemoteCtrlInfo? {
+  suspend fun verifyRemoteCtrlSession(sessionCode: String): RemoteCtrlInfo? = directReconnect.command {
     val r = sendCmd(null, CC.VerifyRemoteCtrlSession(sessionCode))
-    if (r is API.Result && r.res is CR.RemoteCtrlConnected) return r.res.remoteCtrl
+    if (r is API.Result && r.res is CR.RemoteCtrlConnected) {
+      directReconnect.trust(r.res.remoteCtrl.remoteCtrlId, r.res.remoteCtrl.recoveryEnabled)
+      return@command r.res.remoteCtrl
+    }
     apiErrorAlert("verifyRemoteCtrlSession", generalGetString(MR.strings.error_alert_title), r)
-    return null
+    null
   }
 
   suspend fun listRemoteCtrls(): List<RemoteCtrlInfo>? {
@@ -2783,9 +2893,13 @@ object ChatController {
     return null
   }
 
-  suspend fun stopRemoteCtrl(): Boolean = sendCommandOkResp(null, CC.StopRemoteCtrl())
+  suspend fun setRemoteCtrlAddress(rcId: Long, host: String): Boolean = directReconnect.command { sendCommandOkResp(null, CC.SetRemoteCtrlAddress(rcId, host)) }
 
-  suspend fun deleteRemoteCtrl(rcId: Long): Boolean = sendCommandOkResp(null, CC.DeleteRemoteCtrl(rcId))
+  suspend fun stopRemoteCtrl(): Boolean = directReconnect.replace { sendCommandOkResp(null, CC.StopRemoteCtrl()) }
+
+  suspend fun deleteRemoteCtrl(rcId: Long): Boolean = directReconnect.replace {
+    if (!sendCommandOkResp(null, CC.StopRemoteCtrl())) false else sendCommandOkResp(null, CC.DeleteRemoteCtrl(rcId))
+  }
 
   private suspend fun sendCommandOkResp(rh: Long?, cmd: CC, ctrl: ChatCtrl? = null): Boolean {
     val r = sendCmd(rh, cmd, ctrl)
@@ -2958,7 +3072,99 @@ object ChatController {
   }
 
   // Spec: spec/api.md#processReceivedMsg
+  private var uiSnapshotPending = false
+  private var uiOwnerRecoveryPending = false
+
+  internal fun requiresUISnapshot(event: CR?): Boolean = when (event) {
+    null, is CR.UIStateChanged, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
+    is CR.NewRemoteHost, is CR.RemoteCtrlStopped, is CR.RemoteCtrlFound,
+    is CR.RemoteCtrlSessionCode, is CR.RemoteCtrlConnected, is CR.CallInvitation,
+    is CR.CallOffer, is CR.CallAnswer, is CR.CallExtraInfo, is CR.CallEnded,
+    is CR.StorePurchaseCredited, is CR.StorePurchaseRefused -> false
+    else -> true
+  }
+
   private suspend fun processReceivedMsg(msg: API) {
+    // A failed resnapshot must not resume counter/item deltas from a stream
+    // with gaps. Lifecycle, call and settlement callbacks remain actionable so
+    // disconnect/revocation can still release the session during recovery.
+    if (uiSnapshotPending && requiresUISnapshot(msg.result)) {
+      reconcileUI(chatModel.remoteHostId())
+      if (uiSnapshotPending) return
+    }
+    val shared = msg.result is CR.UIStateChanged ||
+      (msg.rhId == chatModel.remoteHostId() &&
+        (msg.rhId != null || chatModel.remoteCtrlSession.value?.active == true))
+    if (shared) uiSnapshotPending = true
+    if (msg.rhId == null && (msg.result as? CR.UIStateChanged)?.origin == "overflow") uiOwnerRecoveryPending = true
+    try {
+      if (msg.result !is CR.UIStateChanged) processReceivedMsgDelta(msg)
+    } finally {
+      if (shared) reconcileUI(msg.rhId)
+    }
+  }
+
+  // The receiver is subscribed before this request. The core returns list,
+  // counters, loaded items and users in ONE store transaction. Events queued
+  // during that transaction remain invalidations, rather than counter deltas
+  // to replay on top of a newer snapshot. Failed requests stay pending.
+  internal suspend fun reconcileUI(rhId: Long?) {
+    if (rhId != chatModel.remoteHostId() || chatModel.currentUser.value == null) return
+    val generation = chatModel.uiStateGeneration
+    val ctx = chatModel.chatsContext
+    val chatId = chatModel.chatId.value
+    val info = chatId?.let { ctx.getChat(it)?.chatInfo }
+    val ref = info?.takeIf { it is ChatInfo.Direct || it is ChatInfo.Group || it is ChatInfo.Local }
+      ?.let { CC.chatRef(it.chatType, it.apiId, it.groupChatScope()) }
+    val response = sendCmd(rhId, CC.UIState(ref, maxOf(100, ctx.chatItems.value.size + 100)), log = false)
+    val state = response.result as? CR.UIState ?: return
+    check(state.uiVersion == 1) { "Unsupported UI snapshot version" }
+    val secondary = chatModel.secondaryChatsContext.value
+    val secondaryInfo = state.chats.firstOrNull { it.id == chatId }?.chatInfo
+    val secondaryItems = if (secondary != null && secondaryInfo != null) {
+      val scope = secondary.groupScopeInfo?.toChatScope()
+      if (secondary.contentTag != null) {
+        apiGetChat(rhId, secondaryInfo.chatType, secondaryInfo.apiId, scope, secondary.contentTag,
+          ChatPagination.Last(maxOf(100, secondary.chatItems.value.size + 100)))?.first?.chatItems
+      } else {
+        val scopedRef = CC.chatRef(secondaryInfo.chatType, secondaryInfo.apiId, scope)
+        (sendCmd(rhId, CC.UIState(scopedRef, maxOf(100, secondary.chatItems.value.size + 100)), log = false)
+          .result as? CR.UIState)?.openChat?.chatItems
+      }
+    } else null
+    var applied = false
+    withContext(Dispatchers.Main) {
+      if (!chatModel.applyUIState(rhId, state, chatId, generation)) return@withContext
+      applied = true
+      if (secondaryItems != null && secondary === chatModel.secondaryChatsContext.value && chatModel.chatId.value == chatId) {
+        secondary?.applyUIItems(secondaryItems)
+      }
+      if (rhId == null) {
+        state.chats.filter { it.chatStats.unreadCount == 0 }.forEach {
+          ntfManager.cancelNotificationsForChat(it.id)
+        }
+      }
+    }
+    if (!applied) return
+    if (rhId == null && uiOwnerRecoveryPending) {
+      // Lifecycle events and platform-store callbacks can be among the lost
+      // deltas. Recover them from the owner, never from the viewer's database.
+      val controllers = listRemoteCtrls()
+      if (controllers != null && chatModel.remoteCtrlSession.value?.active == true &&
+        controllers.none { it.sessionState is RemoteCtrlSessionState.Connected }) {
+        chatModel.remoteCtrlSession.value = null
+        if (appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
+      }
+      apiGetCallInvitations(null).filter { it.contact.id !in chatModel.callInvitations }.forEach {
+        chatModel.callManager.reportNewIncomingCall(it)
+      }
+      BadgeStore.presentUnfinished()
+      uiOwnerRecoveryPending = controllers == null
+    }
+    uiSnapshotPending = uiOwnerRecoveryPending
+  }
+
+  private suspend fun processReceivedMsgDelta(msg: API) {
     lastMsgReceivedTimestamp = System.currentTimeMillis()
     val rhId = msg.rhId
     fun active(user: UserLike): Boolean = activeUser(rhId, user)
@@ -2988,7 +3194,7 @@ object ChatController {
           }
         }
         if (r.contact.directOrUsed) {
-          ntfManager.notifyContactConnected(r.user, r.contact)
+          if (rhId == null) ntfManager.notifyContactConnected(r.user, r.contact)
         }
       }
       is CR.ContactConnecting -> {
@@ -3035,7 +3241,7 @@ object ChatController {
             }
           }
         }
-        ntfManager.notifyContactRequestReceived(r.user, ChatInfo.ContactRequest(contactRequest))
+        if (rhId == null) ntfManager.notifyContactRequestReceived(r.user, ChatInfo.ContactRequest(contactRequest))
       }
       is CR.ContactUpdated -> {
         if (active(r.user) && chatModel.chatsContext.hasChat(rhId, r.toContact.id)) {
@@ -3069,7 +3275,7 @@ object ChatController {
             chatModel.chatsContext.updateChatInfo(rhId, r.chatInfo)
           }
         }
-      is CR.NewChatItems -> withBGApi {
+      is CR.NewChatItems -> {
         r.chatItems.forEach { chatItem ->
           val cInfo = chatItem.chatInfo
           val cItem = chatItem.chatItem
@@ -3088,7 +3294,7 @@ object ChatController {
           }
           val file = cItem.file
           val mc = cItem.content.msgContent
-          if (file != null &&
+          if (rhId == null && !cItem.chatDir.sent && file != null &&
             appPrefs.privacyAcceptImages.get() &&
             ((mc is MsgContent.MCImage && file.fileSize <= MAX_IMAGE_SIZE_AUTO_RCV)
                 || (mc is MsgContent.MCVideo && file.fileSize <= MAX_VIDEO_SIZE_AUTO_RCV)
@@ -3143,7 +3349,7 @@ object ChatController {
             AudioPlayer.stop(cItem)
           }
           val isLastChatItem = chatModel.getChat(cInfo.id)?.chatItems?.lastOrNull()?.id == cItem.id
-          if (isLastChatItem && ntfManager.hasNotificationsForChat(cInfo.id)) {
+          if (rhId == null && isLastChatItem && ntfManager.hasNotificationsForChat(cInfo.id)) {
             ntfManager.cancelNotificationsForChat(cInfo.id)
             ntfManager.displayNotification(
               r.user,
@@ -3392,7 +3598,7 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.RcvFileSndCancelled -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        cleanupFile(r.chatItem)
+        cleanupFile(rhId, r.chatItem)
       }
       is CR.RcvFileProgressXFTP -> {
         if (r.chatItem_ != null) {
@@ -3402,7 +3608,7 @@ object ChatController {
       is CR.RcvFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.RcvFileWarning -> {
@@ -3414,12 +3620,12 @@ object ChatController {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
       is CR.SndFileComplete -> {
         chatItemSimpleUpdate(rhId, r.user, r.chatItem)
-        cleanupDirectFile(r.chatItem)
+        cleanupDirectFile(rhId, r.chatItem)
       }
       is CR.SndFileRcvCancelled -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupDirectFile(r.chatItem_)
+          cleanupDirectFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileProgressXFTP -> {
@@ -3433,7 +3639,7 @@ object ChatController {
       is CR.SndFileError -> {
         if (r.chatItem_ != null) {
           chatItemSimpleUpdate(rhId, r.user, r.chatItem_)
-          cleanupFile(r.chatItem_)
+          cleanupFile(rhId, r.chatItem_)
         }
       }
       is CR.SndFileWarning -> {
@@ -3564,6 +3770,8 @@ object ChatController {
         }
       }
       is CR.RemoteCtrlSessionCode -> {
+        if (directReconnect.staleEvent(r.sessionSeq)) return
+        if (directReconnect.sessionCode(r.sessionSeq, r.sessionCode)) return
         val state = UIRemoteCtrlSessionState.PendingConfirmation(remoteCtrl_ = r.remoteCtrl_, sessionCode = r.sessionCode)
         chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = state)
       }
@@ -3573,10 +3781,18 @@ object ChatController {
         chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.copy(sessionState = state)
       }
       is CR.RemoteCtrlStopped -> {
+        if (directReconnect.staleEvent(r.sessionSeq)) return
+        val retryable = r.rcStopReason is RemoteCtrlStopReason.Disconnected ||
+          (r.rcStopReason is RemoteCtrlStopReason.ConnectionFailed && !directReconnectRejected(r.rcStopReason.chatError)) ||
+          (r.rcStopReason is RemoteCtrlStopReason.SetupFailed && !directReconnectRejected(r.rcStopReason.chatError))
+        if (directReconnect.stopped(r.sessionSeq, retryable)) {
+          chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSession.value?.let { session -> session.copy(sessionState = UIRemoteCtrlSessionState.Connecting(session.recoveryCtrl)) }
+          return
+        }
         val sess = chatModel.remoteCtrlSession.value
         if (sess != null) {
           chatModel.remoteCtrlSession.value = null
-          ModalManager.fullscreen.closeModals()
+          if (appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
           fun showAlert(chatError: ChatError) {
             when {
               r.rcStopReason is RemoteCtrlStopReason.Disconnected ->
@@ -3620,6 +3836,7 @@ object ChatController {
             is RemoteCtrlStopReason.DiscoveryFailed -> showAlert(r.rcStopReason.chatError)
             is RemoteCtrlStopReason.ConnectionFailed -> showAlert(r.rcStopReason.chatError)
             is RemoteCtrlStopReason.SetupFailed -> showAlert(r.rcStopReason.chatError)
+            is RemoteCtrlStopReason.Stopped -> {}
             is RemoteCtrlStopReason.Disconnected -> {
               /*AlertManager.shared.showAlertMsg(
                 generalGetString(MR.strings.remote_ctrl_was_disconnected_title),
@@ -3627,9 +3844,7 @@ object ChatController {
             }
           }
 
-          if (sess.sessionState is UIRemoteCtrlSessionState.Connected) {
-            switchToLocalSession()
-          }
+
         }
       }
       is CR.ContactPQEnabled ->
@@ -3672,13 +3887,16 @@ object ChatController {
     }
   }
 
-  private fun cleanupDirectFile(aChatItem: AChatItem) {
+  private fun cleanupDirectFile(rhId: Long?, aChatItem: AChatItem) {
     if (aChatItem.chatInfo.chatType == ChatType.Direct) {
-      cleanupFile(aChatItem)
+      cleanupFile(rhId, aChatItem)
     }
   }
 
-  private fun cleanupFile(aChatItem: AChatItem) {
+  private fun cleanupFile(rhId: Long?, aChatItem: AChatItem) {
+    // All cleanup entry points, including command replies, carry the owner.
+    // A phone-relative file name must never remove a desktop-local file.
+    if (rhId != null) return
     val cItem = aChatItem.chatItem
     val mc = cItem.content.msgContent
     val fileName = cItem.file?.fileName
@@ -3851,6 +4069,7 @@ object ChatController {
     AlertManager.shared.hideAllAlerts()
     AlertManager.privacySensitive.hideAllAlerts()
     chatModel.currentRemoteHost.value = switchRemoteHost(rhId)
+    chatModel.resetUIState()
     reloadRemoteHosts()
     val user = apiGetActiveUser(rhId)
     val users = listUsers(rhId)
@@ -3870,6 +4089,10 @@ object ChatController {
       }
     }
     getUserChatData(rhId)
+    if (rhId != null && user != null) {
+      uiSnapshotPending = true
+      reconcileUI(rhId)
+    }
   }
 
   suspend fun showProgressIfNeeded(block: suspend () -> Unit) {
@@ -4040,6 +4263,8 @@ sealed class CC {
   class ApiSaveSettings(val settings: AppSettings): CC()
   class ApiGetSettings(val settings: AppSettings): CC()
   class ApiGetChatTags(val userId: Long): CC()
+  class EnableUI: CC()
+  class UIState(val ref: String?, val count: Int): CC()
   class ApiGetChats(val userId: Long): CC()
   class ApiGetChat(val type: ChatType, val id: Long, val scope: GroupChatScope?, val contentTag: MsgContentTag?, val pagination: ChatPagination, val search: String = ""): CC()
   class ApiGetChatContentTypes(val type: ChatType, val id: Long, val scope: GroupChatScope?): CC()
@@ -4176,11 +4401,15 @@ sealed class CC {
   class DeleteRemoteHost(val remoteHostId: Long): CC()
   class StoreRemoteFile(val remoteHostId: Long, val storeEncrypted: Boolean?, val localPath: String): CC()
   class GetRemoteFile(val remoteHostId: Long, val file: RemoteFile): CC()
+  class RestoreRemoteHosts: CC()
+  class SetRemoteCtrlAddress(val remoteCtrlId: Long, val host: String): CC()
+  class ResumeRemoteCtrl(val remoteCtrlId: Long): CC()
   class ConnectRemoteCtrl(val xrcpInvitation: String): CC()
   class FindKnownRemoteCtrl(): CC()
   class ConfirmRemoteCtrl(val remoteCtrlId: Long): CC()
   class VerifyRemoteCtrlSession(val sessionCode: String): CC()
   class ListRemoteCtrls(): CC()
+  class AbortRemoteCtrl(val sequence: Int): CC()
   class StopRemoteCtrl(): CC()
   class DeleteRemoteCtrl(val remoteCtrlId: Long): CC()
   class ApiUploadStandaloneFile(val userId: Long, val file: CryptoFile): CC()
@@ -4238,6 +4467,8 @@ sealed class CC {
     is ApiSaveSettings -> "/_save app settings ${json.encodeToString(settings)}"
     is ApiGetSettings -> "/_get app settings ${json.encodeToString(settings)}"
     is ApiGetChatTags -> "/_get tags $userId"
+    is EnableUI -> "/_ui enable"
+    is UIState -> "/_ui snapshot${ref?.let { " $it" } ?: ""} count=$count"
     is ApiGetChats -> "/_get chats $userId pcc=on"
     is ApiGetChat -> {
       val tag = if (contentTag == null) {
@@ -4405,11 +4636,15 @@ sealed class CC {
           (if (storeEncrypted == null) "" else "encrypt=${onOff(storeEncrypted)} ") +
           localPath
     is GetRemoteFile -> "/get remote file $remoteHostId ${json.encodeToString(file)}"
+    is RestoreRemoteHosts -> "/_restore remote hosts"
+    is SetRemoteCtrlAddress -> "/_remote ctrl address $remoteCtrlId $host"
+    is ResumeRemoteCtrl -> "/_resume remote ctrl $remoteCtrlId"
     is ConnectRemoteCtrl -> "/connect remote ctrl $xrcpInvitation"
     is FindKnownRemoteCtrl -> "/find remote ctrl"
     is ConfirmRemoteCtrl -> "/confirm remote ctrl $remoteCtrlId"
     is VerifyRemoteCtrlSession -> "/verify remote ctrl $sessionCode"
     is ListRemoteCtrls -> "/list remote ctrls"
+    is AbortRemoteCtrl -> "/_abort remote ctrl $sequence"
     is StopRemoteCtrl -> "/stop remote ctrl"
     is DeleteRemoteCtrl -> "/delete remote ctrl $remoteCtrlId"
     is ApiUploadStandaloneFile -> "/_upload $userId ${file.filePath}"
@@ -4457,6 +4692,8 @@ sealed class CC {
     is ApiSaveSettings -> "apiSaveSettings"
     is ApiGetSettings -> "apiGetSettings"
     is ApiGetChatTags -> "apiGetChatTags"
+    is EnableUI -> "enableUI"
+    is UIState -> "uiState"
     is ApiGetChats -> "apiGetChats"
     is ApiGetChat -> "apiGetChat"
     is ApiGetChatContentTypes -> "apiGetChatContentTypes"
@@ -4592,11 +4829,15 @@ sealed class CC {
     is DeleteRemoteHost -> "deleteRemoteHost"
     is StoreRemoteFile -> "storeRemoteFile"
     is GetRemoteFile -> "getRemoteFile"
+    is RestoreRemoteHosts -> "restoreRemoteHosts"
+    is SetRemoteCtrlAddress -> "setRemoteCtrlAddress"
+    is ResumeRemoteCtrl -> "resumeRemoteCtrl"
     is ConnectRemoteCtrl -> "connectRemoteCtrl"
     is FindKnownRemoteCtrl -> "FindKnownRemoteCtrl"
     is ConfirmRemoteCtrl -> "confirmRemoteCtrl"
     is VerifyRemoteCtrlSession -> "verifyRemoteCtrlSession"
     is ListRemoteCtrls -> "listRemoteCtrls"
+    is AbortRemoteCtrl -> "abortRemoteCtrl"
     is StopRemoteCtrl -> "stopRemoteCtrl"
     is DeleteRemoteCtrl -> "deleteRemoteCtrl"
     is ApiUploadStandaloneFile -> "apiUploadStandaloneFile"
@@ -6612,7 +6853,8 @@ data class RemoteCtrl (
 data class RemoteCtrlInfo (
   val remoteCtrlId: Long,
   val ctrlDeviceName: String,
-  val sessionState: RemoteCtrlSessionState?
+  val sessionState: RemoteCtrlSessionState?,
+  val recoveryEnabled: Boolean = false
 ) {
   val deviceViewName: String
     get() = ctrlDeviceName.ifEmpty { remoteCtrlId.toString() }
@@ -6828,6 +7070,8 @@ private fun <T> decodeObject(deserializer: DeserializationStrategy<T>, obj: Json
 // Spec: spec/api.md#CR
 @Serializable
 sealed class CR {
+  @Serializable @SerialName("uiStateChanged") class UIStateChanged(val uiVersion: Int, val revision: Long, val origin: String): CR()
+  @Serializable @SerialName("uiState") class UIState(val uiVersion: Int, val revision: Long, val user: User, val users: List<UserInfo>, val chats: List<Chat>, val openChat: Chat? = null, val userTags: List<ChatTag>): CR()
   @Serializable @SerialName("activeUser") class ActiveUser(val user: User): CR()
   @Serializable @SerialName("usersList") class UsersList(val users: List<UserInfo>): CR()
   @Serializable @SerialName("chatStarted") class ChatStarted: CR()
@@ -7003,10 +7247,10 @@ sealed class CR {
   // remote events (mobile)
   @Serializable @SerialName("remoteCtrlList") class RemoteCtrlList(val remoteCtrls: List<RemoteCtrlInfo>): CR()
   @Serializable @SerialName("remoteCtrlFound") class RemoteCtrlFound(val remoteCtrl: RemoteCtrlInfo, val ctrlAppInfo_: CtrlAppInfo?, val appVersion: String, val compatible: Boolean): CR()
-  @Serializable @SerialName("remoteCtrlConnecting") class RemoteCtrlConnecting(val remoteCtrl_: RemoteCtrlInfo?, val ctrlAppInfo: CtrlAppInfo, val appVersion: String): CR()
-  @Serializable @SerialName("remoteCtrlSessionCode") class RemoteCtrlSessionCode(val remoteCtrl_: RemoteCtrlInfo?, val sessionCode: String): CR()
+  @Serializable @SerialName("remoteCtrlConnecting") class RemoteCtrlConnecting(val remoteCtrl_: RemoteCtrlInfo?, val ctrlAppInfo: CtrlAppInfo, val appVersion: String, val sessionSeq: Int = 0): CR()
+  @Serializable @SerialName("remoteCtrlSessionCode") class RemoteCtrlSessionCode(val remoteCtrl_: RemoteCtrlInfo?, val sessionCode: String, val sessionSeq: Int = 0): CR()
   @Serializable @SerialName("remoteCtrlConnected") class RemoteCtrlConnected(val remoteCtrl: RemoteCtrlInfo): CR()
-  @Serializable @SerialName("remoteCtrlStopped") class RemoteCtrlStopped(val rcsState: RemoteCtrlSessionState, val rcStopReason: RemoteCtrlStopReason): CR()
+  @Serializable @SerialName("remoteCtrlStopped") class RemoteCtrlStopped(val rcsState: RemoteCtrlSessionState, val rcStopReason: RemoteCtrlStopReason, val sessionSeq: Int = 0): CR()
   // pq
   @Serializable @SerialName("contactPQAllowed") class ContactPQAllowed(val user: UserRef, val contact: Contact, val pqEncryption: Boolean): CR()
   @Serializable @SerialName("contactPQEnabled") class ContactPQEnabled(val user: UserRef, val contact: Contact, val pqEnabled: Boolean): CR()
@@ -7034,6 +7278,8 @@ sealed class CR {
   @Serializable class Invalid(val str: String): CR()
 
   val responseType: String get() = when(this) {
+    is UIStateChanged -> "uiStateChanged"
+    is UIState -> "uiState"
     is ActiveUser -> "activeUser"
     is UsersList -> "usersList"
     is ChatStarted -> "chatStarted"
@@ -7230,6 +7476,8 @@ sealed class CR {
   }
 
   val details: String get() = when(this) {
+    is UIStateChanged -> "revision=$revision origin=$origin"
+    is UIState -> "revision=$revision chats=${chats.size}"
     is ActiveUser -> withUser(user, json.encodeToString(user))
     is UsersList -> json.encodeToString(users)
     is ChatStarted -> noDetails()
@@ -7898,7 +8146,7 @@ data class SomeRemoteCtrl(
 )
 
 @Serializable
-data class CtrlAppInfo(val appVersionRange: AppVersionRange, val deviceName: String)
+data class CtrlAppInfo(val appVersionRange: AppVersionRange, val deviceName: String, val reconnect: Boolean = false, val restart: Boolean = false)
 
 @Serializable
 data class AppVersionRange(val minVersion: String, val maxVersion: String)
@@ -8628,6 +8876,7 @@ sealed class RCErrorType {
     is CTRL_AUTH -> "CTRL_AUTH"
     is CTRL_NOT_FOUND -> "CTRL_NOT_FOUND"
     is CTRL_ERROR -> "CTRL_ERROR $ctrlErr"
+    is INVITATION -> "INVITATION"
     is VERSION -> "VERSION"
     is ENCRYPT -> "ENCRYPT"
     is DECRYPT -> "DECRYPT"
@@ -8644,6 +8893,7 @@ sealed class RCErrorType {
   @Serializable @SerialName("ctrlAuth") object CTRL_AUTH: RCErrorType()
   @Serializable @SerialName("ctrlNotFound") object CTRL_NOT_FOUND: RCErrorType()
   @Serializable @SerialName("ctrlError") data class CTRL_ERROR(val ctrlErr: String): RCErrorType()
+  @Serializable @SerialName("invitation") object INVITATION: RCErrorType()
   @Serializable @SerialName("version") object VERSION: RCErrorType()
   @Serializable @SerialName("encrypt") object ENCRYPT: RCErrorType()
   @Serializable @SerialName("decrypt") object DECRYPT: RCErrorType()
@@ -8664,6 +8914,11 @@ sealed class ArchiveError {
 
 @Serializable
 sealed class RemoteHostError {
+  val connectionUnavailable: Boolean get() = when (this) {
+    is Missing, is Inactive, is Timeout, is BadState, is Disconnected -> true
+    is ProtocolError -> (data["type"] as? JsonPrimitive)?.contentOrNull == "sessionClosed"
+    else -> false
+  }
   val string: String get() = when (this) {
     is Missing -> "missing"
     is Inactive -> "inactive"
@@ -8672,6 +8927,7 @@ sealed class RemoteHostError {
     is BadState -> "badState"
     is BadVersion -> "badVersion"
     is Disconnected -> "disconnected"
+    is ProtocolError -> "protocolError ${json.encodeToString(data)}"
   }
   fun localizedString(name: String): String = when (this) {
     is Missing -> generalGetString(MR.strings.remote_host_error_missing)
@@ -8681,6 +8937,7 @@ sealed class RemoteHostError {
     is BadState -> generalGetString(MR.strings.remote_host_error_bad_state)
     is BadVersion -> generalGetString(MR.strings.remote_host_error_bad_version)
     is Disconnected -> generalGetString(MR.strings.remote_host_error_disconnected)
+    is ProtocolError -> generalGetString(if (connectionUnavailable) MR.strings.remote_host_error_disconnected else MR.strings.remote_host_error_protocol)
   }.format(name)
   @Serializable @SerialName("missing") object Missing: RemoteHostError()
   @Serializable @SerialName("inactive") object Inactive: RemoteHostError()
@@ -8689,6 +8946,7 @@ sealed class RemoteHostError {
   @Serializable @SerialName("badState") object BadState: RemoteHostError()
   @Serializable @SerialName("badVersion") object BadVersion: RemoteHostError()
   @Serializable @SerialName("disconnected") class Disconnected(val reason: String): RemoteHostError()
+  @Serializable @SerialName("protocolError") class ProtocolError(val data: JsonObject): RemoteHostError()
 }
 
 @Serializable

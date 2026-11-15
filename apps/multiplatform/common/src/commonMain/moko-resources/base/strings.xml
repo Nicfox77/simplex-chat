@@ -2810,6 +2810,13 @@
   <string name="desktop_device">Desktop</string>
   <string name="not_compatible">Not compatible!</string>
   <string name="refresh_qr_code">Refresh</string>
+  <string name="use_tailscale_address">Use Tailscale address</string>
+  <string name="remote_link_qr_endpoint">Address in QR code: %s</string>
+  <string name="remote_link_recovery_address">Recovery address</string>
+  <string name="remote_link_recovery_host">Tailnet IPv4 or MagicDNS name</string>
+  <string name="remote_link_recovery_address_help">Used for the next reconnection to this verified desktop. The saved port and device identity remain required. Use Disconnect or unlink to disable automatic reconnection.</string>
+  <string name="remote_link_direct_help">For Tailscale, select tailscale0 and refresh the QR code. Scan or paste the full invitation on Android and verify the first session. This enables automatic reconnection, including after app restart, using the saved pairing. Disconnect or unlink to disable it. Local network discovery is not needed. The listener binds the selected tailnet address; also restrict the device and port in your firewall and Tailscale access rules.</string>
+  <string name="remote_link_paste_help">Paste the full invitation from the desktop Share link, not just its IP address. After a disconnection, select the linked mobile on the desktop to get a fresh invitation, then scan or paste it here and verify the session code. Automatic reconnection is not available.</string>
   <string name="no_connected_mobile">No connected mobile</string>
   <string name="random_port">Random</string>
   <string name="open_port_in_firewall_title">Open port in firewall</string>
@@ -2821,6 +2828,9 @@
   <string name="remote_host_error_bad_state"><![CDATA[Connection to the mobile <b>%s</b> is in a bad state]]></string>
   <string name="remote_host_error_bad_version"><![CDATA[Mobile <b>%s</b> has an unsupported version. Please, make sure you use the same version on both devices]]></string>
   <string name="remote_host_error_disconnected"><![CDATA[Mobile <b>%s</b> was disconnected]]></string>
+  <string name="remote_host_error_protocol"><![CDATA[Connection to mobile <b>%s</b> failed]]></string>
+  <string name="remote_send_connection_interrupted_title">Mobile connection interrupted</string>
+  <string name="remote_send_connection_interrupted_message">After reconnecting, check this conversation on your mobile before sending again. The message may already have been sent.</string>
   <string name="remote_ctrl_error_inactive">Desktop is inactive</string>
   <string name="remote_ctrl_error_bad_state">Connection to the desktop is in a bad state</string>
   <string name="remote_ctrl_error_busy">Desktop is busy</string>

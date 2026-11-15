@@ -6,6 +6,7 @@
 
 module Simplex.Chat.Store.Remote where
 
+import Control.Monad (guard)
 import Control.Monad.Except
 import Data.Int (Int64)
 import Data.Text (Text)
@@ -15,9 +16,11 @@ import Data.Word (Word16)
 import Simplex.Chat.Remote.Types
 import Simplex.Chat.Store.Shared
 import Simplex.Messaging.Agent.Store.AgentStore (firstRow, maybeFirstRow)
+import Simplex.Messaging.Agent.Store.DB (BoolInt (..))
 import qualified Simplex.Messaging.Agent.Store.DB as DB
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding.String (StrEncoding (..))
+import Simplex.Messaging.Transport.Client (TransportHost)
 import Simplex.RemoteControl.Types
 import UnliftIO
 #if defined(dbPostgres)
@@ -63,13 +66,13 @@ getRemoteHostByFingerprint db fingerprint =
 remoteHostQuery :: Query
 remoteHostQuery =
   [sql|
-    SELECT remote_host_id, host_device_name, store_path, ca_key, ca_cert, id_key, host_fingerprint, host_dh_pub, bind_iface, bind_addr, bind_port
+    SELECT remote_host_id, host_device_name, store_path, ca_key, ca_cert, id_key, host_fingerprint, host_dh_pub, bind_iface, bind_addr, bind_port, recovery_enabled
     FROM remote_hosts
   |]
 
-toRemoteHost :: (Int64, Text, FilePath, C.APrivateSignKey, C.SignedObject X.Certificate, C.PrivateKeyEd25519, C.KeyHash, C.PublicKeyX25519, Maybe Text, Maybe Text, Maybe Word16) -> RemoteHost
-toRemoteHost (remoteHostId, hostDeviceName, storePath, caKey, C.SignedObject caCert, idPrivKey, hostFingerprint, hostDhPubKey, ifaceName_, ifaceAddr_, bindPort_) =
-  RemoteHost {remoteHostId, hostDeviceName, storePath, hostPairing, bindAddress_, bindPort_}
+toRemoteHost :: (Int64, Text, FilePath, C.APrivateSignKey, C.SignedObject X.Certificate, C.PrivateKeyEd25519, C.KeyHash, C.PublicKeyX25519, Maybe Text, Maybe Text, Maybe Word16, BoolInt) -> RemoteHost
+toRemoteHost (remoteHostId, hostDeviceName, storePath, caKey, C.SignedObject caCert, idPrivKey, hostFingerprint, hostDhPubKey, ifaceName_, ifaceAddr_, bindPort_, BI recoveryEnabled) =
+  RemoteHost {remoteHostId, hostDeviceName, storePath, hostPairing, bindAddress_, bindPort_, recoveryEnabled}
   where
     hostPairing = RCHostPairing {caKey, caCert, idPrivKey, knownHost = Just knownHost}
     knownHost = KnownHostPairing {hostFingerprint, hostDhPubKey}
@@ -126,7 +129,7 @@ getRemoteCtrlByFingerprint db fingerprint =
 remoteCtrlQuery :: Query
 remoteCtrlQuery =
   [sql|
-    SELECT remote_ctrl_id, ctrl_device_name, ca_key, ca_cert, ctrl_fingerprint, id_pub, dh_priv_key, prev_dh_priv_key
+    SELECT remote_ctrl_id, ctrl_device_name, ca_key, ca_cert, ctrl_fingerprint, id_pub, dh_priv_key, prev_dh_priv_key, recovery_host, recovery_port
     FROM remote_controllers
   |]
 
@@ -138,12 +141,20 @@ toRemoteCtrl ::
     C.KeyHash,
     C.PublicKeyEd25519,
     C.PrivateKeyX25519,
-    Maybe C.PrivateKeyX25519
+    Maybe C.PrivateKeyX25519,
+    Maybe Text,
+    Maybe Word16
   ) ->
   RemoteCtrl
-toRemoteCtrl (remoteCtrlId, ctrlDeviceName, caKey, C.SignedObject caCert, ctrlFingerprint, idPubKey, dhPrivKey, prevDhPrivKey) =
+toRemoteCtrl (remoteCtrlId, ctrlDeviceName, caKey, C.SignedObject caCert, ctrlFingerprint, idPubKey, dhPrivKey, prevDhPrivKey, host_, port_) =
   let ctrlPairing = RCCtrlPairing {caKey, caCert, ctrlFingerprint, idPubKey, dhPrivKey, prevDhPrivKey}
-   in RemoteCtrl {remoteCtrlId, ctrlDeviceName, ctrlPairing}
+      recoveryEndpoint = do
+        encodedHost <- host_
+        host <- either (const Nothing) Just $ strDecode $ encodeUtf8 encodedHost
+        port <- port_
+        guard (port > 0)
+        pure RCEndpoint {host, port}
+   in RemoteCtrl {remoteCtrlId, ctrlDeviceName, ctrlPairing, recoveryEndpoint}
 
 updateRemoteCtrl :: DB.Connection -> RemoteCtrl -> Text -> C.PrivateKeyX25519 -> IO ()
 updateRemoteCtrl db RemoteCtrl {remoteCtrlId} ctrlDeviceName dhPrivKey =
@@ -159,3 +170,38 @@ updateRemoteCtrl db RemoteCtrl {remoteCtrlId} ctrlDeviceName dhPrivKey =
 deleteRemoteCtrlRecord :: DB.Connection -> RemoteCtrlId -> IO ()
 deleteRemoteCtrlRecord db remoteCtrlId =
   DB.execute db "DELETE FROM remote_controllers WHERE remote_ctrl_id = ?" (Only remoteCtrlId)
+
+-- Recovery authorization is separate from trust. Local explicit stop must revoke
+-- it even when no transport is connected. Process cleanup does not change it.
+setRemoteHostRecovery :: DB.Connection -> RemoteHostId -> Bool -> IO ()
+setRemoteHostRecovery db rhId enabled =
+  DB.execute db "UPDATE remote_hosts SET recovery_enabled = ? WHERE remote_host_id = ?" (BI enabled, rhId)
+
+setRemoteCtrlRecovery :: DB.Connection -> RemoteCtrlId -> Maybe RCEndpoint -> IO ()
+setRemoteCtrlRecovery db rcId endpoint =
+  DB.execute db "UPDATE remote_controllers SET recovery_host = ?, recovery_port = ? WHERE remote_ctrl_id = ?" (host_, port_, rcId)
+  where
+    host_ = (\RCEndpoint {host} -> decodeASCII $ strEncode host) <$> endpoint
+    port_ = (\RCEndpoint {port} -> port) <$> endpoint
+
+-- A routing edit can never grant recovery authorization. In particular a stale
+-- edit arriving after stop/unlink must not restore a cleared endpoint or port.
+updateRemoteCtrlAddress :: DB.Connection -> RemoteCtrlId -> TransportHost -> IO ()
+updateRemoteCtrlAddress db rcId host =
+  DB.execute
+    db
+    "UPDATE remote_controllers SET recovery_host = ? WHERE remote_ctrl_id = ? AND recovery_host IS NOT NULL AND recovery_port IS NOT NULL"
+    (decodeASCII $ strEncode host, rcId)
+
+disableRemoteRecovery :: DB.Connection -> IO ()
+disableRemoteRecovery db = do
+  DB.execute_ db "UPDATE remote_hosts SET recovery_enabled = 0"
+  disableRemoteCtrlRecovery db
+
+enableRemoteHostRecovery :: DB.Connection -> RemoteHostId -> Word16 -> IO ()
+enableRemoteHostRecovery db rhId port =
+  DB.execute db "UPDATE remote_hosts SET recovery_enabled = 1, bind_port = ? WHERE remote_host_id = ?" (port, rhId)
+
+disableRemoteCtrlRecovery :: DB.Connection -> IO ()
+disableRemoteCtrlRecovery db =
+  DB.execute_ db "UPDATE remote_controllers SET recovery_host = NULL, recovery_port = NULL"

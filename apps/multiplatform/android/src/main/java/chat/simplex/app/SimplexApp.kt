@@ -205,8 +205,8 @@ class SimplexApp: Application(), LifecycleEventObserver {
       override fun showMessage(title: String, text: String) = NtfManager.showMessage(title, text)
     }
     platform = object : PlatformInterface {
-      override suspend fun androidServiceStart() {
-        SimplexService.start()
+      override suspend fun androidServiceStart(remoteSession: Boolean) {
+        SimplexService.start(remoteSession)
       }
 
       override fun androidServiceSafeStop() {

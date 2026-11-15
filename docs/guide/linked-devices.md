@@ -81,6 +81,22 @@ After the first link, the mobile and the desktop remember each other.
      is off. To scan the QR code instead, tap **Scan QR code**.
    - Otherwise, scan the QR code.
 
+## Android and Linux over Tailscale
+
+Android and Linux support simultaneous phone and desktop use and automatic
+recovery over Tailscale. See the
+[device testing guide](../tailscale-device-linking.md) for pairing and setup.
+After a network interruption, leave both apps running while they reconnect;
+the desktop loads missed messages from the phone. A send interrupted by the
+outage may already have reached the phone, so check there before sending it
+again.
+
+If you try to send while the mobile connection is unavailable, the app shows
+**Mobile connection interrupted** and keeps failed text in the composer. It does
+not resend automatically. After reconnecting, check the conversation on the
+mobile before sending again, because an interrupted send may already have
+reached it.
+
 ## Local network discovery
 
 When the desktop shows the QR code for a linked mobile and **Discoverable via
@@ -135,8 +151,8 @@ On the mobile:
 - On iOS, keep the app open while you use it from the desktop. The session ends
   when the app goes to the background, and the screen of the iPhone stays on
   while the session is active.
-- On Android, closing the screen asks **Disconnect desktop?**, because only one
-  device can work at a time.
+- On Android, closing this screen keeps the linked desktop connected and lets
+  you use the phone at the same time. Use **Disconnect** to end the link.
 
 The database of the mobile, its passphrase and its network settings are managed
 on the mobile.

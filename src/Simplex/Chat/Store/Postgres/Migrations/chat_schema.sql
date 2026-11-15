@@ -1553,7 +1553,9 @@ CREATE TABLE test_chat_schema.remote_controllers (
     ctrl_fingerprint bytea NOT NULL,
     id_pub bytea NOT NULL,
     dh_priv_key bytea NOT NULL,
-    prev_dh_priv_key bytea
+    prev_dh_priv_key bytea,
+    recovery_host text,
+    recovery_port integer
 );
 
 
@@ -1580,7 +1582,8 @@ CREATE TABLE test_chat_schema.remote_hosts (
     host_dh_pub bytea NOT NULL,
     bind_addr text,
     bind_iface text,
-    bind_port integer
+    bind_port integer,
+    recovery_enabled smallint DEFAULT 0 NOT NULL
 );
 
 

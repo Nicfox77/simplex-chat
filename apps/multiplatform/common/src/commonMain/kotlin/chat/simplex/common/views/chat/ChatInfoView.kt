@@ -971,7 +971,7 @@ fun CallButton(
   title: String,
   mediaType: CallMediaType
 ) {
-  val canCall = contact.ready && contact.active && contact.mergedPreferences.calls.enabled.forUser && chatModel.activeCall.value == null
+  val canCall = !chatModel.connectedToRemote() && contact.ready && contact.active && contact.mergedPreferences.calls.enabled.forUser && chatModel.activeCall.value == null
   val needToAllowCallsToContact = remember(chat.chatInfo) {
     chat.chatInfo is ChatInfo.Direct && with(chat.chatInfo.contact.mergedPreferences.calls) {
       ((userPreference as? ContactUserPref.User)?.preference?.allow == FeatureAllowed.NO || (userPreference as? ContactUserPref.Contact)?.preference?.allow == FeatureAllowed.NO) &&

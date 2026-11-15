@@ -27,6 +27,7 @@ import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFile)
 import Simplex.Messaging.Parsers (defaultJSON, dropPrefix, enumJSON, sumTypeJSON)
 import Simplex.Messaging.Transport (TLS (..), TSbChainKeys (..), TransportPeer (..))
+import Simplex.Messaging.Transport.Client (TransportHost)
 import Simplex.Messaging.Transport.HTTP2.Client (HTTP2Client)
 import qualified Simplex.Messaging.TMap as TM
 import Simplex.Messaging.Util (AnyError (..), stateTVar', tshow)
@@ -37,6 +38,7 @@ data RemoteHostClient = RemoteHostClient
   { hostEncoding :: PlatformEncoding,
     hostDeviceName :: Text,
     httpClient :: HTTP2Client,
+    hostSessionClosed :: TVar Bool,
     encryption :: RemoteCrypto,
     encryptHostFiles :: Bool,
     storePath :: FilePath
@@ -110,7 +112,18 @@ data RemoteHostSession
   | RHSessionPendingConfirmation {sessionCode :: Text, tls :: TLS 'TServer, rhPendingSession :: RHPendingSession}
   | RHSessionConfirmed {tls :: TLS 'TServer, rhPendingSession :: RHPendingSession}
   | RHSessionConnected
-      { rchClient :: RCHostClient,
+      { rhPendingSession :: RHPendingSession,
+        hostStopRequested :: TVar Bool,
+        canReconnect :: Bool,
+        tls :: TLS 'TServer,
+        rhClient :: RemoteHostClient,
+        pollAction :: Async (),
+        storePath :: FilePath
+      }
+
+  | RHSessionDisconnecting
+      { invitation :: Text,
+        rhPendingSession :: RHPendingSession,
         tls :: TLS 'TServer,
         rhClient :: RemoteHostClient,
         pollAction :: Async (),
@@ -132,6 +145,7 @@ rhsSessionState = \case
   RHSessionPendingConfirmation {tls} -> RHSPendingConfirmation {sessionCode = tlsSessionCode tls}
   RHSessionConfirmed {tls} -> RHSConfirmed {sessionCode = tlsSessionCode tls}
   RHSessionConnected {tls} -> RHSConnected {sessionCode = tlsSessionCode tls}
+  RHSessionDisconnecting {invitation} -> RHSConnecting {invitation}
 
 tlsSessionCode :: TLS p -> Text
 tlsSessionCode = verificationCode . tlsUniq
@@ -142,6 +156,8 @@ data RemoteProtocolError
   | -- | failed to parse RemoteCommand or RemoteResponse
     RPEInvalidJSON {invalidJSON :: String}
   | RPEInvalidBody {invalidBody :: String}
+  | -- | The authenticated session was revoked; reconnect and resnapshot.
+    RPESessionClosed
   | PRESessionCode
   | RPEIncompatibleEncoding
   | RPEUnexpectedFile
@@ -175,6 +191,7 @@ data RemoteHost = RemoteHost
     storePath :: FilePath,
     bindAddress_ :: Maybe RCCtrlAddress,
     bindPort_ :: Maybe Word16,
+    recoveryEnabled :: Bool,
     hostPairing :: RCHostPairing
   }
 
@@ -195,11 +212,16 @@ type RemoteCtrlId = Int64
 data RemoteCtrl = RemoteCtrl
   { remoteCtrlId :: RemoteCtrlId,
     ctrlDeviceName :: Text,
+    recoveryEndpoint :: Maybe RCEndpoint,
     ctrlPairing :: RCCtrlPairing
   }
 
 remoteCtrlId' :: RemoteCtrl -> RemoteCtrlId
 remoteCtrlId' = remoteCtrlId
+
+-- Only endpoint metadata is persisted, alongside the existing long-term pairing.
+data RCEndpoint = RCEndpoint {host :: TransportHost, port :: Word16}
+  deriving (Show)
 
 data PlatformEncoding
   = PESwift
@@ -223,18 +245,24 @@ data RemoteFile = RemoteFile
   deriving (Show)
 
 data CtrlAppInfo = CtrlAppInfo
-  { appVersionRange :: AppVersionRange,
+  { uiProtocol :: Maybe Int,
+    appVersionRange :: AppVersionRange,
     deviceName :: Text,
-    compression :: BoolDef
+    compression :: BoolDef,
+    restart :: BoolDef,
+    reconnect :: BoolDef
   }
   deriving (Show)
 
 data HostAppInfo = HostAppInfo
-  { appVersion :: AppVersion,
+  { uiProtocol :: Maybe Int,
+    appVersion :: AppVersion,
     deviceName :: Text,
     encoding :: PlatformEncoding,
     encryptFiles :: Bool, -- if the host encrypts files in app storage
-    compression :: BoolDef
+    compression :: BoolDef,
+    restart :: BoolDef,
+    reconnect :: BoolDef
   }
 
 $(J.deriveJSON defaultJSON ''RemoteFile)

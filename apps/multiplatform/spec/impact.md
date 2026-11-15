@@ -267,6 +267,7 @@ Path prefix: `common/src/commonMain/kotlin/chat/simplex/common/`
 
 | Source File | Product Concepts Affected | Risk Level | Notes |
 |-------------|--------------------------|------------|-------|
+| `model/DirectLinkReconnect.kt` | PC27 | Medium | Owned Android retries after verified direct pairing |
 | `views/remote/ConnectDesktopView.kt` | PC27 | Medium | Connect-to-desktop flow (from mobile) |
 | `views/remote/ConnectMobileView.kt` | PC27 | Medium | Connect-to-mobile flow (from desktop) |
 

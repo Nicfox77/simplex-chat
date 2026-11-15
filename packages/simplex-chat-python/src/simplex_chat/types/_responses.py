@@ -297,6 +297,7 @@ class RemoteCtrlConnecting(TypedDict):
     remoteCtrl_: NotRequired["T.RemoteCtrlInfo"]
     ctrlAppInfo: "T.CtrlAppInfo"
     appVersion: str
+    sessionSeq: int  # int
 
 class SentConfirmation(TypedDict):
     type: Literal["sentConfirmation"]

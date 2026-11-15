@@ -491,12 +491,14 @@ export namespace CEvt {
     type: "remoteCtrlSessionCode"
     remoteCtrl_?: T.RemoteCtrlInfo
     sessionCode: string
+    sessionSeq: number // int
   }
 
   export interface RemoteCtrlStopped extends Interface {
     type: "remoteCtrlStopped"
     rcsState: T.RemoteCtrlSessionState
     rcStopReason: T.RemoteCtrlStopReason
+    sessionSeq: number // int
   }
 
   export interface MessageError extends Interface {

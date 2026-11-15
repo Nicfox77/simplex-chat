@@ -67,6 +67,7 @@ import Simplex.Messaging.Transport
 import Simplex.Messaging.Transport.Server (ServerCredentials (..), mkTransportServerConfig)
 import Simplex.Messaging.Version
 import Simplex.Messaging.Version.Internal
+import System.Environment (lookupEnv)
 import System.Directory (createDirectoryIfMissing, listDirectory, removePathForcibly)
 import System.FilePath ((</>))
 import qualified System.Terminal as C
@@ -513,7 +514,10 @@ withTmpFiles =
     clearTmp = listDirectory "tests/tmp" >>= mapM_ (removePathForcibly . ("tests/tmp" </>))
 
 newPortBases :: IO (TVar [Int])
-newPortBases = newTVarIO [7000, 7010 .. 8990]
+newPortBases = do
+  -- Independent worktrees can run integration tests on the same host.
+  base <- maybe (pure 7000) readIO =<< lookupEnv "SIMPLEX_TEST_PORT_BASE"
+  newTVarIO [base, base + 10 .. base + 1990]
 
 withPortBase :: TVar [Int] -> (Int -> IO a) -> IO a
 withPortBase bases = bracket takeBase (\b -> atomically $ modifyTVar' bases (b :))

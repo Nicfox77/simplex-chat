@@ -204,6 +204,7 @@ Desktop-specific functionality not present on Android.
 | App update checker | In-app notification for available updates | `common/src/desktopMain/kotlin/chat/simplex/common/views/helpers/AppUpdater.kt` |
 | Window state persistence | Save/restore window position and dimensions | `common/src/desktopMain/kotlin/chat/simplex/common/StoreWindowState.kt` |
 | VLC video playback | Desktop video playback via VLC native libraries | `common/src/desktopMain/kotlin/chat/simplex/common/platform/VideoPlayer.desktop.kt` |
+| Tailscale linked phone | Android retries a trusted direct link during transient network loss while the Linux desktop listener remains owned; app restart requires a fresh invitation. [Details](../../../docs/tailscale-device-linking.md) | `common/src/commonMain/kotlin/chat/simplex/common/model/DirectLinkReconnect.kt` |
 | Desktop app entry | Main function, Haskell init, VLC loading | `desktop/src/jvmMain/kotlin/chat/simplex/desktop/Main.kt` |
 | Desktop notification manager | Platform-native desktop notifications | `common/src/desktopMain/kotlin/chat/simplex/common/platform/Notifications.desktop.kt` |
 | Connect mobile device | Pair desktop with a mobile device for remote access | `common/src/commonMain/kotlin/chat/simplex/common/views/remote/ConnectMobileView.kt` |

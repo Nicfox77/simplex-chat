@@ -31,7 +31,8 @@ cabal build -j $targets
 
 # simplexmq's sdist leaves out apps/common/Web/static/.well-known, which smp-server embeds, so it is built from a clone
 simplexmq=$(mktemp -d)/simplexmq
-git clone --quiet --filter=blob:none https://github.com/simplex-chat/simplexmq.git "$simplexmq"
+simplexmq_url=$(awk '/location:.*\/simplexmq.git/ {print $2; exit}' cabal.project)
+git clone --quiet --filter=blob:none "$simplexmq_url" "$simplexmq"
 git -C "$simplexmq" checkout --quiet "$(awk '/simplexmq.git/ {getline; print $2; exit}' cabal.project)"
 git -C "$simplexmq" submodule update --init --quiet
 git -C "$simplexmq" log -1 --format='simplexmq %H %s'

@@ -124,12 +124,13 @@ fun ConnectMobileLayout(
         }
         Box(Modifier.padding(horizontal = DEFAULT_PADDING)) {
           DefaultDropdownMenu(showMenu) {
-            if (host.activeHost) {
+            if (host.sessionState != null) {
               ItemAction(stringResource(MR.strings.disconnect_remote_host), painterResource(MR.images.ic_wifi_off), color = WarningOrange) {
                 stopRemoteHostAndReloadHosts(host, true)
                 showMenu.value = false
               }
-            } else {
+            }
+            if (!host.activeHost) {
               ItemAction(stringResource(MR.strings.delete_verb), painterResource(MR.images.ic_delete), color = Color.Red) {
                 deleteHost(host)
                 showMenu.value = false
@@ -204,7 +205,8 @@ private fun ConnectMobileViewLayout(
 
         UnderQrLayout()
 
-        if (remember { controller.appPrefs.developerTools.state }.value) {
+        val developerTools = remember { controller.appPrefs.developerTools.state }.value
+        if (remoteLinkCanShare(directDeviceLinkingHelp, developerTools, staleQrCode)) {
           val clipboard = LocalClipboardManager.current
           Spacer(Modifier.height(DEFAULT_PADDING_HALF))
           SectionItemView({ clipboard.shareText(invitation) }) {
@@ -253,6 +255,18 @@ fun connectMobileDevice(rh: RemoteHostInfo, connecting: MutableState<Boolean>) {
   } else if (rh.activeHost()) {
     showConnectedMobileDevice(rh) {
       stopRemoteHostAndReloadHosts(rh, true)
+    }
+  } else if (rh.sessionState is RemoteHostSessionState.Connecting) {
+    // A restored listener already owns this port and fresh invitation. Opening
+    // its status must not try to start a second listener or revoke recovery.
+    ModalManager.start.showModalCloseable { _ ->
+      ConnectMobileViewLayout(
+        title = stringResource(MR.strings.waiting_for_mobile_to_connect),
+        invitation = rh.sessionState.invitation,
+        deviceName = rh.hostDeviceName,
+        sessionCode = null,
+        port = rh.bindPort_?.toString()
+      )
     }
   } else {
     showConnectMobileDevice(rh, connecting)
@@ -310,7 +324,7 @@ fun AddingMobileDevice(showTitle: Boolean, staleQrCode: MutableState<Boolean>, c
     deviceName = remoteDeviceName,
     sessionCode = cachedSessionCode,
     port = cachedR?.ctrlPort,
-    staleQrCode = staleQrCode.value || (cachedR.address != customAddress.value && customAddress.value != null) || cachedR.port != customPort.value,
+    staleQrCode = staleQrCode.value || remoteLinkNeedsRefresh(cachedR.address, cachedR.port, customAddress.value, customPort.value),
     refreshQrCode = {
       withBGApi {
         if (chatController.stopRemoteHost(null)) {
@@ -391,7 +405,7 @@ private fun showConnectMobileDevice(rh: RemoteHostInfo, connecting: MutableState
       deviceName = pairing.value?.first?.hostDeviceName ?: rh.hostDeviceName,
       sessionCode = cachedSessionCode,
       port = cachedR?.ctrlPort,
-      staleQrCode = (cachedR.address != customAddress.value && customAddress.value != null) || cachedR.port != customPort.value,
+      staleQrCode = remoteLinkNeedsRefresh(cachedR.address, cachedR.port, customAddress.value, customPort.value),
       refreshQrCode = {
         withBGApi {
           if (chatController.stopRemoteHost(rh.remoteHostId)) {
@@ -509,6 +523,20 @@ private fun UnderQrLayout(cachedR: CR.RemoteHostStarted?, customAddress: Mutable
         portUnsaved.value = portUnsaved.value.copy(text = customPort.value.toString())
       }
     }
+  }
+  if (directDeviceLinkingHelp) {
+    val tailscaleAddress = cachedR.addresses.firstOrNull { it.`interface` == "tailscale0" }
+    if (tailscaleAddress != null && customAddress.value != tailscaleAddress) {
+      SettingsActionItem(
+        painterResource(MR.images.ic_wifi),
+        stringResource(MR.strings.use_tailscale_address),
+        click = { customAddress.value = tailscaleAddress }
+      )
+    }
+    SectionTextFooter(
+      stringResource(MR.strings.remote_link_qr_endpoint).format("${cachedR.address?.address}:${cachedR?.ctrlPort}")
+    )
+    SectionTextFooter(stringResource(MR.strings.remote_link_direct_help))
   }
 }
 
