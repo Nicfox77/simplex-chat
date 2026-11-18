@@ -6096,6 +6096,26 @@ data class RemoteCtrlSession(
     }
 }
 
+data class LinkedDesktop(val remoteCtrl: RemoteCtrlInfo, val session: RemoteCtrlSession?) {
+  val status: LinkedDesktopStatus
+    get() = when (session?.sessionState) {
+      is UIRemoteCtrlSessionState.Connected -> LinkedDesktopStatus.Connected
+      is UIRemoteCtrlSessionState.PendingConfirmation -> LinkedDesktopStatus.PendingConfirmation
+      null -> LinkedDesktopStatus.Disconnected
+      else -> if (remoteCtrl.recoveryEnabled) LinkedDesktopStatus.Reconnecting else LinkedDesktopStatus.Connecting
+    }
+}
+
+enum class LinkedDesktopStatus { Connected, Connecting, Reconnecting, PendingConfirmation, Disconnected }
+
+fun linkedDesktopRows(saved: List<RemoteCtrlInfo>, sessions: Map<Long, RemoteCtrlSession>): List<LinkedDesktop> {
+  val desktops = saved.associateBy { it.remoteCtrlId }.toMutableMap()
+  sessions.values.forEach { session ->
+    session.recoveryCtrl?.let { desktops[it.remoteCtrlId] = it }
+  }
+  return desktops.values.sortedBy { it.remoteCtrlId }.map { LinkedDesktop(it, sessions[it.remoteCtrlId]) }
+}
+
 @Serializable
 sealed class RemoteCtrlSessionState {
   @Serializable @SerialName("starting") object Starting: RemoteCtrlSessionState()

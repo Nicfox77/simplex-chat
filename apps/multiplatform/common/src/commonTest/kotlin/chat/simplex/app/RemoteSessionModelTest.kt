@@ -6,6 +6,7 @@ import kotlinx.serialization.decodeFromString
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -94,5 +95,38 @@ class RemoteSessionModelTest {
     val event = api.result as CR.RemoteCtrlStopped
     kotlin.test.assertEquals(2L, event.remoteCtrlId_)
     kotlin.test.assertEquals(7, event.sessionSeq)
+  }
+
+  @Test
+  fun linkedListShowsBothConnectionsEvenWhenOnlyOneIsSelected() {
+    val first = RemoteCtrlInfo(1, "Laptop", null, recoveryEnabled = true)
+    val second = RemoteCtrlInfo(2, "Laptop", null, recoveryEnabled = true)
+    chatModel.remoteCtrlSessions[1] = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connected(first, "first"))
+    chatModel.remoteCtrlSessions[2] = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connected(second, "second"))
+    chatModel.remoteCtrlSession.value = chatModel.remoteCtrlSessions[2]
+
+    // A just-paired desktop is visible before the saved list refresh completes.
+    val rows = linkedDesktopRows(listOf(first), chatModel.remoteCtrlSessions.toMap())
+    assertEquals(listOf(1L, 2L), rows.map { it.remoteCtrl.remoteCtrlId })
+    assertTrue(rows.all { it.status == LinkedDesktopStatus.Connected })
+  }
+
+  @Test
+  fun linkedListDoesNotKeepDisconnectedDesktopConnectedFromStaleSavedState() {
+    val first = RemoteCtrlInfo(1, "Laptop A", RemoteCtrlSessionState.Connected("old"), recoveryEnabled = true)
+    val second = RemoteCtrlInfo(2, "Laptop B", null, recoveryEnabled = true)
+    val sessions = mapOf(2L to RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connecting(second)))
+    val rows = linkedDesktopRows(listOf(first, second), sessions)
+    assertEquals(listOf(LinkedDesktopStatus.Disconnected, LinkedDesktopStatus.Reconnecting), rows.map { it.status })
+    assertEquals(2L, rows[1].session?.recoveryCtrl?.remoteCtrlId)
+  }
+
+  @Test
+  fun linkedListShowsConfirmationWithoutMarkingTheSessionConnected() {
+    val desktop = RemoteCtrlInfo(3, "Laptop C", null)
+    val session = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.PendingConfirmation(desktop, "code"))
+    val row = linkedDesktopRows(emptyList(), mapOf(3L to session)).single()
+    assertEquals(LinkedDesktopStatus.PendingConfirmation, row.status)
+    assertFalse(row.session!!.active)
   }
 }

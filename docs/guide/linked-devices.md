@@ -38,8 +38,8 @@ code.
 
 On the mobile:
 
-4. Open the profile menu and tap **Use from desktop**. The app opens **Connect
-   to desktop**.
+4. On Android, open the profile menu, tap **Linked desktops**, then **Link a
+   desktop**. On iOS, tap **Use from desktop**. The scanner opens.
 5. Optionally, change **This device name**.
 6. Scan the QR code from the desktop, under **Scan QR code from desktop**.
 7. Compare the session codes: the mobile shows its code under **Verify code with
@@ -75,7 +75,8 @@ After the first link, the mobile and the desktop remember each other.
 
 1. On the desktop, open **Linked mobiles** and click the mobile. The desktop
    shows a QR code (**Scan from mobile**).
-2. On the mobile, open **Use from desktop**:
+2. On Android, open **Linked desktops** and choose **Link a desktop**. On iOS,
+   open **Use from desktop**:
    - If **Discover via local network** is on, the mobile looks for linked
      desktops on the local network ("Waiting for desktop…"). When it finds the
      desktop, it connects, or it shows **Connect** if **Connect automatically**
@@ -101,12 +102,17 @@ reached it.
 ## Several desktops at once
 
 On Android, you can use the phone and up to eight desktops at the same time.
-Pair each desktop separately. While viewing an active desktop connection on the
-phone, choose **Link another desktop** to scan or paste the next invitation.
-The existing connections stay active. Each desktop views the same phone profile,
+Open **Linked desktops** in the Android profile menu to see every paired desktop
+and its current status: **Connected**, **Reconnecting…**, **Connecting**,
+**Waiting for confirmation**, or **Disconnected**. The list includes all live
+connections, even while you view the details of a different desktop.
+
+Choose **Link a desktop** to scan or paste an invitation. Pair each desktop
+separately. After confirmation, the phone returns to the list. The existing
+connections stay active. Each desktop views the same phone profile,
 messages and read state; the phone owns the database and messaging connections.
 
-In **Linked desktops**, select a desktop to view its session. Its long-press menu
+Tap a connected desktop to view its session code and version. Its long-press menu
 can **Disconnect** or **Delete** that desktop independently. Disconnect disables
 its automatic recovery. Delete also removes its pairing. Other desktops and the
 phone continue working. Disconnect every desktop before switching phone profiles.
@@ -131,15 +137,15 @@ local network** on receives it and connects without scanning.
 | Setting | Device | Default | What it does |
 |---|---|---|---|
 | **Discoverable via local network** | Desktop | On | The desktop announces itself to linked mobiles |
-| **Discover via local network** | Mobile | On (iOS), off (Android) | The mobile looks for linked desktops when you open **Use from desktop** |
+| **Discover via local network** | Mobile | On (iOS), off (Android) | The mobile looks for linked desktops when you open the scanner with no active desktop connections |
 | **Connect automatically** | Mobile | On | The mobile connects to a found desktop without asking |
 | **Verify connections** | Mobile | Off | The mobile asks you to confirm the session code each time |
 
 On the desktop, **Discoverable via local network** is on the screen **Link a
-mobile** (**Linked mobiles**). On the mobile, the other settings are in **Use
-from desktop** > **Linked desktops** > **Linked desktop options**; **Linked
-desktops** is shown after you link a desktop, and **Connect automatically** is
-shown while **Discover via local network** is on.
+mobile** (**Linked mobiles**). On Android, the other settings are in **Linked desktops** > **Linked desktop
+options**. On iOS, open **Use from desktop** > **Linked desktops** > **Linked
+desktop options**. **Connect automatically** is shown while **Discover via local
+network** is on.
 
 ## Desktop address and port
 
@@ -175,8 +181,10 @@ On the mobile:
 - On iOS, keep the app open while you use it from the desktop. The session ends
   when the app goes to the background, and the screen of the iPhone stays on
   while the session is active.
-- On Android, closing this screen keeps the linked desktop connected and lets
-  you use the phone at the same time. Use **Disconnect** to end the link.
+- On Android, **Linked desktops** lists every linked computer with its live
+  connection status. Tap a connected computer for its session details. Closing
+  either screen keeps the connections active and lets you use the phone at the
+  same time. Use **Disconnect** to end a selected link.
 
 The database of the mobile, its passphrase and its network settings are managed
 on the mobile.
@@ -187,6 +195,6 @@ on the mobile.
   **Delete**. The files of that mobile that the desktop loaded are deleted too.
   While you use the profiles of the mobile, the menu has **Disconnect** in place
   of **Delete**.
-- On the mobile, open **Use from desktop** > **Linked desktops**. On iOS, swipe
-  the desktop to the left and confirm **Unlink**. On Android, tap and hold the
-  desktop, then tap **Delete**.
+- On Android, open **Linked desktops** in the profile menu, tap and hold a
+  desktop, then tap **Delete**. On iOS, open **Use from desktop** > **Linked
+  desktops**, swipe the desktop to the left and confirm **Unlink**.

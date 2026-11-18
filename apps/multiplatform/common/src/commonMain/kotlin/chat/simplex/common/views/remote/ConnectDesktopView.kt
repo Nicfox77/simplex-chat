@@ -45,11 +45,30 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ConnectDesktopView(close: () -> Unit) {
   val deviceName = remember { controller.appPrefs.deviceNameForRemoteAccess.state }
+  val remoteCtrls = remember { mutableStateListOf<RemoteCtrlInfo>() }
+  val sessions = chatModel.remoteCtrlSessions.toMap()
   ModalView(close = close, cardScreen = true) {
-    ConnectDesktopLayout(
-      deviceName = deviceName.value!!,
-      close
-    )
+    LinkedDesktopsView(remoteCtrls, deviceName.value ?: "")
+  }
+  LaunchedEffect(sessions) { updateRemoteCtrls(remoteCtrls) }
+}
+
+private fun openDesktopSession(session: RemoteCtrlSession? = null) {
+  chatModel.remoteCtrlSession.value = session
+  ModalManager.start.showCustomModal { close ->
+    DesktopSessionView(close, linking = session == null)
+  }
+}
+
+@Composable
+private fun DesktopSessionView(close: () -> Unit, linking: Boolean) {
+  val deviceName = remember { controller.appPrefs.deviceNameForRemoteAccess.state }
+  ModalView(close = close, cardScreen = true) {
+    ConnectDesktopLayout(deviceName.value!!)
+  }
+  val sessionState = chatModel.remoteCtrlSession.value?.sessionState
+  LaunchedEffect(sessionState) {
+    if (linking && sessionState is UIRemoteCtrlSessionState.Connected || !linking && sessionState == null) close()
   }
   val ntfModeService = remember { chatModel.controller.appPrefs.notificationsMode.get() == NotificationsMode.SERVICE }
   DisposableEffect(Unit) {
@@ -63,7 +82,7 @@ fun ConnectDesktopView(close: () -> Unit) {
 }
 
 @Composable
-private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
+private fun ConnectDesktopLayout(deviceName: String) {
   val showConnectScreen = remember { mutableStateOf(true) }
   val sessionAddress = remember { mutableStateOf("") }
   val remoteCtrls = remember { mutableStateListOf<RemoteCtrlInfo>() }
@@ -71,12 +90,12 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
   ColumnWithScrollBar {
     val discovery = if (session == null) null else session.sessionState is UIRemoteCtrlSessionState.Searching
     if (discovery == true || (discovery == null && !showConnectScreen.value)) {
-      SearchingDesktop(deviceName, remoteCtrls)
+      SearchingDesktop(deviceName)
     } else if (session != null) {
       when (session.sessionState) {
         is UIRemoteCtrlSessionState.Starting -> ConnectingDesktop(session, null)
-        is UIRemoteCtrlSessionState.Searching -> SearchingDesktop(deviceName, remoteCtrls)
-        is UIRemoteCtrlSessionState.Found -> FoundDesktop(session, session.sessionState.remoteCtrl, session.sessionState.compatible, remember { controller.appPrefs.connectRemoteViaMulticastAuto.state }, deviceName, remoteCtrls, sessionAddress)
+        is UIRemoteCtrlSessionState.Searching -> SearchingDesktop(deviceName)
+        is UIRemoteCtrlSessionState.Found -> FoundDesktop(session, session.sessionState.remoteCtrl, session.sessionState.compatible, remember { controller.appPrefs.connectRemoteViaMulticastAuto.state }, deviceName, sessionAddress)
         is UIRemoteCtrlSessionState.Connecting -> ConnectingDesktop(session, session.sessionState.remoteCtrl_)
         is UIRemoteCtrlSessionState.PendingConfirmation -> {
           if (controller.appPrefs.confirmRemoteSessions.get() || session.sessionState.remoteCtrl_ == null) {
@@ -90,34 +109,30 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
         }
 
         is UIRemoteCtrlSessionState.Connected -> {
-          ActiveSession(session, session.sessionState.remoteCtrl, close)
-          SettingsActionItem(painterResource(MR.images.ic_add), stringResource(MR.strings.link_another_desktop), click = {
-            chatModel.remoteCtrlSession.value = null
-          })
+          ActiveSession(session, session.sessionState.remoteCtrl)
         }
       }
     } else {
-      ConnectDesktop(deviceName, remoteCtrls, sessionAddress)
+      ConnectDesktop(deviceName, sessionAddress)
     }
     SectionBottomSpacer()
   }
   LaunchedEffect(Unit) {
     setDeviceName(deviceName)
     updateRemoteCtrls(remoteCtrls)
-    val useMulticast = useMulticast(remoteCtrls)
+    val useMulticast = !chatModel.hasHostedSession() && useMulticast(remoteCtrls)
     showConnectScreen.value = !useMulticast
-    // Opening the session controls must not tear down an existing connection.
-    if (!chatModel.hasHostedSession() && useMulticast) {
+    if (useMulticast) {
       findKnownDesktop(showConnectScreen)
     }
   }
 }
 
 @Composable
-private fun ConnectDesktop(deviceName: String, remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, sessionAddress: MutableState<String>) {
+private fun ConnectDesktop(deviceName: String, sessionAddress: MutableState<String>) {
   AppBarTitle(stringResource(MR.strings.connect_to_desktop))
   SectionView(stringResource(MR.strings.this_device_name)) {
-    DevicesView(deviceName, remoteCtrls) {
+    DeviceNameField(deviceName) {
       if (it != "") {
         setDeviceName(it)
         controller.appPrefs.deviceNameForRemoteAccess.set(it)
@@ -176,10 +191,10 @@ private fun ProgressIndicator() {
 }
 
 @Composable
-private fun SearchingDesktop(deviceName: String, remoteCtrls: SnapshotStateList<RemoteCtrlInfo>) {
+private fun SearchingDesktop(deviceName: String) {
   AppBarTitle(stringResource(MR.strings.connecting_to_desktop))
   SectionView(stringResource(MR.strings.this_device_name)) {
-    DevicesView(deviceName, remoteCtrls) {
+    DeviceNameField(deviceName) {
       if (it != "") {
         setDeviceName(it)
         controller.appPrefs.deviceNameForRemoteAccess.set(it)
@@ -201,12 +216,11 @@ private fun FoundDesktop(
   compatible: Boolean,
   connectRemoteViaMulticastAuto: State<Boolean>,
   deviceName: String,
-  remoteCtrls: SnapshotStateList<RemoteCtrlInfo>,
   sessionAddress: MutableState<String>,
 ) {
   AppBarTitle(stringResource(MR.strings.found_desktop))
   SectionView(stringResource(MR.strings.this_device_name)) {
-    DevicesView(deviceName, remoteCtrls) {
+    DeviceNameField(deviceName) {
       if (it != "") {
         setDeviceName(it)
         controller.appPrefs.deviceNameForRemoteAccess.set(it)
@@ -302,7 +316,7 @@ private fun CtrlDeviceVersionText(session: RemoteCtrlSession) {
 }
 
 @Composable
-private fun ActiveSession(session: RemoteCtrlSession, rc: RemoteCtrlInfo, close: () -> Unit) {
+private fun ActiveSession(session: RemoteCtrlSession, rc: RemoteCtrlInfo) {
   AppBarTitle(stringResource(MR.strings.connected_to_desktop))
   SectionView(stringResource(MR.strings.connected_desktop), contentPadding = PaddingValues(horizontal = DEFAULT_PADDING)) {
     Column {
@@ -322,7 +336,7 @@ private fun ActiveSession(session: RemoteCtrlSession, rc: RemoteCtrlInfo, close:
   SectionDividerSpaced()
 
   SectionView {
-    DisconnectButton { disconnectDesktop(close) }
+    DisconnectButton { disconnectDesktop() }
   }
 }
 
@@ -334,17 +348,6 @@ private fun SessionCodeText(code: String) {
       Modifier.padding(start = DEFAULT_PADDING, top = 5.dp, end = DEFAULT_PADDING, bottom = 10.dp),
       style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 16.sp)
     )
-  }
-}
-
-@Composable
-private fun DevicesView(deviceName: String, remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, updateDeviceName: (String) -> Unit) {
-  DeviceNameField(deviceName) { updateDeviceName(it) }
-  if (remoteCtrls.isNotEmpty()) {
-    SectionItemView({ ModalManager.start.showModal { LinkedDesktopsView(remoteCtrls) }
-    }) {
-      Text(generalGetString(MR.strings.linked_desktops))
-    }
   }
 }
 
@@ -405,37 +408,54 @@ private fun DesktopAddressView(sessionAddress: MutableState<String>) {
 }
 
 @Composable
-private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>) {
+private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, deviceName: String? = null) {
+  val desktops = linkedDesktopRows(remoteCtrls, chatModel.remoteCtrlSessions.toMap())
   ColumnWithScrollBar {
     AppBarTitle(stringResource(MR.strings.linked_desktops))
-    SectionView(stringResource(MR.strings.desktop_devices)) {
-      remoteCtrls.forEach { rc ->
-        val showMenu = rememberSaveable { mutableStateOf(false) }
-        SectionItemViewLongClickable(click = {
-          chatModel.remoteCtrlSessions[rc.remoteCtrlId]?.let { chatModel.remoteCtrlSession.value = it }
-        }, longClick = { showMenu.value = true }) {
-          RemoteCtrl(rc)
-          DefaultDropdownMenu(showMenu) {
-            if (chatModel.remoteCtrlSessions[rc.remoteCtrlId] != null || rc.sessionState != null) {
-              ItemAction(stringResource(MR.strings.disconnect_remote_host), painterResource(MR.images.ic_close)) {
-                showMenu.value = false
-                withBGApi { controller.stopRemoteCtrl(rc.remoteCtrlId); updateRemoteCtrls(remoteCtrls) }
-              }
-            }
-            if (rc.recoveryEnabled) {
-              ItemAction(stringResource(MR.strings.remote_link_recovery_address), painterResource(MR.images.ic_edit)) {
-                showMenu.value = false
-                showRecoveryAddress(rc)
-              }
-            }
-            ItemAction(stringResource(MR.strings.delete_verb), painterResource(MR.images.ic_delete), color = Color.Red) {
-              unlinkDesktop(remoteCtrls, rc)
-              showMenu.value = false
-            }
+    if (deviceName != null) {
+      SectionView(stringResource(MR.strings.this_device_name)) {
+        DeviceNameField(deviceName) { name ->
+          if (name.isNotEmpty()) {
+            setDeviceName(name)
+            controller.appPrefs.deviceNameForRemoteAccess.set(name)
           }
         }
-
       }
+      SectionDividerSpaced()
+    }
+    SectionView(stringResource(MR.strings.desktop_devices)) {
+      if (desktops.isEmpty()) SectionTextFooter(stringResource(MR.strings.no_linked_desktops))
+      desktops.forEach { desktop ->
+        key(desktop.remoteCtrl.remoteCtrlId) {
+          val rc = desktop.remoteCtrl
+          val showMenu = rememberSaveable { mutableStateOf(false) }
+          SectionItemViewLongClickable(click = {
+            desktop.session?.let { openDesktopSession(it) } ?: run { showMenu.value = true }
+          }, longClick = { showMenu.value = true }) {
+            RemoteCtrl(desktop)
+            DefaultDropdownMenu(showMenu) {
+              if (desktop.session != null) {
+                ItemAction(stringResource(MR.strings.disconnect_remote_host), painterResource(MR.images.ic_close)) {
+                  showMenu.value = false
+                  withBGApi { controller.stopRemoteCtrl(rc.remoteCtrlId); updateRemoteCtrls(remoteCtrls) }
+                }
+              }
+              if (rc.recoveryEnabled) {
+                ItemAction(stringResource(MR.strings.remote_link_recovery_address), painterResource(MR.images.ic_edit)) {
+                  showMenu.value = false
+                  showRecoveryAddress(rc)
+                }
+              }
+              ItemAction(stringResource(MR.strings.delete_verb), painterResource(MR.images.ic_delete), color = Color.Red) {
+                unlinkDesktop(remoteCtrls, rc)
+                showMenu.value = false
+              }
+            }
+          }
+
+        }
+      }
+      SettingsActionItem(painterResource(MR.images.ic_add), stringResource(MR.strings.link_a_desktop), click = { openDesktopSession() })
     }
     SectionDividerSpaced()
 
@@ -482,8 +502,23 @@ private fun showRecoveryAddress(rc: RemoteCtrlInfo) {
 }
 
 @Composable
-private fun RemoteCtrl(rc: RemoteCtrlInfo) {
-  Text(rc.deviceViewName)
+private fun RowScope.RemoteCtrl(desktop: LinkedDesktop) {
+  Icon(painterResource(MR.images.ic_desktop), null, tint = MaterialTheme.colors.secondary)
+  TextIconSpaced(false)
+  Column(Modifier.weight(1f)) {
+    Text(desktop.remoteCtrl.deviceViewName)
+    val status = when (desktop.status) {
+      LinkedDesktopStatus.Connected -> MR.strings.linked_desktop_connected
+      LinkedDesktopStatus.Connecting -> MR.strings.linked_desktop_connecting
+      LinkedDesktopStatus.Reconnecting -> MR.strings.linked_desktop_reconnecting
+      LinkedDesktopStatus.PendingConfirmation -> MR.strings.linked_desktop_pending_confirmation
+      LinkedDesktopStatus.Disconnected -> MR.strings.linked_desktop_disconnected
+    }
+    Text(stringResource(status), style = MaterialTheme.typography.body2, color = MaterialTheme.colors.secondary)
+  }
+  if (desktop.status == LinkedDesktopStatus.Connected) {
+    Icon(painterResource(MR.images.ic_done_filled), null, Modifier.size(20.dp), tint = MaterialTheme.colors.primary)
+  }
 }
 
 private fun setDeviceName(name: String) {
@@ -566,19 +601,17 @@ private fun DisconnectButton(label: String = generalGetString(MR.strings.disconn
 private fun useMulticast(remoteCtrls: List<RemoteCtrlInfo>): Boolean =
   controller.appPrefs.connectRemoteViaMulticast.get() && remoteCtrls.isNotEmpty()
 
-private fun disconnectDesktop(close: (() -> Unit)? = null) {
+private fun disconnectDesktop() {
   withBGApi {
     controller.stopRemoteCtrl()
     chatModel.remoteCtrlSession.value = null
     if (controller.appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
-    close?.invoke()
   }
 }
 
 private fun unlinkDesktop(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, rc: RemoteCtrlInfo) {
   withBGApi {
-    controller.deleteRemoteCtrl(rc.remoteCtrlId)
-    remoteCtrls.removeAll { it.remoteCtrlId == rc.remoteCtrlId }
+    if (controller.deleteRemoteCtrl(rc.remoteCtrlId)) remoteCtrls.removeAll { it.remoteCtrlId == rc.remoteCtrlId }
   }
 }
 

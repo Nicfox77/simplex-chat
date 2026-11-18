@@ -32,7 +32,7 @@ explicitly disconnect and unlink to verify that recovery stops.
    select `tailscale0` (or **Use Tailscale address**), and press **Refresh**.
 3. Check **Address in QR code**. A fixed unused TCP port above 1023 is useful for
    tailnet/firewall rules; an initially random port is also saved after pairing.
-4. On Android, open **Use from desktop**, scan the QR or paste the full `xrcp:`
+4. On Android, open **Linked desktops**, choose **Link a desktop**, scan the QR or paste the full `xrcp:`
    invitation, and verify the first session code through a trusted channel.
 
 Selecting the tailnet address and verifying the session enables restart recovery

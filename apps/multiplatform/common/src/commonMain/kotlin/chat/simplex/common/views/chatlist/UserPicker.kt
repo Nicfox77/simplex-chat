@@ -376,7 +376,7 @@ private fun GlobalSettingsSection(
   val stopped = remember { chatModel.chatRunning }.value == false
 
   if (appPlatform.isAndroid) {
-    val text = generalGetString(MR.strings.settings_section_title_use_from_desktop).lowercase().capitalize(Locale.current)
+    val text = stringResource(MR.strings.linked_desktops)
 
     UserPickerOptionRow(
       painterResource(MR.images.ic_desktop),
