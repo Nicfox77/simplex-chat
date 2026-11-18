@@ -1771,7 +1771,7 @@ multipleDesktopMessagesTest = testMultipleDesktops $ \_ mobile desktop second bo
   replicateM_ 3 $ getTermLine bob
   forM_ [local, first, other] $ \command -> do
     (_, items, _, _) <- uiSnapshot command
-    forM_ (zip ids ["phone", "first desktop", "second desktop"]) $ \(itemId, text) -> lookup itemId items `shouldBe` Just text
+    forM_ (zip ids ["phone", "first desktop", "second desktop"]) $ \(chatItemId, text) -> lookup chatItemId items `shouldBe` Just text
   first ("/_update item @2 " <> show (head ids) <> " text edited on desktop") >>= \r ->
     r `shouldSatisfy` \case Right Controller.CRChatItemUpdated {} -> True; _ -> False
   other ("/_delete item @2 " <> show (ids !! 1) <> " internal") >>= \r ->
