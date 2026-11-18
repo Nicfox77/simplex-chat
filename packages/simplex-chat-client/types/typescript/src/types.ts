@@ -3835,7 +3835,7 @@ export interface NamePrice {
   years: number // int
 }
 
-export type NameWarning = 
+export type NameWarning =
   | NameWarning.Expired
   | NameWarning.Available
   | NameWarning.ReservedForCommunity
@@ -4826,7 +4826,7 @@ export interface SimplexDomainClaim {
   proof?: SimplexDomainProof
 }
 
-export type SimplexDomainError = 
+export type SimplexDomainError =
   | SimplexDomainError.NoValidLink
   | SimplexDomainError.UnknownDomain
   | SimplexDomainError.NameWarning
