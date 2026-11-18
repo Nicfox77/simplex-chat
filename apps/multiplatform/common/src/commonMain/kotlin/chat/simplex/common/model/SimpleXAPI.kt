@@ -2956,14 +2956,31 @@ object ChatController {
     else -> false
   }
 
+  private suspend fun resetPairingAttempt(owner: DirectOwner) {
+    val previous = owner.sequence ?: return
+    synchronized(directOwners) {
+      retiredSequences.add(previous)
+      owner.remoteId?.let { if (directOwners[it] === owner) directOwners.remove(it) }
+    }
+    owner.remoteId?.let { chatModel.remoteCtrlSessions.remove(it) }
+    owner.sequence = null
+    owner.remoteId = null
+    sendCmd(null, CC.StopRemoteCtrlSession(previous), owner.nativeCtrl)
+  }
+
   suspend fun connectRemoteCtrl(desktopAddress: String): Pair<SomeRemoteCtrl?, ChatError?> {
     val owner = currentPairingOwner()
     return owner.retries.replace {
+      resetPairingAttempt(owner)
       publishDirectOwner(owner, RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connecting()))
       owner.nativeCtrl = getChatCtrl()
       val r = sendCmd(null, CC.ConnectRemoteCtrl(desktopAddress), owner.nativeCtrl)
       when {
         r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
+          if (owner.revoked || owner.coreGeneration != directCoreGeneration) {
+            sendCmd(null, CC.AbortRemoteCtrl(r.res.sessionSeq), owner.nativeCtrl)
+            return@replace null to null
+          }
           owner.remoteId = r.res.remoteCtrl_?.remoteCtrlId
           if (owner.remoteId != null) registerDirectOwner(owner)
           publishDirectOwner(owner, owner.session.copy(ctrlAppInfo = r.res.ctrlAppInfo, appVersion = r.res.appVersion,
@@ -2984,6 +3001,7 @@ object ChatController {
   suspend fun findKnownRemoteCtrl(): Boolean {
     val owner = currentPairingOwner()
     return owner.retries.replace {
+      resetPairingAttempt(owner)
       owner.nativeCtrl = getChatCtrl()
       publishDirectOwner(owner, RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Searching))
       val r = sendCmd(null, CC.FindKnownRemoteCtrl(), owner.nativeCtrl)
@@ -2997,10 +3015,14 @@ object ChatController {
   }
 
   suspend fun confirmRemoteCtrl(rcId: Long): Pair<SomeRemoteCtrl?, ChatError?> {
-    val r = sendCmd(null, CC.ConfirmRemoteCtrl(remoteCtrlId = rcId))
+    val owner = currentPairingOwner()
+    val r = sendCmd(null, CC.ConfirmRemoteCtrl(remoteCtrlId = rcId), owner.nativeCtrl)
     return when {
       r is API.Result && r.res is CR.RemoteCtrlConnecting -> {
-        val owner = currentPairingOwner()
+        if (owner.revoked || owner.coreGeneration != directCoreGeneration) {
+          sendCmd(null, CC.AbortRemoteCtrl(r.res.sessionSeq), owner.nativeCtrl)
+          return null to null
+        }
         owner.remoteId = r.res.remoteCtrl_?.remoteCtrlId
         registerDirectOwner(owner)
         publishDirectOwner(owner, owner.session.copy(ctrlAppInfo = r.res.ctrlAppInfo, appVersion = r.res.appVersion,

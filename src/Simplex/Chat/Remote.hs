@@ -919,7 +919,7 @@ handleStoreFile rfKN fileName fileSize fileDigest getChunk =
     storeFileTo :: FilePath -> CM' (Either RemoteProtocolError FilePath)
     storeFileTo dir = do
       gate <- asks remoteFileNameGate
-      liftIO . mask $ \restore -> do
+      liftIO $ mask $ \restore -> do
         reserved <- withCommandGate gate . tryAllErrors' $ do
           unless (validRemoteFileName fileName) $ throwError $ RPEInvalidBody "invalid file name"
           filePath <- liftIO $ dir `uniqueCombine` fileName
@@ -1068,7 +1068,7 @@ commitRemoteCtrlPairing sseq ctrlName rcCtrlPairing endpoint = do
           $ modifyTVar' sessionVar
           $ M.adjust
             ( \session -> case session of
-                pending@RCSessionPendingConfirmation {} -> pending {remoteCtrlId_ = Just remoteCtrlId}
+                pending@RCSessionPendingConfirmation {} -> (pending :: RemoteCtrlSession) {remoteCtrlId_ = Just remoteCtrlId}
                 other -> other
             )
             sseq
