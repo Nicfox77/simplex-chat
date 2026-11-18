@@ -977,7 +977,7 @@ verifyRemoteCtrlSession execCC sessCode' = do
     do
       sessions <- M.toList <$> chatReadVar remoteCtrlSessions
       let pending = [(seqNo, session) | (seqNo, session@RCSessionPendingConfirmation {}) <- sessions]
-          matching = filter (\(_, RCSessionPendingConfirmation {sessionCode}) -> sameVerificationCode sessCode' sessionCode) pending
+          matching = [entry | entry@(_, RCSessionPendingConfirmation {sessionCode}) <- pending, sameVerificationCode sessCode' sessionCode]
           selected = case matching of [one] -> Just one; _ -> case pending of [one] -> Just one; _ -> Nothing
       case selected of
         Just (seqNo, RCSessionPendingConfirmation {rcsClient, ctrlDeviceName, sessionCode, rcsWaitConfirmation, recoveryEndpoint}) ->
