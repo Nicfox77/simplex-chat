@@ -499,6 +499,7 @@ export namespace CEvt {
     rcsState: T.RemoteCtrlSessionState
     rcStopReason: T.RemoteCtrlStopReason
     sessionSeq: number // int
+    remoteCtrlId_?: number // int64
   }
 
   export interface MessageError extends Interface {

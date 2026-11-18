@@ -47,6 +47,7 @@ import Simplex.Chat.Terminal.Output (markChatItemRead, remoteReadCommand)
 import Simplex.Chat.Types (User (..))
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFile (..), CryptoFileArgs (..))
+import qualified Simplex.Messaging.Crypto.File as CF
 import Simplex.Messaging.Encoding (smpEncode)
 import Simplex.Messaging.Encoding.String (strDecode, strEncode)
 import qualified Simplex.Messaging.TMap as TM
@@ -1792,22 +1793,24 @@ multipleDesktopMessagesTest = testMultipleDesktops $ \_ mobile desktop second bo
   other "/_read chat @2" >>= expectOwnerOK
   forM_ [local, first, other] $ \command -> uiSnapshot command >>= (\(_, _, unread, _) -> unread `shouldBe` 0)
   let phoneFiles = tmpFile mobile "parallel-uploads"
-      firstFiles = tmpFile desktop "upload-input"
-      otherFiles = tmpFile second "upload-input"
+      firstFiles = tmpFile desktop "first-upload-input"
+      otherFiles = tmpFile second "second-upload-input"
   forM_ [phoneFiles, firstFiles, otherFiles] $ createDirectoryIfMissing True
   local ("/_files_folder " <> phoneFiles) >>= expectOwnerOK
+  ownerCommand desktop Controller.CSLocal ("/_temp_folder " <> firstFiles </> "tmp") >>= expectOwnerOK
+  ownerCommand second Controller.CSLocal ("/_temp_folder " <> otherFiles </> "tmp") >>= expectOwnerOK
   B.writeFile (firstFiles </> "same.txt") "first desktop attachment"
   B.writeFile (otherFiles </> "same.txt") "second desktop attachment"
   (a, b) <-
     concurrently
       (ownerCommand desktop Controller.CSLocal $ "/store remote file 1 " <> firstFiles </> "same.txt")
       (ownerCommand second Controller.CSLocal $ "/store remote file 1 " <> otherFiles </> "same.txt")
-  let path = \case Right (Controller.CRRemoteFileStored _ CryptoFile {filePath}) -> pure filePath; result -> fail $ show result
-  aPath <- path a
-  bPath <- path b
+  let storedFile = \case Right (Controller.CRRemoteFileStored _ cf) -> pure cf; result -> fail $ show result
+  aFile@CryptoFile {filePath = aPath} <- storedFile a
+  bFile@CryptoFile {filePath = bPath} <- storedFile b
   aPath `shouldNotBe` bPath
-  B.readFile (phoneFiles </> aPath) `shouldReturn` "first desktop attachment"
-  B.readFile (phoneFiles </> bPath) `shouldReturn` "second desktop attachment"
+  runExceptT (CF.readFile aFile {filePath = phoneFiles </> aPath}) `shouldReturn` Right "first desktop attachment"
+  runExceptT (CF.readFile bFile {filePath = phoneFiles </> bPath}) `shouldReturn` Right "second desktop attachment"
 
 multipleDesktopRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 multipleDesktopRecoveryTest = testMultipleDesktops $ \compress mobile desktop second bob -> do

@@ -845,6 +845,7 @@ Remote controller session stopped.
 - rcsState: [RemoteCtrlSessionState](./TYPES.md#remotectrlsessionstate)
 - rcStopReason: [RemoteCtrlStopReason](./TYPES.md#remotectrlstopreason)
 - sessionSeq: int
+- remoteCtrlId_: int64?
 
 ---
 

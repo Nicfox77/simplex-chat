@@ -334,6 +334,7 @@ class RemoteCtrlStopped(TypedDict):
     rcsState: "T.RemoteCtrlSessionState"
     rcStopReason: "T.RemoteCtrlStopReason"
     sessionSeq: int  # int
+    remoteCtrlId_: NotRequired[int]  # int64
 
 class MessageError(TypedDict):
     type: Literal["messageError"]
