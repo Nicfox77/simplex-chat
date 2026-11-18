@@ -384,7 +384,8 @@ restoreCalls = do
   savedCalls <- fromRight [] <$> runExceptT (withFastStore' $ \db -> expireCalls db cutoffTs >> getCalls db)
   let callsMap = M.fromList $ map (\call@Call {contactId} -> (contactId, call)) savedCalls
   calls <- asks currentCalls
-  atomically $ writeTVar calls callsMap
+  owners <- asks callOwners
+  atomically $ writeTVar calls callsMap >> writeTVar owners M.empty
 
 stopChatController :: ChatController -> IO ()
 stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, currentRemoteHost, remoteHostSessions, remoteCtrlSessions, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
@@ -448,8 +449,8 @@ execChatCommand src s retryNum =
       CSRemoteHost rhId
         | allowRemoteCommand cmd -> execRemoteCommand rhId cmd s retryNum
         | otherwise -> pure $ Left $ ChatErrorRemoteHost (RHId rhId) $ RHELocalCommand
-      CSRemoteCtrl
-        | allowRemoteCommand cmd -> execLocal cmd
+      CSRemoteCtrl sseq
+        | allowRemoteCommand cmd -> local (\cc -> cc {callCommandOwner = CORemote sseq}) $ execLocal cmd
         | otherwise -> pure $ Left $ ChatErrorRemoteCtrl $ RCEProtocolError $ RPEInvalidBody "prohibited command"
       CSLocal -> execLocal cmd
   where
@@ -457,7 +458,7 @@ execChatCommand src s retryNum =
       cc@ChatController {config = ChatConfig {chatHooks}} <- ask
       enabled <- chatReadVar' simultaneousUI
       let remoteIdentity = case src of
-            CSRemoteCtrl -> enabled && profileLifecycleCommand cmd
+            CSRemoteCtrl _ -> enabled && profileLifecycleCommand cmd
             _ -> False
       -- Remote identity mutations must fail before taking the profile gate:
       -- an admitted request owns a lease which a local post-unlink profile
@@ -1676,6 +1677,9 @@ processChatCommand cxt nm = \case
       then do
         calls <- asks currentCalls
         withContactLock "sendCallInvitation" contactId $ do
+          owner <- asks callCommandOwner
+          checkCallSession owner
+          atomically (TM.lookup contactId calls) >>= mapM_ (checkCallOwner False)
           g <- asks random
           callId <- atomically $ CallId <$> C.randomBytes 16 g
           callUUID <- UUID.toText <$> liftIO V4.nextRandom
@@ -1686,7 +1690,11 @@ processChatCommand cxt nm = \case
           (msg, _) <- sendDirectContactMessage user ct (XCallInv callId invitation)
           ci <- saveSndChatItem user (CDDirectSnd ct) msg (CISndCall CISCallPending 0)
           let call' = Call {contactId, callId, callUUID, chatItemId = chatItemId' ci, callState, callTs = chatItemTs' ci}
-          call_ <- atomically $ TM.lookupInsert contactId call' calls
+          owners <- asks callOwners
+          call_ <- atomically $ do
+            old <- TM.lookupInsert contactId call' calls
+            TM.insert contactId (callId, owner) owners
+            pure old
           forM_ call_ $ \call -> updateCallItemStatus user ct call WCSDisconnected Nothing
           toView $ CEvtNewChatItems user [AChatItem SCTDirect SMDSnd (DirectChat ct) ci]
           ok user
@@ -1694,9 +1702,15 @@ processChatCommand cxt nm = \case
   SendCallInvitation cName callType -> withUser $ \user -> do
     contactId <- withFastStore $ \db -> getContactIdByName db user cName
     processChatCommand cxt nm $ APISendCallInvitation contactId callType
+  APIClaimCall contactId expectedUUID -> withCurrentCall contactId True $ \_ _ call@Call {callUUID, callState} ->
+    if callUUID /= expectedUUID
+      then throwChatError CENoCurrentCall
+      else case callState of
+        CallInvitationReceived {} -> pure $ Just call
+        _ -> throwChatError . CECallState $ callStateTag callState
   APIRejectCall contactId ->
     -- party accepting call
-    withCurrentCall contactId $ \user ct Call {chatItemId, callState} -> case callState of
+    withCurrentCall contactId True $ \user ct Call {chatItemId, callState} -> case callState of
       CallInvitationReceived {} -> do
         let aciContent = ACIContent SMDRcv $ CIRcvCall CISCallRejected 0
         withFastStore' $ \db -> setDirectChatItemRead db user contactId chatItemId
@@ -1708,7 +1722,7 @@ processChatCommand cxt nm = \case
       _ -> throwChatError . CECallState $ callStateTag callState
   APISendCallOffer contactId WebRTCCallOffer {callType, rtcSession} ->
     -- party accepting call
-    withCurrentCall contactId $ \user ct call@Call {callId, chatItemId, callState} -> case callState of
+    withCurrentCall contactId True $ \user ct call@Call {callId, chatItemId, callState} -> case callState of
       CallInvitationReceived {peerCallType, localDhPubKey, sharedKey, callVersion} -> do
         let callDhPubKey = if encryptedCall callType then localDhPubKey else Nothing
             offer = CallOffer {callType, rtcSession, callDhPubKey, callVersion}
@@ -1721,7 +1735,7 @@ processChatCommand cxt nm = \case
       _ -> throwChatError . CECallState $ callStateTag callState
   APISendCallAnswer contactId rtcSession ->
     -- party initiating call
-    withCurrentCall contactId $ \user ct call@Call {callId, chatItemId, callState} -> case callState of
+    withCurrentCall contactId False $ \user ct call@Call {callId, chatItemId, callState} -> case callState of
       CallOfferReceived {localCallType, peerCallType, peerCallSession, sharedKey} -> do
         let callState' = CallNegotiated {localCallType, peerCallType, localCallSession = rtcSession, peerCallSession, sharedKey}
             aciContent = ACIContent SMDSnd $ CISndCall CISCallNegotiated 0
@@ -1731,7 +1745,7 @@ processChatCommand cxt nm = \case
       _ -> throwChatError . CECallState $ callStateTag callState
   APISendCallExtraInfo contactId rtcExtraInfo ->
     -- any call party
-    withCurrentCall contactId $ \user ct call@Call {callId, callState} -> case callState of
+    withCurrentCall contactId False $ \user ct call@Call {callId, callState} -> case callState of
       CallOfferSent {localCallType, peerCallType, localCallSession, sharedKey} -> do
         -- TODO update the list of ice servers in localCallSession
         void . sendDirectContactMessage user ct $ XCallExtra callId CallExtraInfo {rtcExtraInfo}
@@ -1745,13 +1759,15 @@ processChatCommand cxt nm = \case
       _ -> throwChatError . CECallState $ callStateTag callState
   APIEndCall contactId ->
     -- any call party
-    withCurrentCall contactId $ \user ct call@Call {callId} -> do
+    withCurrentCall contactId False $ \user ct call@Call {callId} -> do
       (SndMessage {msgId}, _) <- sendDirectContactMessage user ct (XCallEnd callId)
       updateCallItemStatus user ct call WCSDisconnected $ Just msgId
       pure Nothing
   APIGetCallInvitations -> withUser' $ \_ -> lift $ do
-    calls <- asks currentCalls >>= readTVarIO
-    let invs = mapMaybe callInvitation $ M.elems calls
+    ChatController {currentCalls = callsVar, callOwners = ownersVar} <- ask
+    (calls, owners) <- atomically $ (,) <$> readTVar callsVar <*> readTVar ownersVar
+    let unclaimed Call {contactId, callId} = maybe True ((/= callId) . fst) $ M.lookup contactId owners
+        invs = mapMaybe callInvitation $ filter unclaimed $ M.elems calls
     rcvCallInvitations <- rights <$> mapM rcvCallInvitation invs
     pure $ CRCallInvitations rcvCallInvitations
     where
@@ -1763,7 +1779,7 @@ processChatCommand cxt nm = \case
         contact <- getContact db cxt user contactId
         pure RcvCallInvitation {user, contact, callType = peerCallType, sharedKey, callUUID, callTs}
   APICallStatus contactId receivedStatus ->
-    withCurrentCall contactId $ \user ct call ->
+    withCurrentCall contactId False $ \user ct call ->
       updateCallItemStatus user ct call receivedStatus Nothing $> Just call
   APIUpdateProfile userId profile -> withUserProfileLock "updateProfile" $ withUserId userId (`updateProfile` profile)
   APISetUserDomain userId strDomain_ -> withUserProfileLock "setUserDomain" $ withUserId userId $ \user@User {profile = p@LocalProfile {contactLink, contactDomain}} -> do
@@ -3903,7 +3919,7 @@ processChatCommand cxt nm = \case
   ConfirmRemoteCtrl rcId -> withUser_ $ do
     (rc, ctrlAppInfo, sessionSeq) <- confirmRemoteCtrl rcId
     pure CRRemoteCtrlConnecting {remoteCtrl_ = Just rc, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
-  VerifyRemoteCtrlSession sessId -> withUser_ $ verifyRemoteCtrlSession (execChatCommand CSRemoteCtrl) sessId
+  VerifyRemoteCtrlSession sessId -> withUser_ $ verifyRemoteCtrlSession (execChatCommand . CSRemoteCtrl) sessId
   StopRemoteCtrl -> withUser_ $ stopRemoteCtrl >> ok_
   StopRemoteCtrlId rcId -> withUser_ $ stopRemoteCtrlFor (Just rcId) >> ok_
   StopPendingRemoteCtrl -> withUser_ $ stopPendingRemoteCtrl >> ok_
@@ -4486,8 +4502,8 @@ processChatCommand cxt nm = \case
         unless applicable $
           throwCmdError $ T.unpack (groupFeatureNameText feature) <> " is not available in " <> (if channel then "channels" else "groups")
       runUpdateGroupProfile user gInfo (update p) False
-    withCurrentCall :: ContactId -> (User -> Contact -> Call -> CM (Maybe Call)) -> CM ChatResponse
-    withCurrentCall ctId action = do
+    withCurrentCall :: ContactId -> Bool -> (User -> Contact -> Call -> CM (Maybe Call)) -> CM ChatResponse
+    withCurrentCall ctId mayClaim action = do
       (user, ct) <- withStore $ \db -> do
         user <- getUserByContactId db ctId
         (user,) <$> getContact db cxt user ctId
@@ -4497,14 +4513,25 @@ processChatCommand cxt nm = \case
           Nothing -> throwChatError CENoCurrentCall
           Just call@Call {contactId}
             | ctId == contactId -> do
+                checkCallOwner mayClaim call
                 call_ <- action user ct call
+                owners <- asks callOwners
+                owner <- asks callCommandOwner
                 case call_ of
                   Just call' -> do
                     unless (isRcvInvitation call') $ withStore' $ \db -> deleteCalls db user ctId
-                    atomically $ TM.insert ctId call' calls
+                    firstClaim <- atomically $ do
+                      saved <- TM.lookup ctId owners
+                      let cid = callId (call :: Call)
+                          unclaimed = maybe True ((/= cid) . fst) saved
+                      TM.insert ctId call' calls
+                      TM.insert ctId (cid, owner) owners
+                      pure unclaimed
+                    when firstClaim $ callClaimed user ct owner
                   _ -> do
                     withStore' $ \db -> deleteCalls db user ctId
-                    atomically $ TM.delete ctId calls
+                    atomically $ TM.delete ctId calls >> TM.delete ctId owners
+                    callClaimed user ct owner
                 ok user
             | otherwise -> throwChatError $ CECallContact contactId
     withServerProtocol :: ProtocolTypeI p => SProtocolType p -> (UserProtocol p => CM a) -> CM a
@@ -7056,6 +7083,7 @@ chatCommandP =
       "/_badge request " *> (APIRequestBadge <$> A.decimal),
       "/_service_response " *> (APISendServiceResponse <$> A.decimal <* A.space <*> strP <* A.space <*> jsonP),
       "/_call invite @" *> (APISendCallInvitation <$> A.decimal <* A.space <*> jsonP),
+      "/_call claim @" *> (APIClaimCall <$> A.decimal <* A.space <*> textP),
       "/call " *> char_ '@' *> (SendCallInvitation <$> displayNameP <*> pure defaultCallType),
       "/_call reject @" *> (APIRejectCall <$> A.decimal),
       "/_call offer @" *> (APISendCallOffer <$> A.decimal <* A.space <*> jsonP),

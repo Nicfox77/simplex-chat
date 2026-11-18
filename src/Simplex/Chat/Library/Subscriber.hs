@@ -3085,8 +3085,12 @@ processAgentMessageConn cxt user@User {userId} entity gks_ corrId agentConnId ag
           -- (and replace it in ChatController)
           -- practically, this should not happen
           withStore' $ \db -> createCall db user call' $ chatItemTs' ci
-          call_ <- atomically (TM.lookupInsert contactId call' calls)
+          owners <- asks callOwners
+          call_ <- atomically $ do
+            TM.delete contactId owners
+            TM.lookupInsert contactId call' calls
           forM_ call_ $ \call -> updateCallItemStatus user ct call WCSDisconnected Nothing
+          when (isJust call_) $ toView $ CEvtCallEnded user ct
           toView $ CEvtCallInvitation RcvCallInvitation {user, contact = ct, callType, sharedKey, callUUID, callTs = chatItemTs' ci}
           toView $ CEvtNewChatItems user [AChatItem SCTDirect SMDRcv cInfo ci]
         saveCallItem status = saveRcvChatItemNoParse user (CDDirectRcv ct) msg brokerTs (CIRcvCall status 0)
@@ -3172,6 +3176,8 @@ processAgentMessageConn cxt user@User {userId} entity gks_ corrId agentConnId ag
                 _ -> do
                   withStore' $ \db -> deleteCalls db user ctId'
                   atomically $ TM.delete ctId' calls
+                  owners <- asks callOwners
+                  atomically $ TM.delete ctId' owners
               forM_ aciContent_ $ \aciContent -> do
                 timed_ <- callTimed ct aciContent
                 updateDirectChatItemView user ct chatItemId aciContent False False timed_ $ Just msgId

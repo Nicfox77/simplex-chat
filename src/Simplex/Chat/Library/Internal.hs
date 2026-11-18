@@ -67,6 +67,7 @@ import Simplex.Chat.Messages.CIContent.Events
 import Simplex.Chat.Operators
 import Simplex.Chat.ProfileGenerator (generateRandomProfile)
 import Simplex.Chat.Protocol
+import Simplex.Chat.Remote.Types (SessionSeq)
 import Simplex.Chat.Store
 import Simplex.Chat.Store.ContactRequest
 import Simplex.Chat.Store.Direct
@@ -696,6 +697,35 @@ contactDeletion :: MsgDirectionI d => SMsgDirection d -> Contact -> ChatItem 'CT
 contactDeletion md ct ci ci' = ChatItemDeletion (ctItem ci) (ctItem <$> ci')
   where
     ctItem = AChatItem SCTDirect md (DirectChat ct)
+
+-- A transport cannot transfer a live WebRTC session to a new authenticated
+-- desktop session. Terminate only calls owned by the departing sequence.
+endRemoteCalls :: SessionSeq -> CM ()
+endRemoteCalls sseq = do
+  owners <- asks callOwners
+  owned <- filter ((== CORemote sseq) . snd . snd) . M.toList <$> readTVarIO owners
+  forM_ owned $ \(ctId, (ownedId, _)) -> withContactLock "endRemoteCall" ctId $ do
+    calls <- asks currentCalls
+    (saved, current) <- atomically $ (,) <$> TM.lookup ctId owners <*> TM.lookup ctId calls
+    case (saved, current) of
+      (Just (cid, CORemote seqNo), Just call@Call {callId}) | cid == ownedId && seqNo == sseq && callId == ownedId -> do
+        atomically $ TM.delete ctId calls >> TM.delete ctId owners
+        -- A deleted profile or failing store must not leave ownership behind
+        -- or prevent cleanup of another departing session.
+        ( do
+            cxt <- chatStoreCxt
+            (user, ct) <- withFastStore $ \db -> do
+              user <- getUserByContactId db ctId
+              (user,) <$> getContact db cxt user ctId
+            (void $ sendDirectContactMessage user ct $ XCallEnd callId) `catchAllErrors` (logError . tshow)
+            updateCallItemStatus user ct call WCSDisconnected Nothing
+            withFastStore' $ \db -> deleteCalls db user ctId
+            toView $ CEvtCallEnded user ct
+          )
+          `catchAllErrors` (logError . tshow)
+      _ -> atomically $ do
+        remainingOwner <- TM.lookup ctId owners
+        when (remainingOwner == Just (ownedId, CORemote sseq)) $ TM.delete ctId owners
 
 updateCallItemStatus :: User -> Contact -> Call -> WebRTCCallStatus -> Maybe MessageId -> CM ()
 updateCallItemStatus user ct@Contact {contactId} Call {chatItemId} receivedStatus msgId_ = do

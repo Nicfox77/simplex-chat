@@ -18,7 +18,8 @@ sufficient.
 The phone's local receiver and each authenticated desktop session have independent
 bounded event queues. Eligible asynchronous events are fanned out atomically to
 all subscribers; they never compete to read the same queue. Platform-store callbacks,
-pairing/lifecycle events and call signalling stay on the phone. Command replies
+pairing/lifecycle events stay on the phone. Call invitations are shared; media
+negotiation goes to the UI running WebRTC. Command replies
 and errors return only through the initiating request. Successful send, edit,
 delete, read/unread, reaction, contact/group and file acceptance mutations publish
 `uiStateChanged` invalidations with protocol version, revision and explicit
@@ -76,14 +77,21 @@ profile. Existing per-chat/entity/store locking remains in use.
   against its own database. Mirrored sent items never create received-message
   notifications. Authoritative read snapshots cancel phone notifications for
   chats whose unread count is zero.
-- The phone alone automatically accepts incoming media using its preferences.
+- The phone alone automatically accepts incoming media attachments using its preferences.
   The desktop can request file acceptance explicitly over XRCP. File bytes and
   paths remain on the phone, and the viewer fetches them through encrypted XRCP.
   Hosting a controller does not make the phone use remote paths. Viewer events
   do not run cleanup against desktop-local paths.
-- The phone owns WebRTC calls; remote call commands and call signalling are not
-  admitted/routed to the viewer. Desktop call controls are disabled while
-  viewing a phone. Transferring a live call between UIs is outside this protocol.
+- Calls can originate on the phone or a linked desktop. Incoming invitations
+  ring on all connected UIs. Before opening media, the answering UI claims the
+  call under the contact lock using its invitation UUID; only one device can
+  claim it, and stale invitations cannot claim a replacement call. The core binds a
+  desktop owner to the authenticated session sequence, never to client input.
+  Initial invitations, including the key needed to answer, are shared with
+  the authorized UIs that can claim the call. Subsequent offers, answers and
+  ICE are routed only to the owner, and other devices stop ringing. Other UIs cannot answer, update or end an owned call. Disconnecting
+  its desktop ends that call, without moving media to the phone or affecting
+  another desktop. Transferring a live call between UIs is outside this protocol.
 - The connection modal starts the Android foreground messaging service. Closing
   it leaves the verified session and phone chat UI running. Service safe-stop
   refuses to stop while a hosted session exists, including when the ordinary
@@ -125,7 +133,8 @@ Multicast discovery needs a network environment that supports it. Matching
 native and Kotlin sources must be built together before testing the apps.
 
 Physical acceptance should cover concurrent send/edit/delete/read, incoming
-files, phone-only notifications and calls, phone backgrounding, network outages,
+files, phone-owned message notifications and device-owned calls, phone
+backgrounding, network outages,
 application restarts, explicit disconnect and unlink during active requests.
 Snapshot detail is bounded to 10,000 items; preserving arbitrary older paging,
 scroll position and very large-chat performance need further validation.

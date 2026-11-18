@@ -9,6 +9,7 @@ module RemoteTests where
 import ChatClient
 import ChatTests.DBUtils
 import qualified ChatTests.DBUtils as DBU
+import ChatTests.Direct (serialize, testCallType, testWebRTCCallOffer, testWebRTCSession)
 import ChatTests.Utils
 import Control.Concurrent.STM (check, retry)
 import Control.Logger.Simple
@@ -30,11 +31,13 @@ import qualified Data.Text as T
 import Data.Word (Word32)
 import qualified Network.Socket as NS
 import Simplex.Chat.Badges.Types (BadgeIssueFailure (BIFServiceTimeout))
+import Simplex.Chat.Call (Call (..), CallState (..))
 import Simplex.Chat.Controller (ChatCommand (..), ChatConfig (..), versionNumber)
 import qualified Simplex.Chat.Controller as Controller
-import Simplex.Chat.Controller.Concurrent (EventBufferClosed (..), closeEventBuffer, eventBufferClosed, newEventBuffer, readEventBuffer, writeEventBuffer)
+import Simplex.Chat.Controller.Concurrent (EventBuffer, EventBufferClosed (..), closeEventBuffer, eventBufferClosed, newEventBuffer, readEventBuffer, writeEventBuffer)
 import Simplex.Chat.Files (safeFileNameStr)
 import Simplex.Chat.Library.Commands (execChatCommand, parseChatCommand)
+import Simplex.Chat.Library.Internal (endRemoteCalls)
 import Simplex.Chat.Messages (AChat (..), AChatItem (..), CIMeta (..), Chat (..), ChatItem (..), ChatRef (..), ChatStats (..), ChatType (..), GroupChatScope (..), aChatItemId, aChatItems, chatInfoToRef)
 import Simplex.Chat.Mobile.File
 import Simplex.Chat.Options (ChatOpts (..))
@@ -256,6 +259,10 @@ runRemoteTests = do
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
   it "sends messages" remoteMessageTest
+  describe "linked calls" $ do
+    it "routes desktop and phone call signalling only to the initiating UI" linkedOutgoingCallsTest
+    it "allows exactly one of the phone and two desktops to answer" linkedIncomingCallsTest
+    it "ends only the disconnected desktop call and preserves other sessions" linkedCallDisconnectTest
   describe "multiple desktops" $ do
     it "shares concurrent phone and two-desktop mutations and isolates same-name uploads" multipleDesktopMessagesTest
     it "recovers one overflowed desktop without interrupting another and revokes only one pairing" multipleDesktopRecoveryTest
@@ -566,7 +573,7 @@ simultaneousLocalOverflowTest = testRemote $ \compress mobile desktop -> do
       r `shouldSatisfy` \case
         Right (Right (Controller.CEvtCustomChatEvent Nothing txt')) -> txt' == txt
         _ -> False
-  runReaderT (Controller.invalidateUI Controller.CSRemoteCtrl) cc
+  runReaderT (Controller.invalidateUI (Controller.CSRemoteCtrl 1)) cc
   atomically (readTBQueue localQueue) >>= \r ->
     r `shouldSatisfy` \case
       (_, Right (Controller.CEvtUiStateChanged 2 _ "remote")) -> True
@@ -778,7 +785,7 @@ remoteUnlinkTest = testRemote $ \compress mobile desktop -> do
   atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBDetached
   -- Revocation also protects a command that would change the owning database.
   usersBefore <- local "/users"
-  rejected <- withRemoteSession oldEvents $ ownerCommand mobile Controller.CSRemoteCtrl "/create user revoked_controller"
+  rejected <- withRemoteSession oldEvents $ ownerCommand mobile (Controller.CSRemoteCtrl 1) "/create user revoked_controller"
   rejected `shouldSatisfy` \case
     Left (RRProtocolError RPESessionClosed) -> True
     _ -> False
@@ -1764,6 +1771,172 @@ testMultipleDesktops test params@((_, compression), ps) =
             when (rcId `elem` connected) $ client <## "remote host 1 stopped"
     )
     params
+
+-- Replace only event destinations, not the live authenticated command paths.
+-- This checks SDP/key/ICE isolation independently of terminal rendering.
+withCapturedCallEvents :: TestCC -> (M.Map SessionSeq (EventBuffer (Either Controller.ChatError Controller.ChatEvent)) -> IO a) -> IO a
+withCapturedCallEvents mobile action = bracket capture restore $ action . fmap snd
+  where
+    sessions = Controller.remoteCtrlSessions $ chatController mobile
+    capture = atomically $ do
+      current <- readTVar sessions
+      captured <- forM current $ \case
+        s@Controller.RCSessionConnected {Controller.remoteOutputQ} -> (remoteOutputQ,) <$> newEventBuffer 128
+        _ -> error "expected connected session"
+      writeTVar sessions $ M.mapWithKey (\seqNo s -> s {Controller.remoteOutputQ = snd $ captured M.! seqNo}) current
+      pure captured
+    restore captured = atomically $ modifyTVar' sessions $ M.mapWithKey $ \seqNo s ->
+      maybe s (\(old, _) -> s {Controller.remoteOutputQ = old}) $ M.lookup seqNo captured
+
+waitCallEvent :: EventBuffer (Either Controller.ChatError Controller.ChatEvent) -> (Controller.ChatEvent -> Bool) -> IO ()
+waitCallEvent events matches = do
+  let loop =
+        atomically (readEventBuffer events) >>= \case
+          Right (Right ev) | matches ev -> pure ()
+          Right _ -> loop
+          Left reason -> expectationFailure $ "closed call stream: " <> show reason
+  Timeout.timeout 5000000 loop `shouldReturn` Just ()
+
+assertNoMediaEvent :: EventBuffer (Either Controller.ChatError Controller.ChatEvent) -> IO ()
+assertNoMediaEvent events = do
+  let drain =
+        atomically ((Just <$> readEventBuffer events) `orElse` pure Nothing) >>= \case
+          Nothing -> pure ()
+          Just (Right (Right ev)) -> case ev of
+            Controller.CEvtCallOffer {} -> expectationFailure "SDP/key leaked to another UI"
+            Controller.CEvtCallAnswer {} -> expectationFailure "answer leaked to another UI"
+            Controller.CEvtCallExtraInfo {} -> expectationFailure "ICE leaked to another UI"
+            _ -> drain
+          Just _ -> drain
+  drain
+
+linkedOutgoingCallsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+linkedOutgoingCallsTest = testMultipleDesktops $ \_ mobile desktop second bob ->
+  withCapturedCallEvents mobile $ \events -> do
+    let local = ownerCommand mobile Controller.CSLocal
+        remote = ownerCommand desktop $ Controller.CSRemoteHost 1
+        other = ownerCommand second $ Controller.CSRemoteHost 1
+        peer = ownerCommand bob Controller.CSLocal
+        firstEvents = snd $ M.findMin events
+        secondEvents = snd $ M.findMax events
+    forM_ [(remote, True), (local, False)] $ \(start, remoteOwns) -> do
+      start ("/_call invite @2 " <> serialize testCallType) >>= expectOwnerOK
+      let incoming =
+            peer "/_call get" >>= \case
+              Right (Controller.CRCallInvitations invs) -> pure $ length invs
+              _ -> pure 0
+      incoming `shouldEventuallyReturn` 1
+      bob <## "alice wants to connect with you via WebRTC video call (e2e encrypted)"
+      replicateM_ 3 $ getTermLine bob
+      peer ("/_call offer @2 " <> serialize testWebRTCCallOffer) >>= expectOwnerOK
+      if remoteOwns
+        then waitCallEvent firstEvents $ \case Controller.CEvtCallOffer {} -> True; _ -> False
+        else do
+          let state =
+                readTVarIO (Controller.currentCalls $ chatController mobile) >>= \calls -> pure $ case M.lookup 2 calls of
+                  Just Call {callState = CallOfferReceived {}} -> True
+                  _ -> False
+          state `shouldEventuallyReturn` True
+          assertNoMediaEvent firstEvents
+          mobile <## "bob accepted your WebRTC video call (e2e encrypted)"
+          replicateM_ 3 $ getTermLine mobile
+      assertNoMediaEvent secondEvents
+      (if remoteOwns then local else remote) "/_call end @2" >>= expectCallOwnedElsewhere
+      other "/_call status @2 connected" >>= expectCallOwnedElsewhere
+      start ("/_call answer @2 " <> serialize testWebRTCSession) >>= expectOwnerOK
+      bob <## "alice continued the WebRTC call"
+      replicateM_ 3 $ getTermLine bob
+      let negotiated =
+            readTVarIO (Controller.currentCalls $ chatController bob) >>= \calls -> pure $ case M.lookup 2 calls of
+              Just Call {callState = CallNegotiated {}} -> True
+              _ -> False
+      negotiated `shouldEventuallyReturn` True
+      peer "/_call extra @2 {\"rtcSession\":\"{}\",\"rtcIceCandidates\":\"[]\"}" >>= expectOwnerOK
+      when remoteOwns $ waitCallEvent firstEvents $ \case Controller.CEvtCallExtraInfo {} -> True; _ -> False
+      unless remoteOwns $ mobile <## "call extra info from bob"
+      assertNoMediaEvent secondEvents
+      start "/_call end @2" >>= expectOwnerOK
+      bob <## "call with alice ended"
+      when remoteOwns $ mobile <## "call with bob ended"
+      (M.null <$> readTVarIO (Controller.currentCalls $ chatController bob)) `shouldEventuallyReturn` True
+
+expectCallOwnedElsewhere :: Either Controller.ChatError Controller.ChatResponse -> IO ()
+expectCallOwnedElsewhere r =
+  r `shouldSatisfy` \case
+    Left (Controller.ChatError Controller.CEHasCurrentCall) -> True
+    _ -> False
+
+linkedIncomingCallsTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+linkedIncomingCallsTest = testMultipleDesktops $ \_ mobile desktop second bob ->
+  withCapturedCallEvents mobile $ \_ -> do
+    let commands = [ownerCommand mobile Controller.CSLocal, ownerCommand desktop (Controller.CSRemoteHost 1), ownerCommand second (Controller.CSRemoteHost 1)]
+        peer = ownerCommand bob Controller.CSLocal
+        pendingCount command =
+          command "/_call get" >>= \case
+            Right (Controller.CRCallInvitations invs) -> pure $ length invs
+            _ -> pure (-1)
+    peer ("/_call invite @2 " <> serialize testCallType) >>= expectOwnerOK
+    forM_ commands $ \command -> pendingCount command `shouldEventuallyReturn` 1
+    mobile <## "bob wants to connect with you via WebRTC video call (e2e encrypted)"
+    replicateM_ 3 $ getTermLine mobile
+    head commands "/_call claim @2 stale-invitation" >>= \r ->
+      r `shouldSatisfy` \case Left (Controller.ChatError Controller.CENoCurrentCall) -> True; _ -> False
+    pendingCount (head commands) `shouldReturn` 1
+    Just Call {callUUID} <- atomically $ TM.lookup 2 $ Controller.currentCalls $ chatController mobile
+    replies <- mapConcurrently ($ ("/_call claim @2 " <> T.unpack callUUID)) commands
+    let won (Right Controller.CRCmdOk {}) = True
+        won _ = False
+    length (filter won replies) `shouldBe` 1
+    unless (won $ head replies) $ mobile <## "call with bob ended"
+    forM_ (zip commands replies) $ \(command, reply) -> do
+      pendingCount command `shouldReturn` 0
+      unless (won reply) $ do
+        expectCallOwnedElsewhere reply
+        command "/_call end @2" >>= expectCallOwnedElsewhere
+        command ("/_call offer @2 " <> serialize testWebRTCCallOffer) >>= expectCallOwnedElsewhere
+    let winner = fst $ head $ filter (won . snd) $ zip commands replies
+    winner ("/_call offer @2 " <> serialize testWebRTCCallOffer) >>= expectOwnerOK
+    bob <## "alice accepted your WebRTC video call (e2e encrypted)"
+    replicateM_ 3 $ getTermLine bob
+    winner "/_call end @2" >>= expectOwnerOK
+    bob <## "call with alice ended"
+    unless (won $ head replies) $ mobile <## "call with bob ended"
+    M.null <$> readTVarIO (Controller.callOwners $ chatController mobile) `shouldReturn` True
+
+linkedCallDisconnectTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+linkedCallDisconnectTest = testMultipleDesktops $ \_ mobile desktop second bob ->
+  withCapturedCallEvents mobile $ \_ -> do
+    let remote = ownerCommand desktop $ Controller.CSRemoteHost 1
+    remote ("/_call invite @2 " <> serialize testCallType) >>= expectOwnerOK
+    bob <## "alice wants to connect with you via WebRTC video call (e2e encrypted)"
+    replicateM_ 3 $ getTermLine bob
+    let cc = chatController mobile
+    Just savedCall@Call {callId = savedCallId} <- atomically $ TM.lookup 2 $ Controller.currentCalls cc
+    sessions <- readTVarIO $ Controller.remoteCtrlSessions $ chatController mobile
+    let seqNo = fst $ head [(sseq, s) | (sseq, s@Controller.RCSessionConnected {Controller.remoteCtrlId = 1}) <- M.toList sessions]
+    runRemote mobile $ Remote.stopRemoteCtrlSession seqNo
+    bob <## "call with alice ended"
+    mobile <## "call with bob ended"
+    mobile <## "remote controller stopped"
+    desktop <## "remote host 1 stopped"
+    (M.null <$> readTVarIO (Controller.currentCalls $ chatController mobile)) `shouldReturn` True
+    (M.null <$> readTVarIO (Controller.callOwners $ chatController mobile)) `shouldReturn` True
+    -- A deleted contact cannot keep a failed disconnect cleanup's ownership.
+    atomically $ do
+      TM.insert 999999 savedCall {contactId = 999999} $ Controller.currentCalls cc
+      TM.insert 999999 (savedCallId, Controller.CORemote seqNo) $ Controller.callOwners cc
+    runRemote mobile $ endRemoteCalls seqNo
+    (M.null <$> readTVarIO (Controller.currentCalls cc)) `shouldReturn` True
+    (M.null <$> readTVarIO (Controller.callOwners cc)) `shouldReturn` True
+    -- A stale request/monitor cannot acquire or end a new session's call.
+    ownerCommand mobile (Controller.CSRemoteCtrl seqNo) ("/_call invite @2 " <> serialize testCallType) >>= \r ->
+      r `shouldSatisfy` \case Left (Controller.ChatErrorRemoteCtrl Controller.RCEInactive) -> True; _ -> False
+    remaining <- readTVarIO $ Controller.remoteCtrlSessions $ chatController mobile
+    M.size remaining `shouldBe` 1
+    ownerCommand second (Controller.CSRemoteHost 1) "@bob messaging survives call disconnect" >>= expectOwnerOKMessage
+    bob <# "alice> messaging survives call disconnect"
+  where
+    expectOwnerOKMessage r = r `shouldSatisfy` \case Right Controller.CRNewChatItems {} -> True; _ -> False
 
 multipleDesktopMessagesTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 multipleDesktopMessagesTest = testMultipleDesktops $ \_ mobile desktop second bob -> do

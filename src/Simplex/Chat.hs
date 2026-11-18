@@ -195,6 +195,7 @@ newChatController
         sndFiles <- newTVarIO M.empty
         rcvFiles <- newTVarIO M.empty
         currentCalls <- TM.emptyIO
+        callOwners <- TM.emptyIO
         localDeviceName <- newTVarIO $ fromMaybe deviceNameForRemote deviceName
         multicastSubscribers <- newTMVarIO 0
         remoteSessionSeq <- newTVarIO 0
@@ -249,6 +250,8 @@ newChatController
               sndFiles,
               rcvFiles,
               currentCalls,
+              callOwners,
+              callCommandOwner = COLocal,
               localDeviceName,
               multicastSubscribers,
               remoteSessionSeq,

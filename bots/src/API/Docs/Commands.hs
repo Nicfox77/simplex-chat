@@ -372,6 +372,7 @@ undocumentedCommands =
     "APIAddMyAddressShortLink",
     "APIArchiveReceivedReports",
     "APICallStatus",
+    "APIClaimCall",
     "APIChangeConnectionUser",
     "APIChangePreparedContactUser",
     "APIChangePreparedGroupUser",

@@ -42,6 +42,7 @@ import qualified Paths_simplex_chat as SC
 import Simplex.Chat.Controller
 import Simplex.Chat.Controller.Concurrent
 import Simplex.Chat.Files
+import Simplex.Chat.Library.Internal (endRemoteCalls)
 import Simplex.Chat.Messages (chatNameStr)
 import Simplex.Chat.Remote.AppVersion
 import Simplex.Chat.Remote.Protocol
@@ -971,7 +972,7 @@ remoteCtrlInfo RemoteCtrl {remoteCtrlId, ctrlDeviceName, recoveryEndpoint} sessi
   RemoteCtrlInfo {remoteCtrlId, ctrlDeviceName, recoveryEnabled = isJust recoveryEndpoint, sessionState}
 
 -- | Take a look at emoji of tlsunique, commit pairing, and start session server
-verifyRemoteCtrlSession :: (ByteString -> Int -> CM' (Either ChatError ChatResponse)) -> Text -> CM ChatResponse
+verifyRemoteCtrlSession :: (SessionSeq -> ByteString -> Int -> CM' (Either ChatError ChatResponse)) -> Text -> CM ChatResponse
 verifyRemoteCtrlSession execCC sessCode' = do
   (sseq, client, ctrlName, sessionCode, vars, recoveryEndpoint) <-
     do
@@ -1004,7 +1005,7 @@ verifyRemoteCtrlSession execCC sessCode' = do
             atomically $ void $ tryPutTMVar activity ()
             -- Signal the connection owner after replying. Never cancel the TLS
             -- client from its own HTTP/2 request handler.
-            handleRemoteCommand execCC (atomically $ closeEventBuffer remoteOutputQ EBDetached >> void (tryPutTMVar desktopStop ())) encryption remoteOutputQ remoteStopEvent req `runReaderT` cc
+            handleRemoteCommand (execCC sseq) (atomically $ closeEventBuffer remoteOutputQ EBDetached >> void (tryPutTMVar desktopStop ())) encryption remoteOutputQ remoteStopEvent req `runReaderT` cc
           stopped = atomically (readTMVar desktopStop) >> closeRemoteHostTransport tls
           idle = remoteCtrlWatchdog remoteCtrlIdleTimeout activity (closeRemoteHostTransport tls)
       race_ server $ if retainLink then race_ stopped idle else stopped
@@ -1109,6 +1110,7 @@ stopRemoteCtrlMatching emitEvent matches revoke = do
       RCSessionConnected {http2Server, ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}} -> void $ timeout 2000000 $ waitCatch http2Server
       _ -> pure ()
     liftIO $ cancelRemoteCtrl False session
+    endRemoteCalls sseq
     when emitEvent $ toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq, remoteCtrlId_ = remoteCtrlSessionId session}
   -- A first verification may already hold the store transaction when stop
   -- unpublishes it. Revoke by its verified fingerprint after that transaction,
@@ -1163,6 +1165,7 @@ cancelActiveRemoteCtrl_ emitEvent handlingError handlerInfo_ = handleAny (logErr
   sessions <- atomically $ takeRemoteCtrlSessions var (fst <$> handlerInfo_)
   forM_ sessions $ \(sseq, session) -> do
     liftIO $ cancelRemoteCtrl handlingError session
+    endRemoteCalls sseq
     when emitEvent $ forM_ (snd <$> handlerInfo_) $ \rcStopReason ->
       toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason, sessionSeq = sseq, remoteCtrlId_ = remoteCtrlSessionId session}
 

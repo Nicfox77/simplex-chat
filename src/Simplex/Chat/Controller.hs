@@ -21,7 +21,7 @@ import Control.Concurrent (ThreadId)
 import Control.Concurrent.Async (Async)
 import Control.Exception (Exception)
 import qualified Control.Exception as E
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
@@ -42,7 +42,7 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
 import Data.Set (Set)
 import qualified Data.Map.Strict as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.String
 import Data.Text (Text)
 import Data.Text.Encoding (decodeLatin1)
@@ -99,6 +99,7 @@ import Simplex.Messaging.Parsers (defaultJSON, dropPrefix, enumJSON, parseAll, p
 import Simplex.Messaging.Protocol (AProtoServerWithAuth, AProtocolType (..), MsgId, NMsgMeta (..), NtfServer, ProtocolType (..), QueueId, SMPMsgMeta (..), SubscriptionMode (..), USDCents, XFTPServer)
 import Simplex.Messaging.Session (SessionVar)
 import Simplex.Messaging.TMap (TMap)
+import qualified Simplex.Messaging.TMap as TM
 import Simplex.Messaging.Transport (TLS, TransportPeer (..), simplexMQVersion)
 import Simplex.Messaging.Transport.Client (SocksProxyWithAuth, TransportHost)
 import Simplex.Messaging.Util (AnyError (..), catchAllErrors, catchOwn', (<$$>))
@@ -331,6 +332,8 @@ data ChatController = ChatController
     sndFiles :: TVar (Map Int64 Handle),
     rcvFiles :: TVar (Map Int64 Handle),
     currentCalls :: TMap ContactId Call,
+    callOwners :: TMap ContactId (CallId, CallOwner),
+    callCommandOwner :: CallOwner,
     localDeviceName :: TVar Text,
     multicastSubscribers :: TMVar Int,
     remoteSessionSeq :: TVar Int,
@@ -457,6 +460,7 @@ data ChatCommand
   | APISendServiceRequest {userId :: UserId, sendTarget :: ConnectTarget 'CMContact, requestTimeout :: Maybe NominalDiffTime, signKey :: Maybe (C.StoredPrivateKey 'C.Ed25519), request :: J.Object}
   | APISendServiceResponse {userId :: UserId, requestId :: AgentInvId, responseData :: J.Object}
   | APISendCallInvitation ContactId CallType
+  | APIClaimCall ContactId Text
   | SendCallInvitation ContactName CallType
   | APIRejectCall ContactId
   | APISendCallOffer ContactId WebRTCCallOffer
@@ -761,19 +765,13 @@ planResolveModeP =
 data CommandSource
   = CSLocal -- entered on this device
   | CSRemoteHost RemoteHostId -- forwarded to a paired remote host
-  | CSRemoteCtrl -- received from a paired remote controller
+  | CSRemoteCtrl SessionSeq -- bound by the authenticated XRCP server, never by request data
+
+data CallOwner = COLocal | CORemote SessionSeq
+  deriving (Eq, Show)
 
 allowRemoteCommand :: ChatCommand -> Bool -- XXX: consider using Relay/Block/ForceLocal
 allowRemoteCommand = \case
-  APISendCallInvitation {} -> False
-  SendCallInvitation {} -> False
-  APIRejectCall {} -> False
-  APISendCallOffer {} -> False
-  APISendCallAnswer {} -> False
-  APISendCallExtraInfo {} -> False
-  APIEndCall {} -> False
-  APICallStatus {} -> False
-  APIGetCallInvitations -> False
   APIEnableUI -> False
   StartChat {} -> False
   APIStopChat -> False
@@ -1160,11 +1158,6 @@ allowRemoteEvent = \case
   CEvtChatSuspended -> False
   -- Only the app that owns the platform-store transaction can finish it.
   -- Badge state still travels to the remote UI through CEvtBadgeChanged.
-  CEvtCallInvitation {} -> False
-  CEvtCallOffer {} -> False
-  CEvtCallAnswer {} -> False
-  CEvtCallExtraInfo {} -> False
-  CEvtCallEnded {} -> False
   CEvtStorePurchaseCredited {} -> False
   CEvtStorePurchaseRefused {} -> False
   CEvtRemoteHostSessionCode {} -> False
@@ -1880,13 +1873,65 @@ toView_ ev = do
   atomically $ do
     modifyTVar' (uiRevision cc) (+ 1)
     sessions <- readTVar session
-    let remotes = [remoteOutputQ | RCSessionConnected {remoteOutputQ} <- M.elems sessions]
+    owner <- callEventOwner cc event
+    let remotes = [remoteOutputQ | (sseq, RCSessionConnected {remoteOutputQ}) <- M.toList sessions, maybe True (== CORemote sseq) owner]
         shared = either (const True) allowRemoteEvent event
     when shared $ mapM_ (`writeEventBuffer` event) remotes
     enabled <- readTVar $ simultaneousUI cc
     if enabled
-      then writeUIOutput cc (Nothing, event)
-      else when (null remotes || not shared) $ writeTBQueue localQ (Nothing, event)
+      then when (maybe True (== COLocal) owner) $ writeUIOutput cc (Nothing, event)
+      else when (maybe (null remotes || not shared) (== COLocal) owner) $ writeTBQueue localQ (Nothing, event)
+
+-- SDP, media keys and ICE candidates belong only to the UI running WebRTC.
+-- Invitations and terminal events are shared so every device can ring/stop.
+callEventOwner :: ChatController -> Either ChatError ChatEvent -> STM (Maybe CallOwner)
+callEventOwner ChatController {currentCalls, callOwners} event = case event of
+  Right CEvtCallOffer {contact} -> owner contact
+  Right CEvtCallAnswer {contact} -> owner contact
+  Right CEvtCallExtraInfo {contact} -> owner contact
+  _ -> pure Nothing
+  where
+    owner Contact {contactId} = do
+      call <- TM.lookup contactId currentCalls
+      saved <- TM.lookup contactId callOwners
+      pure $ Just $ case (call, saved) of
+        (Just Call {callId}, Just (ownedId, ui)) | callId == ownedId -> ui
+        _ -> COLocal
+
+-- Stop other frontends' invitation UI without ending the winning call.
+callClaimed :: User -> Contact -> CallOwner -> CM ()
+callClaimed user contact owner = do
+  cc@ChatController {remoteCtrlSessions} <- ask
+  atomically $ do
+    let ev = Right $ CEvtCallEnded user contact
+    when (owner /= COLocal) $ writeUIOutput cc (Nothing, ev)
+    sessions <- readTVar remoteCtrlSessions
+    forM_ (M.toList sessions) $ \(sseq, session) -> case session of
+      RCSessionConnected {remoteOutputQ} | owner /= CORemote sseq -> writeEventBuffer remoteOutputQ ev
+      _ -> pure ()
+
+checkCallSession :: CallOwner -> CM ()
+checkCallSession COLocal = pure ()
+checkCallSession (CORemote sseq) = do
+  sessions <- chatReadVar remoteCtrlSessions
+  case M.lookup sseq sessions of
+    Just RCSessionConnected {remoteOutputQ} -> do
+      closed <- atomically $ eventBufferClosed remoteOutputQ
+      when (isJust closed) $ throwError $ ChatErrorRemoteCtrl RCEInactive
+    _ -> throwError $ ChatErrorRemoteCtrl RCEInactive
+
+-- Called under the contact lock, shared with incoming call signalling.
+checkCallOwner :: Bool -> Call -> CM ()
+checkCallOwner mayClaim Call {contactId, callId, callState} = do
+  owner <- asks callCommandOwner
+  checkCallSession owner
+  saved <- asks callOwners >>= atomically . TM.lookup contactId
+  let allowed = case saved of
+        Just (ownedId, ui) | ownedId == callId -> owner == ui
+        _ -> case callState of
+          CallInvitationReceived {} -> mayClaim
+          _ -> owner == COLocal
+  unless allowed $ throwChatError CEHasCurrentCall
 
 -- A frontend may issue commands from its receiver. Never wait for that same
 -- receiver to drain a queue: overflow discards deltas and demands a snapshot.
@@ -1911,7 +1956,7 @@ invalidateUI src = do
     when enabled $ do
       rev <- stateTVar uiRevision $ \n -> (n + 1, n + 1)
       let ev = Right $ CEvtUiStateChanged 2 rev $ case src of
-            CSRemoteCtrl -> "remote"
+            CSRemoteCtrl _ -> "remote"
             _ -> "local"
       writeUIOutput cc (Nothing, ev)
       sessions <- readTVar remoteCtrlSessions

@@ -178,3 +178,16 @@ An in-app notification banner shown when a call invitation arrives while the app
 | `WebRTC.kt` | [`common/src/commonMain/.../views/call/WebRTC.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/views/call/WebRTC.kt) | -- | `CallState` enum, `WCallCommand`, `WCallResponse` types |
 | `IncomingCallAlertView.kt` | [`common/src/commonMain/.../views/call/IncomingCallAlertView.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/views/call/IncomingCallAlertView.kt) | 128 | In-app incoming call notification banner |
 | `SimpleXAPI.kt` | [`common/src/commonMain/.../model/SimpleXAPI.kt`](../../common/src/commonMain/kotlin/chat/simplex/common/model/SimpleXAPI.kt) | -- | Call API commands (L1837--L1881) |
+
+## Linked devices
+
+The phone remains the account and signalling authority. An outgoing call is
+owned by the initiating UI. Before starting WebRTC for an incoming call, the
+UI sends `/_call claim @<contactId> <callUUID>`; the core atomically selects one owner
+under the contact lock, rejecting stale invitation UUIDs. A desktop owner is bound to its authenticated XRCP
+session sequence, not to a client-supplied device identifier. Successful claims
+dismiss other UIs' invitations with `callEnded`; receivers must close their UI
+without sending an end command back. Initial invitations, including their
+answering key, are available to authorized UIs; subsequent offers, answers and
+ICE go only to the call owner. Disconnecting that desktop terminates only its calls. Reconnecting does
+not transfer media or give a replacement session ownership of an old call.

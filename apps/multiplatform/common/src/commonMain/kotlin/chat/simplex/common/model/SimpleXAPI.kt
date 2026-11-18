@@ -2211,17 +2211,21 @@ object ChatController {
     return null
   }
 
-  suspend fun apiGetCallInvitations(rh: Long?): List<RcvCallInvitation> {
+  suspend fun apiGetCallInvitations(rh: Long?): List<RcvCallInvitation> = apiGetCallInvitationsOrNull(rh) ?: emptyList()
+
+  private suspend fun apiGetCallInvitationsOrNull(rh: Long?): List<RcvCallInvitation>? {
     val r = sendCmd(rh, CC.ApiGetCallInvitations())
-    if (r is API.Result && r.res is CR.CallInvitations) return r.res.callInvitations
+    if (r is API.Result && r.res is CR.CallInvitations) return r.res.callInvitations.map { it.copy(remoteHostId = rh) }
     Log.e(TAG, "apiGetCallInvitations bad response: ${r.responseType} ${r.details}")
-    return emptyList()
+    return null
   }
 
   suspend fun apiSendCallInvitation(rh: Long?, contact: Contact, callType: CallType): Boolean {
     val r = sendCmd(rh, CC.ApiSendCallInvitation(contact, callType))
     return r.result is CR.CmdOk
   }
+
+  suspend fun apiClaimCall(rh: Long?, contact: Contact, callUUID: String): Boolean = sendCmd(rh, CC.ApiClaimCall(contact, callUUID)).result is CR.CmdOk
 
   suspend fun apiRejectCall(rh: Long?, contact: Contact): Boolean {
     val r = sendCmd(rh, CC.ApiRejectCall(contact))
@@ -3252,6 +3256,7 @@ object ChatController {
   // Spec: spec/api.md#processReceivedMsg
   private var uiSnapshotPending = false
   private var uiOwnerRecoveryPending = false
+  private var uiCallInvitationsRecoveryPending = false
 
   internal fun requiresUISnapshot(event: CR?): Boolean = when (event) {
     null, is CR.UIStateChanged, is CR.RemoteHostStopped, is CR.RemoteHostConnected, is CR.RemoteHostSessionCode,
@@ -3275,6 +3280,7 @@ object ChatController {
         (msg.rhId != null || chatModel.hasActiveHostedSession()))
     if (shared) uiSnapshotPending = true
     if (msg.rhId == null && (msg.result as? CR.UIStateChanged)?.origin == "overflow") uiOwnerRecoveryPending = true
+    if ((msg.result as? CR.UIStateChanged)?.origin == "overflow") uiCallInvitationsRecoveryPending = true
     try {
       if (msg.result !is CR.UIStateChanged) processReceivedMsgDelta(msg)
     } finally {
@@ -3324,6 +3330,12 @@ object ChatController {
       }
     }
     if (!applied) return
+    if (uiCallInvitationsRecoveryPending) {
+      apiGetCallInvitationsOrNull(rhId)?.let {
+        chatModel.callManager.reconcileInvitations(rhId, it)
+        uiCallInvitationsRecoveryPending = false
+      }
+    }
     if (rhId == null && uiOwnerRecoveryPending) {
       // Lifecycle events and platform-store callbacks can be among the lost
       // deltas. Recover them from the owner, never from the viewer's database.
@@ -3340,13 +3352,10 @@ object ChatController {
         }
         if (appPrefs.notificationsMode.get() != NotificationsMode.SERVICE) platform.androidServiceSafeStop()
       }
-      apiGetCallInvitations(null).filter { it.contact.id !in chatModel.callInvitations }.forEach {
-        chatModel.callManager.reportNewIncomingCall(it)
-      }
       BadgeStore.presentUnfinished()
       uiOwnerRecoveryPending = controllers == null
     }
-    uiSnapshotPending = uiOwnerRecoveryPending
+    uiSnapshotPending = uiOwnerRecoveryPending || uiCallInvitationsRecoveryPending
   }
 
   private suspend fun processReceivedMsgDelta(msg: API) {
@@ -3855,7 +3864,7 @@ object ChatController {
         chatModel.callManager.reportNewIncomingCall(r.callInvitation.copy(remoteHostId = rhId))
       }
       is CR.CallOffer -> {
-        withCall(r, r.contact) { call ->
+        withCall(rhId, r, r.contact) { call ->
           chatModel.activeCall.value = call.copy(callState = CallState.OfferReceived, hasSharedKey = r.sharedKey != null)
           if (r.askConfirmation) {
             showUnencryptedCallAlert(call) { processCallOffer(r) }
@@ -3865,23 +3874,24 @@ object ChatController {
         }
       }
       is CR.CallAnswer -> {
-        withCall(r, r.contact) { call ->
+        withCall(rhId, r, r.contact) { call ->
           chatModel.activeCall.value = call.copy(callState = CallState.AnswerReceived)
           chatModel.callCommand.add(WCallCommand.Answer(answer = r.answer.rtcSession, iceCandidates = r.answer.rtcIceCandidates))
         }
       }
       is CR.CallExtraInfo -> {
-        withCall(r, r.contact) { _ ->
+        withCall(rhId, r, r.contact) { _ ->
           chatModel.callCommand.add(WCallCommand.Ice(iceCandidates = r.extraInfo.rtcIceCandidates, session = r.extraInfo.rtcSession))
         }
       }
       is CR.CallEnded -> {
-        val invitation = chatModel.callInvitations.remove(r.contact.id)
+        val invitation = chatModel.callInvitations[r.contact.id]?.takeIf { it.remoteHostId == rhId }
         if (invitation != null) {
+          chatModel.callInvitations.remove(r.contact.id)
           chatModel.callManager.reportCallRemoteEnded(invitation = invitation)
         }
-        withCall(r, r.contact) { call ->
-          withBGApi { chatModel.callManager.endCall(call) }
+        withCall(rhId, r, r.contact) { call ->
+          withBGApi { chatModel.callManager.endCall(call.copy(callState = CallState.Ended)) }
         }
       }
       is CR.ContactSwitch ->
@@ -3916,6 +3926,9 @@ object ChatController {
         chatModel.currentRemoteHost.value = r.remoteHost
         ModalManager.start.closeModals()
         switchUIRemoteHost(r.remoteHost.remoteHostId)
+        apiGetCallInvitationsOrNull(r.remoteHost.remoteHostId)?.let {
+          chatModel.callManager.reconcileInvitations(r.remoteHost.remoteHostId, it)
+        }
       }
       is CR.ContactDisabled -> {
         if (active(r.user)) {
@@ -3925,6 +3938,13 @@ object ChatController {
         }
       }
       is CR.RemoteHostStopped -> {
+        chatModel.activeCall.value?.takeIf { it.remoteHostId == r.remoteHostId_ && it.remoteHostId != null }?.let { call ->
+          withBGApi { chatModel.callManager.endCall(call.copy(callState = CallState.Ended)) }
+        }
+        chatModel.callInvitations.values.filter { it.remoteHostId == r.remoteHostId_ && it.remoteHostId != null }.toList().forEach {
+          chatModel.callInvitations.remove(it.contact.id)
+          chatModel.callManager.reportCallRemoteEnded(it)
+        }
         val disconnectedHost = chatModel.remoteHosts.firstOrNull { it.remoteHostId == r.remoteHostId_ }
         chatModel.remoteHostPairing.value = null
         if (disconnectedHost != null) {
@@ -4121,9 +4141,9 @@ object ChatController {
   fun activeUser(rhId: Long?, user: UserLike): Boolean =
     rhId == chatModel.remoteHostId() && user.userId == chatModel.currentUser.value?.userId
 
-  private fun withCall(r: CR, contact: Contact, perform: (Call) -> Unit) {
+  private fun withCall(rhId: Long?, r: CR, contact: Contact, perform: (Call) -> Unit) {
     val call = chatModel.activeCall.value
-    if (call != null && call.contact.apiId == contact.apiId) {
+    if (call != null && call.remoteHostId == rhId && call.contact.apiId == contact.apiId) {
       perform(call)
     } else {
       Log.d(TAG, "processReceivedMsg: ignoring ${r.responseType}, not in call with the contact ${contact.id}")
@@ -4581,6 +4601,7 @@ sealed class CC {
   class ApiSetAddressSettings(val userId: Long, val addressSettings: AddressSettings): CC()
   class ApiGetCallInvitations: CC()
   class ApiSendCallInvitation(val contact: Contact, val callType: CallType): CC()
+  class ApiClaimCall(val contact: Contact, val callUUID: String): CC()
   class ApiRejectCall(val contact: Contact): CC()
   class ApiSendCallOffer(val contact: Contact, val callOffer: WebRTCCallOffer): CC()
   class ApiSendCallAnswer(val contact: Contact, val answer: WebRTCSession): CC()
@@ -4815,6 +4836,7 @@ sealed class CC {
     is ApiRejectContact -> "/_reject $contactReqId"
     is ApiGetCallInvitations -> "/_call get"
     is ApiSendCallInvitation -> "/_call invite @${contact.apiId} ${json.encodeToString(callType)}"
+    is ApiClaimCall -> "/_call claim @${contact.apiId} $callUUID"
     is ApiRejectCall -> "/_call reject @${contact.apiId}"
     is ApiSendCallOffer -> "/_call offer @${contact.apiId} ${json.encodeToString(callOffer)}"
     is ApiSendCallAnswer -> "/_call answer @${contact.apiId} ${json.encodeToString(answer)}"
@@ -5018,6 +5040,7 @@ sealed class CC {
     is ApiRejectContact -> "apiRejectContact"
     is ApiGetCallInvitations -> "apiGetCallInvitations"
     is ApiSendCallInvitation -> "apiSendCallInvitation"
+    is ApiClaimCall -> "apiClaimCall"
     is ApiRejectCall -> "apiRejectCall"
     is ApiSendCallOffer -> "apiSendCallOffer"
     is ApiSendCallAnswer -> "apiSendCallAnswer"

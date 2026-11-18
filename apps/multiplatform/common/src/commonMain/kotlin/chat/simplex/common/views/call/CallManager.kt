@@ -4,6 +4,9 @@ import chat.simplex.common.AppLock
 import chat.simplex.common.model.*
 import chat.simplex.common.platform.*
 import chat.simplex.common.views.helpers.withBGApi
+import chat.simplex.common.views.helpers.generalGetString
+import chat.simplex.common.views.helpers.AlertManager
+import chat.simplex.res.*
 import kotlinx.datetime.Clock
 import kotlin.time.Duration.Companion.minutes
 
@@ -11,6 +14,7 @@ class CallManager(val chatModel: ChatModel) {
   fun reportNewIncomingCall(invitation: RcvCallInvitation) {
     Log.d(TAG, "CallManager.reportNewIncomingCall")
     with (chatModel) {
+      if (callInvitations[invitation.contact.id]?.let { it.remoteHostId == invitation.remoteHostId && it.callUUID == invitation.callUUID } == true) return
       callInvitations[invitation.contact.id] = invitation
       if (invitation.user.showNotifications) {
         if (Clock.System.now() - invitation.callTs <= 3.minutes) {
@@ -24,10 +28,29 @@ class CallManager(val chatModel: ChatModel) {
     }
   }
 
+  internal fun reconcileInvitations(rhId: Long?, pending: List<RcvCallInvitation>) {
+    val uuids = pending.map { it.callUUID }.toSet()
+    chatModel.callInvitations.values.filter { it.remoteHostId == rhId && it.callUUID !in uuids }.toList().forEach {
+      chatModel.callInvitations.remove(it.contact.id)
+      reportCallRemoteEnded(it)
+    }
+    pending.forEach { invitation ->
+      val call = chatModel.activeCall.value
+      if (call?.let { it.remoteHostId == rhId && it.callUUID == invitation.callUUID } != true) reportNewIncomingCall(invitation.copy(remoteHostId = rhId))
+    }
+  }
+
   fun acceptIncomingCall(invitation: RcvCallInvitation) = withBGApi {
     val call = chatModel.activeCall.value
     val contactInfo = chatModel.controller.apiContactInfo(invitation.remoteHostId, invitation.contact.contactId)
     val profile = contactInfo?.second ?: invitation.user.profile.toProfile()
+    // Claim before opening a microphone/camera or ending a different local call.
+    if (!chatModel.controller.apiClaimCall(invitation.remoteHostId, invitation.contact, invitation.callUUID)) {
+      chatModel.callInvitations.remove(invitation.contact.id)
+      reportCallRemoteEnded(invitation)
+      showCallUnavailable()
+      return@withBGApi
+    }
     // In case the same contact calling while previous call didn't end yet (abnormal ending of call from the other side)
     if (call == null || (call.remoteHostId == invitation.remoteHostId && call.contact.id == invitation.contact.id)) {
       justAcceptIncomingCall(invitation = invitation, profile)
@@ -97,6 +120,18 @@ class CallManager(val chatModel: ChatModel) {
     }
   }
 
+  suspend fun signallingFailed(call: Call) {
+    endCall(call.copy(callState = CallState.Ended))
+    showCallUnavailable()
+  }
+
+  private fun showCallUnavailable() {
+    AlertManager.shared.showAlertMsg(
+      generalGetString(MR.strings.cant_call_contact_alert_title),
+      generalGetString(MR.strings.call_unavailable_on_this_device)
+    )
+  }
+
   fun endCall(invitation: RcvCallInvitation) {
     with (chatModel) {
       callInvitations.remove(invitation.contact.id)
@@ -113,7 +148,7 @@ class CallManager(val chatModel: ChatModel) {
   }
 
   fun reportCallRemoteEnded(invitation: RcvCallInvitation) {
-    if (chatModel.activeCallInvitation.value?.contact?.id == invitation.contact.id) {
+    if (chatModel.activeCallInvitation.value?.let { it.remoteHostId == invitation.remoteHostId && it.contact.id == invitation.contact.id } == true) {
       chatModel.activeCallInvitation.value = null
       ntfManager.cancelCallNotification()
     }

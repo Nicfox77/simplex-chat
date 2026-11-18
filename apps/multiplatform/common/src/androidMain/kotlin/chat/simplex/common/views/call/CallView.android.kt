@@ -140,7 +140,10 @@ actual fun ActiveCallView() {
         when (val r = apiMsg.resp) {
           is WCallResponse.Capabilities -> withBGApi {
             val callType = CallType(call.initialCallType, r.capabilities)
-            chatModel.controller.apiSendCallInvitation(callRh, call.contact, callType)
+            if (!chatModel.controller.apiSendCallInvitation(callRh, call.contact, callType)) {
+              chatModel.callManager.signallingFailed(call)
+              return@withBGApi
+            }
             updateActiveCall(call) { it.copy(callState = CallState.InvitationSent, localCapabilities = r.capabilities) }
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
               // Starting is delayed to make Android <= 11 working good with Bluetooth
@@ -152,7 +155,10 @@ actual fun ActiveCallView() {
             activeCallWaitDeliveryReceipt(scope)
           }
           is WCallResponse.Offer -> withBGApi {
-            chatModel.controller.apiSendCallOffer(callRh, call.contact, r.offer, r.iceCandidates, call.initialCallType, r.capabilities)
+            if (!chatModel.controller.apiSendCallOffer(callRh, call.contact, r.offer, r.iceCandidates, call.initialCallType, r.capabilities)) {
+              chatModel.callManager.signallingFailed(call)
+              return@withBGApi
+            }
             updateActiveCall(call) { it.copy(callState = CallState.OfferSent, localCapabilities = r.capabilities) }
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
               // Starting is delayed to make Android <= 11 working good with Bluetooth
@@ -162,7 +168,10 @@ actual fun ActiveCallView() {
             }
           }
           is WCallResponse.Answer -> withBGApi {
-            chatModel.controller.apiSendCallAnswer(callRh, call.contact, r.answer, r.iceCandidates)
+            if (!chatModel.controller.apiSendCallAnswer(callRh, call.contact, r.answer, r.iceCandidates)) {
+              chatModel.callManager.signallingFailed(call)
+              return@withBGApi
+            }
             updateActiveCall(call) { it.copy(callState = CallState.Negotiated) }
             CallSoundsPlayer.stop()
           }

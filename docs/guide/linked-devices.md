@@ -198,3 +198,14 @@ on the mobile.
 - On Android, open **Linked desktops** in the profile menu, tap and hold a
   desktop, then tap **Delete**. On iOS, open **Use from desktop** > **Linked
   desktops**, swipe the desktop to the left and confirm **Unlink**.
+
+## Calls on linked desktops
+
+You can make audio and video calls from the phone or a linked desktop. The
+device you use for the call provides its microphone, speakers and camera. The
+phone still manages the account and sends the call signalling.
+
+Incoming calls can ring on the phone and connected desktops. Answer on one
+device to stop ringing on the others. Other devices can continue messaging,
+but cannot control that device's call. A call ends if its desktop disconnects
+from the phone; it does not move automatically to another device.

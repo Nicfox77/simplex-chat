@@ -41,17 +41,26 @@ actual fun ActiveCallView() {
       when (val r = apiMsg.resp) {
         is WCallResponse.Capabilities -> withBGApi {
           val callType = CallType(call.initialCallType, r.capabilities)
-          chatModel.controller.apiSendCallInvitation(callRh, call.contact, callType)
+          if (!chatModel.controller.apiSendCallInvitation(callRh, call.contact, callType)) {
+            chatModel.callManager.signallingFailed(call)
+            return@withBGApi
+          }
           chatModel.activeCall.value = call.copy(callState = CallState.InvitationSent, localCapabilities = r.capabilities)
           CallSoundsPlayer.startConnectingCallSound(scope)
           activeCallWaitDeliveryReceipt(scope)
         }
         is WCallResponse.Offer -> withBGApi {
-          chatModel.controller.apiSendCallOffer(callRh, call.contact, r.offer, r.iceCandidates, call.initialCallType, r.capabilities)
+          if (!chatModel.controller.apiSendCallOffer(callRh, call.contact, r.offer, r.iceCandidates, call.initialCallType, r.capabilities)) {
+            chatModel.callManager.signallingFailed(call)
+            return@withBGApi
+          }
           chatModel.activeCall.value = call.copy(callState = CallState.OfferSent, localCapabilities = r.capabilities)
         }
         is WCallResponse.Answer -> withBGApi {
-          chatModel.controller.apiSendCallAnswer(callRh, call.contact, r.answer, r.iceCandidates)
+          if (!chatModel.controller.apiSendCallAnswer(callRh, call.contact, r.answer, r.iceCandidates)) {
+            chatModel.callManager.signallingFailed(call)
+            return@withBGApi
+          }
           chatModel.activeCall.value = call.copy(callState = CallState.Negotiated)
           CallSoundsPlayer.stop()
         }
