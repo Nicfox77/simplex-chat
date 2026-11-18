@@ -30,7 +30,7 @@ import Data.Functor (($>))
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as L
 import qualified Data.Map.Strict as M
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeLatin1, encodeUtf8)
@@ -56,6 +56,7 @@ import Simplex.Chat.Util (encryptFile, liftIOEither)
 import Simplex.FileTransfer.Description (FileDigest (..))
 import Simplex.Messaging.Agent
 import Simplex.Messaging.Agent.Protocol (AgentErrorType (RCP))
+import qualified Simplex.Messaging.Agent.Store.DB as DB
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Crypto.File (CryptoFile (..), CryptoFileArgs (..))
 import qualified Simplex.Messaging.Crypto.File as CF
@@ -73,7 +74,7 @@ import Simplex.RemoteControl.Types
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import UnliftIO
 import UnliftIO.Concurrent (forkIO)
-import UnliftIO.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive, renameFile)
+import UnliftIO.Directory (canonicalizePath, copyFile, createDirectoryIfMissing, doesDirectoryExist, removeDirectoryRecursive, removeFile, renameFile)
 
 remoteFilesFolder :: String
 remoteFilesFolder = "simplex_v1_files"
@@ -596,13 +597,13 @@ resumeRemoteCtrl = resumeRemoteCtrlWith $ \pairing host port -> do
 -- The fetch boundary is injectable for deterministic stop/revocation tests.
 resumeRemoteCtrlWith :: (RCCtrlPairing -> TransportHost -> Word16 -> CM RCVerifiedInvitation) -> RemoteCtrlId -> CM (Maybe RemoteCtrlInfo, CtrlAppInfo, SessionSeq)
 resumeRemoteCtrlWith fetchInvitation rcId = do
-  sseq <- startRemoteCtrlSession
+  sseq <- startRemoteCtrlSessionFor (Just rcId)
   handleCtrlError sseq RCSRConnectionFailed "resumeRemoteCtrl" $ do
     RemoteCtrl {ctrlPairing, recoveryEndpoint} <- withStore (`getRemoteCtrl` rcId)
     endpoint@RCEndpoint {host, port} <- maybe (throwError $ ChatErrorRemoteCtrl RCEBadController) pure recoveryEndpoint
     inv <- fetchInvitation ctrlPairing host port
     updateRemoteCtrlSession sseq $ \case
-      RCSessionStarting -> Right RCSessionStarting
+      RCSessionStarting {} -> Right (RCSessionStarting (Just rcId))
       _ -> Left $ ChatErrorRemoteCtrl RCEBadState
     (rc_, info) <- connectRemoteCtrl inv sseq
     unless (maybe False (\RemoteCtrlInfo {remoteCtrlId = rid} -> rid == rcId) rc_) $ do
@@ -659,38 +660,76 @@ findKnownRemoteCtrl = do
     let compatible = isJust $ compatibleAppVersion hostAppVersionRange . appVersionRange =<< ctrlAppInfo_
     toView CEvtRemoteCtrlFound {remoteCtrl = remoteCtrlInfo rc (Just RCSSearching), ctrlAppInfo_, appVersion = currentAppVersion, compatible}
   updateRemoteCtrlSession sseq $ \case
-    RCSessionStarting -> Right RCSessionSearching {action, foundCtrl}
+    RCSessionStarting {} -> Right RCSessionSearching {action, foundCtrl}
     _ -> Left $ ChatErrorRemoteCtrl RCEBadState
   atomically $ putTMVar cmdOk ()
 
 confirmRemoteCtrl :: RemoteCtrlId -> CM (RemoteCtrlInfo, CtrlAppInfo, SessionSeq)
 confirmRemoteCtrl rcId = do
-  session <- asks remoteCtrlSession
+  sessions <- asks remoteCtrlSessions
   (sseq, listener, found) <- liftIOEither $ atomically $ do
-    readTVar session >>= \case
-      Just (sseq, RCSessionSearching {action, foundCtrl}) -> do
-        writeTVar session $ Just (sseq, RCSessionStarting) -- drop intermediate "Searching" state so connectRemoteCtrl can proceed
-        pure $ Right (sseq, action, foundCtrl)
+    allSessions <- readTVar sessions
+    case [(seqNo, action, foundCtrl) | (seqNo, RCSessionSearching {action, foundCtrl}) <- M.toList allSessions] of
+      [(seqNo, _, _)]
+        | any ((== Just rcId) . remoteCtrlSessionId) (M.elems $ M.delete seqNo allSessions) ->
+            pure . Left $ ChatErrorRemoteCtrl RCEBusy
+      [(seqNo, action, foundCtrl)] -> do
+        writeTVar sessions $ M.insert seqNo (RCSessionStarting (Just rcId)) allSessions
+        pure $ Right (seqNo, action, foundCtrl)
       _ -> pure . Left $ ChatErrorRemoteCtrl RCEBadState
   uninterruptibleCancel listener
   (RemoteCtrl {remoteCtrlId = foundRcId}, verifiedInv) <- atomically $ takeTMVar found
-  unless (rcId == foundRcId) $ throwError $ ChatErrorRemoteCtrl RCEBadController
+  unless (rcId == foundRcId) $ do
+    abortRemoteCtrl sseq
+    throwError $ ChatErrorRemoteCtrl RCEBadController
   connectRemoteCtrl verifiedInv sseq >>= \case
     (Nothing, _) -> throwChatError $ CEInternalError "connecting with a stored ctrl"
     (Just rci, appInfo) -> pure (rci, appInfo, sseq)
 
 -- ** Common
 
+remoteCtrlSessionId :: RemoteCtrlSession -> Maybe RemoteCtrlId
+remoteCtrlSessionId = \case
+  RCSessionStarting {remoteCtrlId_} -> remoteCtrlId_
+  RCSessionConnecting {remoteCtrlId_} -> remoteCtrlId_
+  RCSessionPendingConfirmation {remoteCtrlId_} -> remoteCtrlId_
+  RCSessionConnected {remoteCtrlId} -> Just remoteCtrlId
+  _ -> Nothing
+
 startRemoteCtrlSession :: CM SessionSeq
-startRemoteCtrlSession = do
-  session <- asks remoteCtrlSession
+startRemoteCtrlSession = startRemoteCtrlSessionFor Nothing
+
+startRemoteCtrlSessionFor :: Maybe RemoteCtrlId -> CM SessionSeq
+startRemoteCtrlSessionFor rcId = do
+  sessions <- asks remoteCtrlSessions
+  enabled <- chatReadVar simultaneousUI
   nextSessionSeq <- asks remoteSessionSeq
-  liftIOEither . atomically $
-    readTVar session >>= \case
-      Just _ -> pure . Left $ ChatErrorRemoteCtrl RCEBusy
-      Nothing -> do
+  liftIOEither . atomically $ do
+    current <- readTVar sessions
+    let busy =
+          (not enabled && not (M.null current))
+            || M.size current >= 8
+            || any ((== rcId) . remoteCtrlSessionId) (M.elems current)
+    if busy
+      then pure . Left $ ChatErrorRemoteCtrl RCEBusy
+      else do
         sseq <- stateTVar' nextSessionSeq $ \s -> (s, s + 1)
-        Right sseq <$ writeTVar session (Just (sseq, RCSessionStarting))
+        Right sseq <$ writeTVar sessions (M.insert sseq (RCSessionStarting rcId) current)
+
+reserveRemoteCtrl :: SessionSeq -> Maybe RemoteCtrlId -> CM ()
+reserveRemoteCtrl sseq rcId = do
+  sessions <- asks remoteCtrlSessions
+  liftIOEither . atomically $ do
+    current <- readTVar sessions
+    case M.lookup sseq current of
+      Just RCSessionStarting {remoteCtrlId_ = expected} ->
+        if isJust expected && expected /= rcId
+          then pure . Left $ ChatErrorRemoteCtrl RCEBadController
+          else
+            if maybe False (\rid -> any ((== Just rid) . remoteCtrlSessionId . snd) $ M.toList $ M.delete sseq current) rcId
+              then pure . Left $ ChatErrorRemoteCtrl RCEBusy
+              else Right () <$ writeTVar sessions (M.insert sseq (RCSessionStarting rcId) current)
+      _ -> pure . Left $ ChatErrorRemoteCtrl RCEInactive
 
 connectRemoteCtrl :: RCVerifiedInvitation -> SessionSeq -> CM (Maybe RemoteCtrlInfo, CtrlAppInfo)
 connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) sseq = handleCtrlError sseq RCSRConnectionFailed "connectRemoteCtrl" $ do
@@ -701,6 +740,7 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
   v <- checkAppVersion ctrlInfo
   rc_ <- withStore' $ \db -> getRemoteCtrlByFingerprint db ca
   mapM_ (validateRemoteCtrl inv) rc_
+  reserveRemoteCtrl sseq (remoteCtrlId' <$> rc_)
   let CtrlAppInfo {reconnect = BoolDef canReconnect, restart = BoolDef canRestart} = ctrlInfo
       RCInvitation {host, port} = inv
       recoveryEndpoint = if canRestart && canReconnect && localEncoding == PEKotlin then Just RCEndpoint {host, port} else Nothing
@@ -712,7 +752,7 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
     atomically $ takeTMVar cmdOk
     handleCtrlError sseq RCSRConnectionFailed "waitForCtrlSession" $ waitForCtrlSession rc_ ctrlInfo rcsClient vars
   ( updateRemoteCtrlSession sseq $ \case
-      RCSessionStarting -> Right RCSessionConnecting {remoteCtrlId_ = remoteCtrlId' <$> rc_, rcsClient, rcsWaitSession, recoveryEndpoint, ctrlAppInfo = ctrlInfo}
+      RCSessionStarting {} -> Right RCSessionConnecting {remoteCtrlId_ = remoteCtrlId' <$> rc_, remoteCtrlFingerprint = ca, rcsClient, rcsWaitSession, recoveryEndpoint, ctrlAppInfo = ctrlInfo}
       _ -> Left $ ChatErrorRemoteCtrl RCEBadState
     )
     `catchAllErrors` \e -> do
@@ -728,9 +768,9 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
       (uniq, tls, rcsWaitConfirmation) <- timeoutThrow (ChatErrorRemoteCtrl RCETimeout) networkIOTimeout $ takeRCStep vars
       let sessionCode = verificationCode uniq
       updateRemoteCtrlSession sseq $ \case
-        RCSessionConnecting {rcsWaitSession, recoveryEndpoint} ->
+        RCSessionConnecting {rcsWaitSession, recoveryEndpoint, remoteCtrlFingerprint} ->
           let remoteCtrlId_ = remoteCtrlId' <$> rc_
-           in Right RCSessionPendingConfirmation {remoteCtrlId_, ctrlDeviceName = ctrlName, rcsClient, tls, sessionCode, rcsWaitSession, rcsWaitConfirmation, recoveryEndpoint, ctrlAppInfo}
+           in Right RCSessionPendingConfirmation {remoteCtrlId_, remoteCtrlFingerprint, ctrlDeviceName = ctrlName, rcsClient, tls, sessionCode, rcsWaitSession, rcsWaitConfirmation, recoveryEndpoint, ctrlAppInfo}
         _ -> Left $ ChatErrorRemoteCtrl RCEBadState
       toView CEvtRemoteCtrlSessionCode {remoteCtrl_ = (`remoteCtrlInfo` Just RCSPendingConfirmation {sessionCode}) <$> rc_, sessionCode, sessionSeq = sseq}
     checkAppVersion CtrlAppInfo {appVersionRange} =
@@ -747,7 +787,7 @@ connectRemoteCtrl verifiedInv@(RCVerifiedInvitation inv@RCInvitation {ca, app}) 
 uiProtocolVersion :: CM (Maybe Int)
 uiProtocolVersion = do
   enabled <- chatReadVar simultaneousUI
-  pure $ if enabled then Just 1 else Nothing
+  pure $ if enabled then Just 2 else Nothing
 
 parseCtrlAppInfo :: JT.Value -> CM CtrlAppInfo
 parseCtrlAppInfo ctrlAppInfo = do
@@ -876,15 +916,28 @@ handleStoreFile rfKN fileName fileSize fileDigest getChunk =
       Just ff -> takeFileName <$$> storeFileTo ff
       Nothing -> storeFileTo =<< getDefaultFilesFolder
     storeFileTo :: FilePath -> CM' (Either RemoteProtocolError FilePath)
-    storeFileTo dir = liftIO . tryAllErrors' $ do
-      unless (validRemoteFileName fileName) $ throwError $ RPEInvalidBody "invalid file name"
-      filePath <- liftIO $ dir `uniqueCombine` fileName
-      -- resolves symlinks, so it also catches a final component linking outside the folder
-      canonPath <- liftIO $ canonicalizePath filePath
-      inDir <- liftIO $ (takeDirectory canonPath ==) <$> canonicalizePath dir
-      unless inDir $ throwError $ RPEInvalidBody "file path outside of files folder"
-      receiveEncryptedFile rfKN getChunk fileSize fileDigest filePath
-      pure filePath
+    storeFileTo dir = do
+      gate <- asks remoteFileNameGate
+      liftIO . mask $ \restore -> do
+        reserved <- withCommandGate gate . tryAllErrors' $ do
+          unless (validRemoteFileName fileName) $ throwError $ RPEInvalidBody "invalid file name"
+          filePath <- liftIO $ dir `uniqueCombine` fileName
+          canonPath <- liftIO $ canonicalizePath filePath
+          inDir <- liftIO $ (takeDirectory canonPath ==) <$> canonicalizePath dir
+          unless inDir $ throwError $ RPEInvalidBody "file path outside of files folder"
+          -- Reserve before releasing the name gate; attachment IO never holds it.
+          liftIO $ B.writeFile filePath ""
+          pure filePath
+        case reserved of
+          Left e -> pure $ Left e
+          Right filePath -> do
+            result <-
+              restore (tryAllErrors' $ receiveEncryptedFile rfKN getChunk fileSize fileDigest filePath >> pure filePath)
+                `onException` removeFile filePath
+            case result of
+              Left _ -> removeFile filePath
+              Right _ -> pure ()
+            pure result
 
 -- The controller only ever sends a bare file name (see storeRemoteFile), so a path is a protocol violation.
 validRemoteFileName :: FilePath -> Bool
@@ -908,19 +961,9 @@ handleGetFile User {userId} RemoteFile {userId = commandUserId, fileId, sent, fi
 
 listRemoteCtrls :: CM [RemoteCtrlInfo]
 listRemoteCtrls = do
-  session <- snd <$$> chatReadVar remoteCtrlSession
-  let rcId = sessionRcId =<< session
-      sessState = rcsSessionState <$> session
-  map (rcInfo rcId sessState) <$> withStore' getRemoteCtrls
-  where
-    rcInfo :: Maybe RemoteCtrlId -> Maybe RemoteCtrlSessionState -> RemoteCtrl -> RemoteCtrlInfo
-    rcInfo rcId sessState rc@RemoteCtrl {remoteCtrlId} =
-      remoteCtrlInfo rc $ if rcId == Just remoteCtrlId then sessState else Nothing
-    sessionRcId = \case
-      RCSessionConnecting {remoteCtrlId_} -> remoteCtrlId_
-      RCSessionPendingConfirmation {remoteCtrlId_} -> remoteCtrlId_
-      RCSessionConnected {remoteCtrlId} -> Just remoteCtrlId
-      _ -> Nothing
+  sessions <- M.elems <$> chatReadVar remoteCtrlSessions
+  let states = M.fromList [(rcId, rcsSessionState session) | session <- sessions, Just rcId <- [remoteCtrlSessionId session]]
+  map (\rc@RemoteCtrl {remoteCtrlId} -> remoteCtrlInfo rc $ M.lookup remoteCtrlId states) <$> withStore' getRemoteCtrls
 
 remoteCtrlInfo :: RemoteCtrl -> Maybe RemoteCtrlSessionState -> RemoteCtrlInfo
 remoteCtrlInfo RemoteCtrl {remoteCtrlId, ctrlDeviceName, recoveryEndpoint} sessionState =
@@ -930,10 +973,15 @@ remoteCtrlInfo RemoteCtrl {remoteCtrlId, ctrlDeviceName, recoveryEndpoint} sessi
 verifyRemoteCtrlSession :: (ByteString -> Int -> CM' (Either ChatError ChatResponse)) -> Text -> CM ChatResponse
 verifyRemoteCtrlSession execCC sessCode' = do
   (sseq, client, ctrlName, sessionCode, vars, recoveryEndpoint) <-
-    chatReadVar remoteCtrlSession >>= \case
-      Nothing -> throwError $ ChatErrorRemoteCtrl RCEInactive
-      Just (sseq, RCSessionPendingConfirmation {rcsClient, ctrlDeviceName = ctrlName, sessionCode, rcsWaitConfirmation, recoveryEndpoint}) -> pure (sseq, rcsClient, ctrlName, sessionCode, rcsWaitConfirmation, recoveryEndpoint)
-      _ -> throwError $ ChatErrorRemoteCtrl RCEBadState
+    do
+      sessions <- M.toList <$> chatReadVar remoteCtrlSessions
+      let pending = [(seqNo, session) | (seqNo, session@RCSessionPendingConfirmation {}) <- sessions]
+          matching = filter (\(_, RCSessionPendingConfirmation {sessionCode}) -> sameVerificationCode sessCode' sessionCode) pending
+          selected = case matching of [one] -> Just one; _ -> case pending of [one] -> Just one; _ -> Nothing
+      case selected of
+        Just (seqNo, RCSessionPendingConfirmation {rcsClient, ctrlDeviceName, sessionCode, rcsWaitConfirmation, recoveryEndpoint}) ->
+          pure (seqNo, rcsClient, ctrlDeviceName, sessionCode, rcsWaitConfirmation, recoveryEndpoint)
+        _ -> throwError $ ChatErrorRemoteCtrl RCEBadState
   handleCtrlError sseq RCSRSetupFailed "verifyRemoteCtrlSession" $ do
     let verified = sameVerificationCode sessCode' sessionCode
     timeoutThrow (ChatErrorRemoteCtrl RCETimeout) networkIOTimeout . liftIO $ confirmCtrlSession client verified -- signal verification result before crashing
@@ -975,9 +1023,9 @@ verifyRemoteCtrlSession execCC sessCode' = do
       -- Close network IO before waiting for the server on overflow/revocation.
       case res of
         Right EBOverflow -> do
-          var <- asks remoteCtrlSession
-          readTVarIO var >>= \case
-            Just (seq', RCSessionConnected {tls}) | seq' == sseq -> liftIO $ closeRemoteHostTransport tls
+          var <- asks remoteCtrlSessions
+          (M.lookup sseq <$> readTVarIO var) >>= \case
+            Just RCSessionConnected {tls} -> liftIO $ closeRemoteHostTransport tls
             _ -> pure ()
           cancel server
         Right EBDetached -> pure () -- explicit stop owns graceful delivery and cleanup
@@ -985,10 +1033,10 @@ verifyRemoteCtrlSession execCC sessCode' = do
       logInfo $ "HTTP2 server stopped: " <> tshow res
       intentional <- atomically $ not <$> isEmptyTMVar desktopStop
       when intentional $ do
-        sessionVar <- asks remoteCtrlSession
+        sessionVar <- asks remoteCtrlSessions
         withStore' $ \db ->
-          readTVarIO sessionVar >>= \case
-            Just (currentSeq, RCSessionConnected {remoteCtrlId}) | currentSeq == sseq -> setRemoteCtrlRecovery db remoteCtrlId Nothing
+          (M.lookup sseq <$> readTVarIO sessionVar) >>= \case
+            Just RCSessionConnected {remoteCtrlId} -> setRemoteCtrlRecovery db remoteCtrlId Nothing
             _ -> pure ()
       cancelActiveRemoteCtrl $ Just (sseq, if intentional then RCSRStopped else RCSRDisconnected)
 
@@ -998,12 +1046,12 @@ verifyRemoteCtrlSession execCC sessCode' = do
 -- late verification after stop/unlink cannot insert or re-enable a pairing.
 commitRemoteCtrlPairing :: SessionSeq -> Text -> RCCtrlPairing -> Maybe RCEndpoint -> CM RemoteCtrl
 commitRemoteCtrlPairing sseq ctrlName rcCtrlPairing endpoint = do
-  sessionVar <- asks remoteCtrlSession
+  sessionVar <- asks remoteCtrlSessions
   committed <- withStore $ \db -> do
     owns <-
       liftIO $
-        readTVarIO sessionVar >>= \case
-          Just (currentSeq, RCSessionPendingConfirmation {}) -> pure $ currentSeq == sseq
+        (M.lookup sseq <$> readTVarIO sessionVar) >>= \case
+          Just RCSessionPendingConfirmation {} -> pure True
           _ -> pure False
     if not owns
       then pure Nothing
@@ -1015,33 +1063,66 @@ commitRemoteCtrlPairing sseq ctrlName rcCtrlPairing endpoint = do
             let dhPrivKey' = dhPrivKey rcCtrlPairing
             liftIO $ updateRemoteCtrl db rc ctrlName dhPrivKey'
             pure rc {ctrlDeviceName = ctrlName, ctrlPairing = ctrlPairing {dhPrivKey = dhPrivKey'}}
-        liftIO $ disableRemoteCtrlRecovery db >> setRemoteCtrlRecovery db remoteCtrlId endpoint
+        liftIO . atomically
+          $ modifyTVar' sessionVar
+          $ M.adjust
+            ( \session -> case session of
+                pending@RCSessionPendingConfirmation {} -> pending {remoteCtrlId_ = Just remoteCtrlId}
+                other -> other
+            )
+            sseq
+        liftIO $ setRemoteCtrlRecovery db remoteCtrlId endpoint
         pure $ Just (rc :: RemoteCtrl) {recoveryEndpoint = endpoint}
   maybe (throwError $ ChatErrorRemoteCtrl RCEInactive) pure committed
 
 stopRemoteCtrl :: CM ()
-stopRemoteCtrl = do
-  -- Revoke even if the Android retry owner is between connection attempts.
-  withStore' disableRemoteCtrlRecovery
-  var <- asks remoteCtrlSession
-  -- Claim the closing session before signalling the desktop. The monitor must
-  -- neither report this explicit stop as loss nor cancel a replacement session.
-  closing <-
-    atomically $
-      readTVar var >>= \case
-        Just (sseq, session@RCSessionConnected {ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}}) ->
-          do
-            let event = Right CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq}
-            void $ tryPutTMVar (remoteStopEvent session) event
-            fmap (sseq,) <$> takeRemoteCtrlSession var (Just sseq)
-        _ -> pure Nothing
-  case closing of
-    Just (_, session@RCSessionConnected {http2Server}) -> do
-      -- The desktop consumes this event and closes its retained listener first.
-      void $ timeout 2000000 $ waitCatch http2Server
-      liftIO $ cancelRemoteCtrl False session
-    _ -> cancelActiveRemoteCtrl Nothing
-  withStore' disableRemoteCtrlRecovery
+stopRemoteCtrl = stopRemoteCtrlFor Nothing
+
+stopRemoteCtrlFor :: Maybe RemoteCtrlId -> CM ()
+stopRemoteCtrlFor rcId =
+  stopRemoteCtrlMatching
+    (isJust rcId)
+    (\_ session -> maybe True (\rid -> remoteCtrlSessionId session == Just rid) rcId)
+    (\db -> maybe (disableRemoteCtrlRecovery db) (\rid -> setRemoteCtrlRecovery db rid Nothing) rcId)
+
+stopRemoteCtrlSession :: SessionSeq -> CM ()
+stopRemoteCtrlSession sseq = stopRemoteCtrlMatching True (\seqNo _ -> seqNo == sseq) (const $ pure ())
+
+stopPendingRemoteCtrl :: CM ()
+stopPendingRemoteCtrl = stopRemoteCtrlMatching True (\_ session -> isNothing $ remoteCtrlSessionId session) (const $ pure ())
+
+stopRemoteCtrlMatching :: Bool -> (SessionSeq -> RemoteCtrlSession -> Bool) -> (DB.Connection -> IO ()) -> CM ()
+stopRemoteCtrlMatching emitEvent matches revoke = do
+  withStore' revoke
+  var <- asks remoteCtrlSessions
+  closing <- atomically $ do
+    sessions <- readTVar var
+    let selected = M.filterWithKey matches sessions
+    forM_ (M.toList selected) $ \(sseq, session) -> case session of
+      RCSessionConnected {remoteStopEvent, ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}} ->
+        void $ tryPutTMVar remoteStopEvent $ Right CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq, remoteCtrlId_ = remoteCtrlSessionId session}
+      _ -> pure ()
+    concat <$> mapM (takeRemoteCtrlSessions var . Just) (M.keys selected)
+  forM_ closing $ \(sseq, session) -> do
+    case session of
+      RCSessionConnected {http2Server, ctrlAppInfo = CtrlAppInfo {reconnect = BoolDef True}} -> void $ timeout 2000000 $ waitCatch http2Server
+      _ -> pure ()
+    liftIO $ cancelRemoteCtrl False session
+    when emitEvent $ toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason = RCSRStopped, sessionSeq = sseq, remoteCtrlId_ = remoteCtrlSessionId session}
+  -- A first verification may already hold the store transaction when stop
+  -- unpublishes it. Revoke by its verified fingerprint after that transaction,
+  -- even if it had not yet acquired a database pairing ID at unpublication.
+  withStore' $ \db -> do
+    revoke db
+    forM_ closing $ \(_, session) -> case remoteCtrlSessionId session of
+      Just rcId -> setRemoteCtrlRecovery db rcId Nothing
+      Nothing -> forM_ (sessionFingerprint session) $ \fingerprint ->
+        getRemoteCtrlByFingerprint db fingerprint >>= mapM_ (\RemoteCtrl {remoteCtrlId} -> setRemoteCtrlRecovery db remoteCtrlId Nothing)
+  where
+    sessionFingerprint = \case
+      RCSessionConnecting {remoteCtrlFingerprint} -> Just remoteCtrlFingerprint
+      RCSessionPendingConfirmation {remoteCtrlFingerprint} -> Just remoteCtrlFingerprint
+      _ -> Nothing
 
 -- Authentication/protocol failures terminate persisted automatic authorization.
 -- Network exceptions and timeouts retain it so ordinary outages remain retryable.
@@ -1060,10 +1141,10 @@ terminalRecoveryError = \case
 handleCtrlError :: SessionSeq -> (ChatError -> RemoteCtrlStopReason) -> Text -> CM a -> CM a
 handleCtrlError sseq mkReason name action =
   action `catchAllErrors` \e -> do
-    sessionVar <- asks remoteCtrlSession
+    sessionVar <- asks remoteCtrlSessions
     when (terminalRecoveryError e) $ withStore' $ \db -> do
-      active <- readTVarIO sessionVar
-      when (maybe False ((== sseq) . fst) active) $ disableRemoteCtrlRecovery db
+      active <- M.lookup sseq <$> readTVarIO sessionVar
+      forM_ (active >>= remoteCtrlSessionId) $ \rcId -> setRemoteCtrlRecovery db rcId Nothing
     logError $ name <> " remote ctrl error: " <> tshow e
     cancelActiveRemoteCtrl $ Just (sseq, mkReason e)
     throwError e
@@ -1077,31 +1158,29 @@ abortRemoteCtrl sseq = cancelActiveRemoteCtrl_ False False $ Just (sseq, RCSRSto
 
 cancelActiveRemoteCtrl_ :: Bool -> Bool -> Maybe (SessionSeq, RemoteCtrlStopReason) -> CM ()
 cancelActiveRemoteCtrl_ emitEvent handlingError handlerInfo_ = handleAny (logError . tshow) $ do
-  var <- asks remoteCtrlSession
-  session_ <- atomically $ takeRemoteCtrlSession var (fst <$> handlerInfo_)
-  forM_ session_ $ \session -> do
+  var <- asks remoteCtrlSessions
+  sessions <- atomically $ takeRemoteCtrlSessions var (fst <$> handlerInfo_)
+  forM_ sessions $ \(sseq, session) -> do
     liftIO $ cancelRemoteCtrl handlingError session
     when emitEvent $ forM_ (snd <$> handlerInfo_) $ \rcStopReason ->
-      toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason, sessionSeq = maybe 0 fst handlerInfo_}
+      toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState session, rcStopReason, sessionSeq = sseq, remoteCtrlId_ = remoteCtrlSessionId session}
 
 -- Revoke request admission in the same transaction as unpublishing the
 -- session, before asynchronous transport cleanup can yield. The owner-core
 -- stop path must use this too. A stale monitor must not revoke a new session.
-takeRemoteCtrlSession :: TVar (Maybe (SessionSeq, RemoteCtrlSession)) -> Maybe SessionSeq -> STM (Maybe RemoteCtrlSession)
-takeRemoteCtrlSession var expectedSeq =
-  readTVar var >>= \case
-    Nothing -> pure Nothing
-    Just (oldSeq, _) | maybe False (oldSeq /=) expectedSeq -> pure Nothing
-    Just (_, s) -> do
-      case s of
-        RCSessionConnected {remoteOutputQ} -> closeEventBuffer remoteOutputQ EBDetached
-        _ -> pure ()
-      writeTVar var Nothing
-      pure $ Just s
+takeRemoteCtrlSessions :: TVar (M.Map SessionSeq RemoteCtrlSession) -> Maybe SessionSeq -> STM [(SessionSeq, RemoteCtrlSession)]
+takeRemoteCtrlSessions var expectedSeq = do
+  sessions <- readTVar var
+  let (closing, remaining) = M.partitionWithKey (\sseq _ -> maybe True (== sseq) expectedSeq) sessions
+  forM_ (M.elems closing) $ \case
+    RCSessionConnected {remoteOutputQ} -> closeEventBuffer remoteOutputQ EBDetached
+    _ -> pure ()
+  writeTVar var remaining
+  pure $ M.toList closing
 
 cancelRemoteCtrl :: Bool -> RemoteCtrlSession -> IO ()
 cancelRemoteCtrl handlingError = \case
-  RCSessionStarting -> pure ()
+  RCSessionStarting {} -> pure ()
   RCSessionSearching {action} ->
     unless handlingError $ uninterruptibleCancel action
   RCSessionConnecting {rcsClient, rcsWaitSession} -> do
@@ -1121,52 +1200,33 @@ cancelRemoteCtrl handlingError = \case
 deleteRemoteCtrl :: RemoteCtrlId -> CM ()
 deleteRemoteCtrl rcId = do
   enabled <- chatReadVar simultaneousUI
-  if enabled
-    then do
-      current <- chatReadVar remoteCtrlSession
-      let session = snd <$> current
-          matches = case session of
-            Just RCSessionConnected {remoteCtrlId} -> remoteCtrlId == rcId
-            Just RCSessionPendingConfirmation {remoteCtrlId_} -> remoteCtrlId_ == Just rcId
-            Just RCSessionConnecting {remoteCtrlId_} -> remoteCtrlId_ == Just rcId
-            _ -> False
-      when matches $ do
-        stopRemoteCtrl
-        forM_ session $ \s -> toView CEvtRemoteCtrlStopped {rcsState = rcsSessionState s, rcStopReason = RCSRStopped, sessionSeq = maybe 0 fst current}
-    else checkNoRemoteCtrlSession
-  -- TODO check it exists
+  if enabled then stopRemoteCtrlFor (Just rcId) else checkNoRemoteCtrlSession
   withStore' (`deleteRemoteCtrlRecord` rcId)
 
 checkNoRemoteCtrlSession :: CM ()
-checkNoRemoteCtrlSession =
-  chatReadVar remoteCtrlSession >>= maybe (pure ()) (\_ -> throwError $ ChatErrorRemoteCtrl RCEBusy)
+checkNoRemoteCtrlSession = do
+  sessions <- chatReadVar remoteCtrlSessions
+  unless (M.null sessions) $ throwError $ ChatErrorRemoteCtrl RCEBusy
 
 -- | Transition controller to a new state, unless session update key is stale
 updateRemoteCtrlSession :: SessionSeq -> (RemoteCtrlSession -> Either ChatError RemoteCtrlSession) -> CM ()
 updateRemoteCtrlSession sseq state = do
-  session <- asks remoteCtrlSession
-  r <- atomically $ do
-    readTVar session >>= \case
+  sessions <- asks remoteCtrlSessions
+  liftIOEither . atomically $ do
+    current <- readTVar sessions
+    case M.lookup sseq current of
       Nothing -> pure . Left $ ChatErrorRemoteCtrl RCEInactive
-      Just (oldSeq, st)
-        | oldSeq /= sseq -> pure . Left $ ChatErrorRemoteCtrl RCEBadState
-        | otherwise -> case state st of
-            Left ce -> pure $ Left ce
-            Right st' -> Right () <$ writeTVar session (Just (sseq, st'))
-  liftEither r
+      Just session -> case state session of
+        Left ce -> pure $ Left ce
+        Right session' -> Right () <$ writeTVar sessions (M.insert sseq session' current)
 
 getRemoteCtrlAppInfo :: SessionSeq -> CM (Maybe CtrlAppInfo)
-getRemoteCtrlAppInfo sseq = chatReadVar remoteCtrlSession $>>= pure . appInfo
-  where
-    appInfo (currSseq, sess)
-      | sseq == currSseq = case sess of
-          RCSessionStarting -> Nothing
-          RCSessionSearching {} -> Nothing
-          RCSessionConnecting {ctrlAppInfo} -> Just ctrlAppInfo
-          RCSessionPendingConfirmation {ctrlAppInfo} -> Just ctrlAppInfo
-          RCSessionConnected {ctrlAppInfo} -> Just ctrlAppInfo
-      | otherwise = Nothing
-
-utf8String :: [Char] -> ByteString
-utf8String = encodeUtf8 . T.pack
-{-# INLINE utf8String #-}
+getRemoteCtrlAppInfo sseq = do
+  current <- M.lookup sseq <$> chatReadVar remoteCtrlSessions
+  pure $
+    current >>= \case
+      RCSessionStarting {} -> Nothing
+      RCSessionSearching {} -> Nothing
+      RCSessionConnecting {ctrlAppInfo} -> Just ctrlAppInfo
+      RCSessionPendingConfirmation {ctrlAppInfo} -> Just ctrlAppInfo
+      RCSessionConnected {ctrlAppInfo} -> Just ctrlAppInfo

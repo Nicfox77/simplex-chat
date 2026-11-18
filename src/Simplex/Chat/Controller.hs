@@ -322,6 +322,7 @@ data ChatController = ChatController
     simultaneousUI :: TVar Bool,
     uiRevision :: TVar Int64,
     remoteCommandLeases :: TVar Int,
+    remoteFileNameGate :: CommandGate,
     profileCreationGate :: CommandGate, -- protect name check + agent/store allocation
     subscriptionMode :: TVar SubscriptionMode,
     processServiceRequests :: TVar Bool,
@@ -335,7 +336,7 @@ data ChatController = ChatController
     remoteSessionSeq :: TVar Int,
     remoteHostSessions :: TMap RHKey (SessionSeq, RemoteHostSession), -- All the active remote hosts
     remoteHostsFolder :: TVar (Maybe FilePath), -- folder for remote hosts data
-    remoteCtrlSession :: TVar (Maybe (SessionSeq, RemoteCtrlSession)), -- Supervisor process for hosted controllers
+    remoteCtrlSessions :: TVar (Map SessionSeq RemoteCtrlSession), -- Supervisor process for hosted controllers
     config :: ChatConfig,
     filesFolder :: TVar (Maybe FilePath), -- path to files folder for mobile apps,
     deliveryTaskWorkers :: TMap DeliveryWorkerKey Worker,
@@ -716,6 +717,9 @@ data ChatCommand
   | VerifyRemoteCtrlSession {sessionCode :: Text} -- Verify remote controller session
   | ListRemoteCtrls
   | StopRemoteCtrl -- Stop listening for announcements or terminate an active session
+  | StopRemoteCtrlId RemoteCtrlId
+  | StopRemoteCtrlSession SessionSeq
+  | StopPendingRemoteCtrl
   | DeleteRemoteCtrl RemoteCtrlId -- Remove all local data associated with a remote controller session
   | APIUploadStandaloneFile UserId CryptoFile
   | APIDownloadStandaloneFile UserId FileDescriptionURI CryptoFile
@@ -807,6 +811,9 @@ allowRemoteCommand = \case
   VerifyRemoteCtrlSession {} -> False
   ListRemoteCtrls -> False
   StopRemoteCtrl -> False
+  StopRemoteCtrlId _ -> False
+  StopPendingRemoteCtrl -> False
+  StopRemoteCtrlSession _ -> False
   DeleteRemoteCtrl _ -> False
   ExecChatStoreSQL _ -> False
   ExecAgentStoreSQL _ -> False
@@ -1113,7 +1120,7 @@ data ChatEvent
   | CEvtRemoteHostStopped {remoteHostId_ :: Maybe RemoteHostId, rhsState :: RemoteHostSessionState, rhStopReason :: RemoteHostStopReason}
   | CEvtRemoteCtrlFound {remoteCtrl :: RemoteCtrlInfo, ctrlAppInfo_ :: Maybe CtrlAppInfo, appVersion :: AppVersion, compatible :: Bool}
   | CEvtRemoteCtrlSessionCode {remoteCtrl_ :: Maybe RemoteCtrlInfo, sessionCode :: Text, sessionSeq :: SessionSeq}
-  | CEvtRemoteCtrlStopped {rcsState :: RemoteCtrlSessionState, rcStopReason :: RemoteCtrlStopReason, sessionSeq :: SessionSeq}
+  | CEvtRemoteCtrlStopped {rcsState :: RemoteCtrlSessionState, rcStopReason :: RemoteCtrlStopReason, sessionSeq :: SessionSeq, remoteCtrlId_ :: Maybe RemoteCtrlId}
   | CEvtContactPQEnabled {user :: User, contact :: Contact, pqEnabled :: PQEncryption}
   | CEvtContactDisabled {user :: User, contact :: Contact}
   | CEvtConnectionDisabled {connectionEntity :: ConnectionEntity}
@@ -1734,7 +1741,7 @@ instance AnyError ChatError where
 
 -- | Host (mobile) side of transport to process remote commands and forward notifications
 data RemoteCtrlSession
-  = RCSessionStarting
+  = RCSessionStarting {remoteCtrlId_ :: Maybe RemoteCtrlId}
   | RCSessionSearching
       { action :: Async (),
         foundCtrl :: TMVar (RemoteCtrl, RCVerifiedInvitation)
@@ -1742,6 +1749,7 @@ data RemoteCtrlSession
   | RCSessionConnecting
       { remoteCtrlId_ :: Maybe RemoteCtrlId,
         rcsClient :: RCCtrlClient,
+        remoteCtrlFingerprint :: C.KeyHash,
         rcsWaitSession :: Async (),
         recoveryEndpoint :: Maybe RCEndpoint,
         ctrlAppInfo :: CtrlAppInfo
@@ -1749,6 +1757,7 @@ data RemoteCtrlSession
   | RCSessionPendingConfirmation
       { remoteCtrlId_ :: Maybe RemoteCtrlId,
         ctrlDeviceName :: Text,
+        remoteCtrlFingerprint :: C.KeyHash,
         rcsClient :: RCCtrlClient,
         tls :: TLS 'TClient,
         sessionCode :: Text,
@@ -1779,7 +1788,7 @@ data RemoteCtrlSessionState
 
 rcsSessionState :: RemoteCtrlSession -> RemoteCtrlSessionState
 rcsSessionState = \case
-  RCSessionStarting -> RCSStarting
+  RCSessionStarting {} -> RCSStarting
   RCSessionSearching {} -> RCSSearching
   RCSessionConnecting {} -> RCSConnecting
   RCSessionPendingConfirmation {tls} -> RCSPendingConfirmation {sessionCode = tlsSessionCode tls}
@@ -1861,22 +1870,20 @@ eToView' = toView_ . Left
 
 toView_ :: Either ChatError ChatEvent -> CM' ()
 toView_ ev = do
-  cc@ChatController {outputQ = localQ, remoteCtrlSession = session, config = ChatConfig {chatHooks}} <- ask
+  cc@ChatController {outputQ = localQ, remoteCtrlSessions = session, config = ChatConfig {chatHooks}} <- ask
   event <- case eventHook chatHooks of
     Just hook -> liftIO $ hook cc ev
     Nothing -> pure ev
   atomically $ do
     modifyTVar' (uiRevision cc) (+ 1)
-    readTVar session >>= \case
-      Just (_, RCSessionConnected {remoteOutputQ})
-        | either (const True) allowRemoteEvent event -> do
-            writeEventBuffer remoteOutputQ event
-            enabled <- readTVar $ simultaneousUI cc
-            when enabled $ writeUIOutput cc (Nothing, event)
-      -- TODO potentially, it should hold some events while connecting
-      _ -> do
-        enabled <- readTVar $ simultaneousUI cc
-        if enabled then writeUIOutput cc (Nothing, event) else writeTBQueue localQ (Nothing, event)
+    sessions <- readTVar session
+    let remotes = [remoteOutputQ | RCSessionConnected {remoteOutputQ} <- M.elems sessions]
+        shared = either (const True) allowRemoteEvent event
+    when shared $ mapM_ (`writeEventBuffer` event) remotes
+    enabled <- readTVar $ simultaneousUI cc
+    if enabled
+      then writeUIOutput cc (Nothing, event)
+      else when (null remotes || not shared) $ writeTBQueue localQ (Nothing, event)
 
 -- A frontend may issue commands from its receiver. Never wait for that same
 -- receiver to drain a queue: overflow discards deltas and demands a snapshot.
@@ -1888,24 +1895,25 @@ writeUIOutput ChatController {outputQ, uiRevision} out = do
     then do
       void $ flushTBQueue outputQ
       rev <- readTVar uiRevision
-      writeTBQueue outputQ (fst out, Right $ CEvtUiStateChanged 1 rev "overflow")
+      writeTBQueue outputQ (fst out, Right $ CEvtUiStateChanged 2 rev "overflow")
     else writeTBQueue outputQ out
 
 -- Successful replies stay private to the caller. Subscribers receive only an
 -- invalidation, never a command error, password or request-specific payload.
 invalidateUI :: CommandSource -> CM' ()
 invalidateUI src = do
-  cc@ChatController {simultaneousUI, uiRevision, remoteCtrlSession} <- ask
+  cc@ChatController {simultaneousUI, uiRevision, remoteCtrlSessions} <- ask
   atomically $ do
     enabled <- readTVar simultaneousUI
     when enabled $ do
       rev <- stateTVar uiRevision $ \n -> (n + 1, n + 1)
-      let ev = Right $ CEvtUiStateChanged 1 rev $ case src of
+      let ev = Right $ CEvtUiStateChanged 2 rev $ case src of
             CSRemoteCtrl -> "remote"
             _ -> "local"
       writeUIOutput cc (Nothing, ev)
-      readTVar remoteCtrlSession >>= \case
-        Just (_, RCSessionConnected {remoteOutputQ}) -> writeEventBuffer remoteOutputQ ev
+      sessions <- readTVar remoteCtrlSessions
+      forM_ (M.elems sessions) $ \case
+        RCSessionConnected {remoteOutputQ} -> writeEventBuffer remoteOutputQ ev
         _ -> pure ()
 
 withStore' :: (DB.Connection -> IO a) -> CM a

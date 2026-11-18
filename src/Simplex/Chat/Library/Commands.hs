@@ -387,15 +387,15 @@ restoreCalls = do
   atomically $ writeTVar calls callsMap
 
 stopChatController :: ChatController -> IO ()
-stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, currentRemoteHost, remoteHostSessions, remoteCtrlSession, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
+stopChatController ChatController {smpAgent, agentAsync = s, sndFiles, rcvFiles, expireCIFlags, currentRemoteHost, remoteHostSessions, remoteCtrlSessions, cleanupManagerAsync, relayGroupLinkChecksAsync, webPreviewState, expireCIThreads, timedItemThreads, deliveryTaskWorkers, deliveryJobWorkers, relayRequestWorkers, badgeWorkers, storeReceiptWorkers} = do
   (hosts, ctrl) <- atomically $ do
     hosts <- swapTVar remoteHostSessions M.empty
     writeTVar currentRemoteHost Nothing
-    ctrl <- takeRemoteCtrlSession remoteCtrlSession Nothing
+    ctrl <- takeRemoteCtrlSessions remoteCtrlSessions Nothing
     pure (hosts, ctrl)
   -- Unpublish before cancellation: closing HTTP2 invokes the disconnect
   -- callback, which must not recursively cancel the same published session.
-  mapM_ (cancelRemoteCtrl False) ctrl
+  mapM_ (cancelRemoteCtrl False . snd) ctrl
   mapM_ (cancelRemoteHost False . snd) hosts
   disconnectAgentClient smpAgent
   readTVarIO s >>= mapM_ (\(a1, a2) -> uninterruptibleCancel a1 >> mapM_ uninterruptibleCancel a2)
@@ -566,9 +566,9 @@ handleCommandError a = runExceptT a `E.catches` ioErrors
 checkUIProfileChange :: CM ()
 checkUIProfileChange = do
   enabled <- chatReadVar simultaneousUI
-  session <- chatReadVar remoteCtrlSession
+  session <- chatReadVar remoteCtrlSessions
   when enabled $ do
-    when (isJust session) $ throwError $ ChatErrorRemoteCtrl RCEBusy
+    unless (M.null session) $ throwError $ ChatErrorRemoteCtrl RCEBusy
     -- Revocation unpublishes the session before transport cancellation. An
     -- already-admitted command must finish/cancel under its original profile.
     -- New requests cannot acquire a lease on the revoked session.
@@ -582,6 +582,8 @@ parseChatCommand = A.parseOnly chatCommandP . B.dropWhileEnd isSpace
 processChatCommand :: StoreCxt -> NetworkRequestMode -> ChatCommand -> CM ChatResponse
 processChatCommand cxt nm = \case
   APIEnableUI -> do
+    enabled <- chatReadVar simultaneousUI
+    unless enabled checkNoRemoteCtrlSession
     chatWriteVar simultaneousUI True
     ok_
   APIUIState ref count -> withUser' $ \user -> do
@@ -604,7 +606,7 @@ processChatCommand cxt nm = \case
                 CTLocal -> AChat SCTLocal . fst <$> getLocalChat db user cid Nothing page Nothing
                 _ -> throwError $ SEInternalError "unsupported UI snapshot chat"
            in (Just <$> detail) `catchError` const (pure Nothing)
-      pure $ CRUiState 1 rev user users chats openChat tags
+      pure $ CRUiState 2 rev user users chats openChat tags
   ShowActiveUser -> withUser' $ pure . CRActiveUser
   CreateActiveUser NewUser {profile, pastTimestamp, userChatRelay, clientService} -> do
     checkUIProfileChange
@@ -3901,6 +3903,9 @@ processChatCommand cxt nm = \case
     pure CRRemoteCtrlConnecting {remoteCtrl_ = Just rc, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
   VerifyRemoteCtrlSession sessId -> withUser_ $ verifyRemoteCtrlSession (execChatCommand CSRemoteCtrl) sessId
   StopRemoteCtrl -> withUser_ $ stopRemoteCtrl >> ok_
+  StopRemoteCtrlId rcId -> withUser_ $ stopRemoteCtrlFor (Just rcId) >> ok_
+  StopPendingRemoteCtrl -> withUser_ $ stopPendingRemoteCtrl >> ok_
+  StopRemoteCtrlSession sseq -> withUser_ $ stopRemoteCtrlSession sseq >> ok_
   ListRemoteCtrls -> withUser_ $ CRRemoteCtrlList <$> listRemoteCtrls
   DeleteRemoteCtrl rc -> withUser_ $ deleteRemoteCtrl rc >> ok_
   APIUploadStandaloneFile userId file@CryptoFile {filePath} -> withUserId userId $ \user -> do
@@ -6932,6 +6937,7 @@ chatCommandP =
       "/create user " *> (CreateActiveUser <$> newUserP False),
       "/create chat relay user " *> (CreateActiveUser <$> newUserP True),
       "/create bot " *> (CreateActiveUser <$> newBotUserP),
+      "/_ui enable 2" $> APIEnableUI,
       "/_ui enable" $> APIEnableUI,
       "/_ui snapshot" *> (APIUIState <$> optional (A.space *> chatRefP) <* " count=" <*> A.decimal),
       "/users" $> ListUsers,
@@ -7332,6 +7338,9 @@ chatCommandP =
       "/confirm remote ctrl " *> (ConfirmRemoteCtrl <$> A.decimal),
       "/verify remote ctrl " *> (VerifyRemoteCtrlSession <$> textP),
       "/list remote ctrls" $> ListRemoteCtrls,
+      "/_stop remote ctrl session " *> (StopRemoteCtrlSession <$> A.decimal),
+      "/_stop remote ctrl pending" $> StopPendingRemoteCtrl,
+      "/stop remote ctrl " *> (StopRemoteCtrlId <$> A.decimal),
       "/stop remote ctrl" $> StopRemoteCtrl,
       "/delete remote ctrl " *> (DeleteRemoteCtrl <$> A.decimal),
       "/_upload " *> (APIUploadStandaloneFile <$> A.decimal <* A.space <*> cryptoFileP),

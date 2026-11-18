@@ -24,7 +24,7 @@ import Data.Int (Int64)
 import Data.List (find, isPrefixOf, sort)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map.Strict as M
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word32)
@@ -46,7 +46,7 @@ import qualified Simplex.Chat.Store.Remote as RemoteStore
 import Simplex.Chat.Terminal.Output (markChatItemRead, remoteReadCommand)
 import Simplex.Chat.Types (User (..))
 import qualified Simplex.Messaging.Crypto as C
-import Simplex.Messaging.Crypto.File (CryptoFileArgs (..))
+import Simplex.Messaging.Crypto.File (CryptoFile (..), CryptoFileArgs (..))
 import Simplex.Messaging.Encoding (smpEncode)
 import Simplex.Messaging.Encoding.String (strDecode, strEncode)
 import qualified Simplex.Messaging.TMap as TM
@@ -254,14 +254,18 @@ runRemoteTests = do
     it "refuses invalid client cert" remoteHandshakeRejectTest
     it "connects with stored server bindings" storedBindingsTest
   it "sends messages" remoteMessageTest
+  describe "multiple desktops" $ do
+    it "shares concurrent phone and two-desktop mutations and isolates same-name uploads" multipleDesktopMessagesTest
+    it "recovers one overflowed desktop without interrupting another and revokes only one pairing" multipleDesktopRecoveryTest
+    it "bounds admission and rejects duplicate controller owners without evicting peers" multipleDesktopAdmissionTest
   describe "simultaneous UI" $ do
     it "keeps both receivers live and shares sends, edits, deletes and read state through snapshots" simultaneousMessagesTest
     it "does not block the owner when a local subscriber overflows" simultaneousLocalOverflowTest
-    it "resnapshots a fresh protocol-1 session after overflow while the phone keeps receiving" simultaneousRecoveryTest
+    it "resnapshots a fresh protocol-2 session after overflow while the phone keeps receiving" simultaneousRecoveryTest
     it "drains admitted commands before selecting another profile after unlink" simultaneousProfileLeaseTest
-    it "recovers a retained protocol-1 link after overflow and revokes it on unlink" simultaneousPersistentRecoveryTest
-    it "restores a protocol-1 desktop with fresh keys and a fresh snapshot session" (desktopRestartTestWithUI True)
-    it "restores a protocol-1 phone and revokes authenticated recovery on stop" (phoneRestartTestWithUI True)
+    it "recovers a retained protocol-2 link after overflow and revokes it on unlink" simultaneousPersistentRecoveryTest
+    it "restores a protocol-2 desktop with fresh keys and a fresh snapshot session" (desktopRestartTestWithUI True)
+    it "restores a protocol-2 phone and revokes authenticated recovery on stop" (phoneRestartTestWithUI True)
   describe "single owner concurrency" $ do
     it "runs phone and desktop sends concurrently against one store, including read and unread state" concurrentOwnerMessagesTest
     it "marks remote messages read on the phone without changing desktop-local unread items" remoteReadOwnershipTest
@@ -305,8 +309,8 @@ remoteEventOverflowTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
   startRemote compress mobile desktop
   let cc = chatController mobile
-      session = Controller.remoteCtrlSession cc
-  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readTVarIO session
+      session = Controller.remoteCtrlSessions cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readRemoteCtrlSession session
   -- Publish the burst in one transaction so the live desktop reader cannot
   -- drain it halfway through and hide the overflow. The producer must return.
   Timeout.timeout
@@ -318,12 +322,12 @@ remoteEventOverflowTest = testRemote $ \compress mobile desktop -> do
         $ Controller.CEvtCustomChatEvent Nothing "burst"
     )
     `shouldReturn` Just ()
-  Timeout.timeout 5000000 (atomically $ readTVar session >>= check . isNothing)
+  Timeout.timeout 5000000 (atomically $ readTVar session >>= check . M.null)
     `shouldReturn` Just ()
   mobile <## "remote controller stopped"
   desktop <## "remote host 1 stopped"
 
--- Exercises protocol-1 negotiation and the frontend snapshot contract over
+-- Exercises protocol-2 negotiation and the frontend snapshot contract over
 -- encrypted XRCP, with both terminal event subscribers running throughout.
 simultaneousMessagesTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 simultaneousMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
@@ -384,7 +388,7 @@ simultaneousMessagesTest = testRemote3ManualRead $ \compress mobile desktop bob 
 uiSnapshot :: (String -> IO (Either Controller.ChatError Controller.ChatResponse)) -> IO (Int64, [(Int64, Text)], Int, Bool)
 uiSnapshot command =
   command "/_ui snapshot @2 count=100" >>= \case
-    Right (Controller.CRUiState 1 rev _ _ previews (Just ownerChat) _) -> case find isOwnerChat previews of
+    Right (Controller.CRUiState 2 rev _ _ previews (Just ownerChat) _) -> case find isOwnerChat previews of
       Just (AChat _ Chat {chatStats = ChatStats {unreadCount, unreadChat}}) ->
         pure (rev, [(aChatItemId item, ownerItemText item) | item <- aChatItems ownerChat], unreadCount, unreadChat)
       _ -> fail "snapshot lacks chat preview"
@@ -400,7 +404,7 @@ simultaneousProfileLeaseTest = testRemote $ \compress mobile desktop -> do
   ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
   startRemote compress mobile desktop
   Just User {userId = originalUserId} <- readTVarIO $ Controller.currentUser cc
-  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = events}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   entered <- newEmptyMVar
   release <- newEmptyMVar
   let admitted =
@@ -451,7 +455,7 @@ simultaneousRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob 
   contactBob desktop bob
   mobile <## "bob (Bob): contact is connected"
   let cc = chatController mobile
-  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   atomically
     $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1)
     $ writeEventBuffer oldEvents
@@ -478,7 +482,7 @@ enableSimultaneous :: HasCallStack => TestCC -> TestCC -> IO ()
 enableSimultaneous mobile desktop = forM_ [mobile, desktop] $ \client ->
   ownerCommand client Controller.CSLocal "/_ui enable" >>= expectOwnerOK
 
--- Combine authenticated restart recovery with protocol-1 fanout and revocation.
+-- Combine authenticated restart recovery with protocol-2 fanout and revocation.
 -- The invitation endpoint fetch, handshake, event polls and snapshot all use XRCP.
 simultaneousPersistentRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 simultaneousPersistentRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -> do
@@ -489,7 +493,7 @@ simultaneousPersistentRecoveryTest = testRemote3ManualRead $ \compress mobile de
   let cc = chatController mobile
       local = ownerCommand mobile Controller.CSLocal
       remote = ownerCommand desktop (Controller.CSRemoteHost 1)
-  Just (oldSeq, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (oldSeq, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   atomically
     $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1)
     $ writeEventBuffer oldEvents
@@ -501,7 +505,7 @@ simultaneousPersistentRecoveryTest = testRemote3ManualRead $ \compress mobile de
   bob #> "@alice missed during retained recovery"
   mobile <# "bob> missed during retained recovery"
   resumeStoredRemote compress mobile desktop
-  Just (freshSeq, Controller.RCSessionConnected {Controller.remoteOutputQ = freshEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (freshSeq, Controller.RCSessionConnected {Controller.remoteOutputQ = freshEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   freshSeq `shouldSatisfy` (> oldSeq)
   atomically (eventBufferClosed freshEvents) `shouldReturn` Nothing
   atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBOverflow
@@ -542,18 +546,18 @@ simultaneousLocalOverflowTest = testRemote $ \compress mobile desktop -> do
   ownerCommand desktop Controller.CSLocal "/_ui enable" >>= expectOwnerOK
   startRemote compress mobile desktop
   let owner = chatController mobile
-  Just (seqNo, session@Controller.RCSessionConnected {}) <- readTVarIO $ Controller.remoteCtrlSession owner
+  Just (seqNo, session@Controller.RCSessionConnected {}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions owner
   (localQueue, remoteQueue, sessionVar) <- atomically $ do
     l <- newTBQueue 1
     r <- newEventBuffer 8
-    v <- newTVar $ Just (seqNo, session {Controller.remoteOutputQ = r})
+    v <- newTVar $ M.singleton seqNo session {Controller.remoteOutputQ = r}
     pure (l, r, v)
-  let cc = owner {Controller.outputQ = localQueue, Controller.remoteCtrlSession = sessionVar}
+  let cc = owner {Controller.outputQ = localQueue, Controller.remoteCtrlSessions = sessionVar}
       emit txt = runReaderT (Controller.toView' $ Controller.CEvtCustomChatEvent Nothing txt) cc
   Timeout.timeout 1000000 (emit "first" >> emit "second") `shouldReturn` Just ()
   atomically (readTBQueue localQueue) >>= \r ->
     r `shouldSatisfy` \case
-      (_, Right (Controller.CEvtUiStateChanged 1 _ "overflow")) -> True
+      (_, Right (Controller.CEvtUiStateChanged 2 _ "overflow")) -> True
       _ -> False
   forM_ ["first", "second"] $ \txt ->
     atomically (readEventBuffer remoteQueue) >>= \r ->
@@ -563,16 +567,16 @@ simultaneousLocalOverflowTest = testRemote $ \compress mobile desktop -> do
   runReaderT (Controller.invalidateUI Controller.CSRemoteCtrl) cc
   atomically (readTBQueue localQueue) >>= \r ->
     r `shouldSatisfy` \case
-      (_, Right (Controller.CEvtUiStateChanged 1 _ "remote")) -> True
+      (_, Right (Controller.CEvtUiStateChanged 2 _ "remote")) -> True
       _ -> False
   atomically (readEventBuffer remoteQueue) >>= \r ->
     r `shouldSatisfy` \case
-      Right (Right (Controller.CEvtUiStateChanged 1 _ "remote")) -> True
+      Right (Right (Controller.CEvtUiStateChanged 2 _ "remote")) -> True
       _ -> False
   -- The owner can answer snapshots even if its UI never resumes.
   ownerCommand mobile Controller.CSLocal "/_ui snapshot count=100" >>= \r ->
     r `shouldSatisfy` \case
-      Right (Controller.CRUiState 1 _ _ _ _ Nothing _) -> True
+      Right (Controller.CRUiState 2 _ _ _ _ Nothing _) -> True
       _ -> False
   stopDesktop mobile desktop
 
@@ -673,7 +677,7 @@ remoteEventRecoveryTest = testRemote3ManualRead $ \compress mobile desktop bob -
   startRemote compress mobile desktop
   contactBob desktop bob
   let cc = chatController mobile
-  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   atomically
     $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1)
     $ writeEventBuffer oldEvents
@@ -757,7 +761,7 @@ remoteUnlinkTest = testRemote $ \compress mobile desktop -> do
   startRemote compress mobile desktop
   let cc = chatController mobile
       local = ownerCommand mobile Controller.CSLocal
-  Just (sseq, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (sseq, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   -- A monitor left over from an earlier connection must not revoke this one.
   result <- runReaderT (runExceptT $ cancelActiveRemoteCtrl $ Just (sseq - 1, Controller.RCSRDisconnected)) cc
   result `shouldSatisfy` \case
@@ -788,12 +792,12 @@ remoteOwnerStopTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 remoteOwnerStopTest = testRemote $ \compress mobile desktop -> do
   startRemote compress mobile desktop
   let cc = chatController mobile
-  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readTVarIO $ Controller.remoteCtrlSession cc
+  Just (_, Controller.RCSessionConnected {Controller.remoteOutputQ = oldEvents}) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions cc
   ownerCommand mobile Controller.CSLocal "/_stop" >>= \r ->
     r `shouldSatisfy` \case
       Right Controller.CRChatStopped -> True
       _ -> False
-  isNothing <$> readTVarIO (Controller.remoteCtrlSession cc) `shouldReturn` True
+  M.null <$> readTVarIO (Controller.remoteCtrlSessions cc) `shouldReturn` True
   atomically (eventBufferClosed oldEvents) `shouldReturn` Just EBDetached
   desktop <## "remote host 1 stopped"
 
@@ -861,7 +865,10 @@ remoteHandshakeStoredTest = testRemote $ \compress mobile desktop -> do
 
 -- Use loopback to run the production retained-listener lifecycle on CI without a tailnet.
 startPersistentRemote :: HasCallStack => String -> TestCC -> TestCC -> IO String
-startPersistentRemote compress mobile desktop = do
+startPersistentRemote = startPersistentRemoteWithId 1
+
+startPersistentRemoteWithId :: HasCallStack => Int -> String -> TestCC -> TestCC -> IO String
+startPersistentRemoteWithId rcId compress mobile desktop = do
   desktop ##> "/set device name My desktop"
   desktop <## "ok"
   mobile ##> "/set device name Mobile"
@@ -875,10 +882,10 @@ startPersistentRemote compress mobile desktop = do
   desktop <## "new remote host connecting"
   mobile <## "new remote controller connected"
   -- Neither database grants restart access before the first authenticated HELLO.
-  runRemote mobile (Controller.withStore' RemoteStore.getRemoteCtrls) >>= (\r -> null r `shouldBe` True)
+  runRemote mobile (Controller.withStore' RemoteStore.getRemoteCtrls) >>= (\r -> length r `shouldBe` rcId - 1)
   runRemote desktop (Controller.withStore' RemoteStore.getRemoteHosts) >>= (\r -> null r `shouldBe` True)
   verifyRemoteCtrl mobile desktop
-  mobile <## ("remote controller 1 session started with My desktop" <> compress)
+  mobile <## (("remote controller " <> show rcId <> " session started with My desktop") <> compress)
   desktop <## "new remote host 1 added: Mobile"
   desktop <## ("remote host 1 connected" <> compress)
   pure inv
@@ -999,7 +1006,7 @@ persistentRequestCancellationTest = testRemote $ \compress mobile desktop -> do
 persistentReconnectTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
 persistentReconnectTest = testRemote $ \compress mobile desktop -> do
   inv <- startPersistentRemote compress mobile desktop
-  Just (oldSeq, _) <- readTVarIO $ Controller.remoteCtrlSession $ chatController mobile
+  Just (oldSeq, _) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions $ chatController mobile
   forM_ [1 .. 2 :: Int] $ \_ -> do
     (oldPoll, oldHTTP) <-
       readTVarIO (Controller.remoteHostSessions $ chatController desktop) >>= \sessions -> case M.lookup (RHId 1) sessions of
@@ -1025,7 +1032,7 @@ persistentReconnectTest = testRemote $ \compress mobile desktop -> do
     desktop <## ("remote host 1 connected" <> compress)
     mobile ##> ("/_abort remote ctrl " <> show oldSeq)
     mobile <## "ok"
-    readTVarIO (Controller.remoteCtrlSession $ chatController mobile) >>= (\r -> isJust r `shouldBe` True)
+    readTVarIO (Controller.remoteCtrlSessions $ chatController mobile) >>= (\r -> not (M.null r) `shouldBe` True)
     desktop ##> "/user"
     desktop <## "user profile: alice (Alice)"
     desktop <## "use /p <name> [<bio>] to change it"
@@ -1036,7 +1043,7 @@ delayedRecoveryStopTest :: HasCallStack => Bool -> ((Bool, Bool), TestParams) ->
 delayedRecoveryStopTest unlink = testRemote $ \compress mobile desktop -> do
   inv <- startPersistentRemote compress mobile desktop
   [RemoteCtrl {ctrlPairing = savedPairing, recoveryEndpoint = savedEndpoint}] <- runRemote mobile $ Controller.withStore' RemoteStore.getRemoteCtrls
-  Just (oldSeq, _) <- readTVarIO $ Controller.remoteCtrlSession $ chatController mobile
+  Just (oldSeq, _) <- readRemoteCtrlSession $ Controller.remoteCtrlSessions $ chatController mobile
   signed <- either fail pure $ strDecode $ BC.pack inv
   verified <- maybe (fail "invalid test invitation") pure $ verifySignedInvitation signed
   sessions <- readTVarIO $ Controller.remoteHostSessions $ chatController desktop
@@ -1061,7 +1068,7 @@ delayedRecoveryStopTest unlink = testRemote $ \compress mobile desktop -> do
     result `shouldSatisfy` \case
       Just (Left (Controller.ChatErrorRemoteCtrl Controller.RCEInactive)) -> True
       _ -> False
-  atomically (readTVar $ Controller.remoteCtrlSession $ chatController mobile) >>= (\r -> isJust r `shouldBe` False)
+  atomically (readTVar $ Controller.remoteCtrlSessions $ chatController mobile) >>= (\r -> not (M.null r) `shouldBe` False)
   ctrls <- runRemote mobile Remote.listRemoteCtrls
   map (\Controller.RemoteCtrlInfo {recoveryEnabled} -> recoveryEnabled) ctrls `shouldBe` (if unlink then [] else [False])
   runRemote desktop $ Remote.closeRemoteHost $ RHId 1
@@ -1732,3 +1739,118 @@ parseDecryptChunks :: Int -> RemoteCrypto -> IORef [B.ByteString] -> IO (Either 
 parseDecryptChunks maxSize rc chunks = do
   body <- getHTTP2Body (TestBody chunks) 0
   runExceptT . void $ parseDecryptHTTP2Body maxSize rc (TestBody chunks) body
+
+readRemoteCtrlSession :: TVar (M.Map SessionSeq Controller.RemoteCtrlSession) -> IO (Maybe (SessionSeq, Controller.RemoteCtrlSession))
+readRemoteCtrlSession var = listToMaybe . M.toList <$> readTVarIO var
+
+testMultipleDesktops :: HasCallStack => (String -> TestCC -> TestCC -> TestCC -> TestCC -> IO ()) -> ((Bool, Bool), TestParams) -> IO ()
+testMultipleDesktops test params@((_, compression), ps) =
+  testRemote3ManualRead
+    ( \compress mobile desktop bob ->
+        withNewTestChatCfgOpts ps testCfg {remoteCompression = compression} testOpts {markRead = False} "second-desktop" cathProfile $ \second -> do
+          forM_ [mobile, desktop, second] $ \client -> ownerCommand client Controller.CSLocal "/_ui enable 2" >>= expectOwnerOK
+          void $ startPersistentRemoteWithId 1 compress mobile desktop
+          void $ startPersistentRemoteWithId 2 compress mobile second
+          contactBob desktop bob
+          mobile <## "bob (Bob): contact is connected"
+          second <## "bob (Bob): contact is connected"
+          test compress mobile desktop second bob
+    )
+    params
+
+multipleDesktopMessagesTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+multipleDesktopMessagesTest = testMultipleDesktops $ \_ mobile desktop second bob -> do
+  let local = ownerCommand mobile Controller.CSLocal
+      first = ownerCommand desktop (Controller.CSRemoteHost 1)
+      other = ownerCommand second (Controller.CSRemoteHost 1)
+  replies <- mapConcurrently (\(command, text) -> command ("@bob " <> text)) [(local, "phone"), (first, "first desktop"), (other, "second desktop")]
+  ids <- forM replies $ \case
+    Right (Controller.CRNewChatItems _ [item]) -> pure $ aChatItemId item
+    result -> fail $ "simultaneous send failed: " <> show result
+  replicateM_ 3 $ getTermLine bob
+  forM_ [local, first, other] $ \command -> do
+    (_, items, _, _) <- uiSnapshot command
+    forM_ (zip ids ["phone", "first desktop", "second desktop"]) $ \(itemId, text) -> lookup itemId items `shouldBe` Just text
+  first ("/_update item @2 " <> show (head ids) <> " text edited on desktop") >>= \r ->
+    r `shouldSatisfy` \case Right Controller.CRChatItemUpdated {} -> True; _ -> False
+  other ("/_delete item @2 " <> show (ids !! 1) <> " internal") >>= \r ->
+    r `shouldSatisfy` \case Right Controller.CRChatItemsDeleted {} -> True; _ -> False
+  forM_ [local, first, other] $ \command -> do
+    (_, items, _, _) <- uiSnapshot command
+    lookup (head ids) items `shouldBe` Just "edited on desktop"
+    lookup (ids !! 1) items `shouldBe` Nothing
+  bob #> "@alice visible everywhere"
+  forM_ [mobile, desktop, second] $ \client -> client <# "bob> visible everywhere"
+  forM_ [local, first, other] $ \command -> uiSnapshot command >>= (\(_, _, unread, _) -> unread `shouldBe` 1)
+  other "/_read chat @2" >>= expectOwnerOK
+  forM_ [local, first, other] $ \command -> uiSnapshot command >>= (\(_, _, unread, _) -> unread `shouldBe` 0)
+  let phoneFiles = tmpFile mobile "parallel-uploads"
+      firstFiles = tmpFile desktop "upload-input"
+      otherFiles = tmpFile second "upload-input"
+  forM_ [phoneFiles, firstFiles, otherFiles] $ createDirectoryIfMissing True
+  local ("/_files_folder " <> phoneFiles) >>= expectOwnerOK
+  B.writeFile (firstFiles </> "same.txt") "first desktop attachment"
+  B.writeFile (otherFiles </> "same.txt") "second desktop attachment"
+  (a, b) <-
+    concurrently
+      (ownerCommand desktop Controller.CSLocal $ "/store remote file 1 " <> firstFiles </> "same.txt")
+      (ownerCommand second Controller.CSLocal $ "/store remote file 1 " <> otherFiles </> "same.txt")
+  let path = \case Right (Controller.CRRemoteFileStored _ CryptoFile {filePath}) -> pure filePath; result -> fail $ show result
+  aPath <- path a
+  bPath <- path b
+  aPath `shouldNotBe` bPath
+  B.readFile (phoneFiles </> aPath) `shouldReturn` "first desktop attachment"
+  B.readFile (phoneFiles </> bPath) `shouldReturn` "second desktop attachment"
+
+multipleDesktopRecoveryTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+multipleDesktopRecoveryTest = testMultipleDesktops $ \compress mobile desktop second bob -> do
+  let cc = chatController mobile
+      local = ownerCommand mobile Controller.CSLocal
+      other = ownerCommand second (Controller.CSRemoteHost 1)
+      connectedId (Controller.RCSessionConnected {Controller.remoteCtrlId}) = Just remoteCtrlId
+      connectedId _ = Nothing
+  sessions <- readTVarIO $ Controller.remoteCtrlSessions cc
+  [(oldSeq, Controller.RCSessionConnected {Controller.remoteOutputQ = events})] <- pure $ filter ((== Just 1) . connectedId . snd) $ M.toList sessions
+  runRemote mobile Remote.listRemoteCtrls >>= (\cs -> map (\Controller.RemoteCtrlInfo {Controller.recoveryEnabled} -> recoveryEnabled) cs `shouldBe` [True, True])
+  atomically $ replicateM_ (fromIntegral (tbqSize $ Controller.config cc) + 1) $ writeEventBuffer events $ Right $ Controller.CEvtCustomChatEvent Nothing "overflow one desktop"
+  eventually 3 $ mobile <## "remote controller stopped"
+  desktop <## "remote host 1 stopped"
+  other "@bob surviving desktop" >>= \r -> r `shouldSatisfy` \case Right Controller.CRNewChatItems {} -> True; _ -> False
+  bob <# "alice> surviving desktop"
+  resumeStoredRemote compress mobile desktop
+  local ("/_abort remote ctrl " <> show oldSeq) >>= expectOwnerOK
+  readTVarIO (Controller.remoteCtrlSessions cc) >>= (\cs -> M.size cs `shouldBe` 2)
+  local "/stop remote ctrl 1" >>= expectOwnerOK
+  mobile <## "remote controller stopped"
+  desktop <## "remote host 1 stopped"
+  runRemote mobile Remote.listRemoteCtrls >>= (\cs -> map (\Controller.RemoteCtrlInfo {Controller.recoveryEnabled} -> recoveryEnabled) cs `shouldBe` [False, True])
+  -- The surviving viewer still holds profile identity and can send normally.
+  local "/create user blocked_by_second_desktop" >>= \r -> r `shouldSatisfy` \case Left (Controller.ChatErrorRemoteCtrl Controller.RCEBusy) -> True; _ -> False
+  other "@bob still connected" >>= \r -> r `shouldSatisfy` \case Right Controller.CRNewChatItems {} -> True; _ -> False
+  bob <# "alice> still connected"
+  (_, items, _, _) <- uiSnapshot other
+  map snd items `shouldContain` ["surviving desktop", "still connected"]
+  local "/delete remote ctrl 1" >>= expectOwnerOK
+  readTVarIO (Controller.remoteCtrlSessions cc) >>= (\cs -> M.size cs `shouldBe` 1)
+  -- Revoked recovery cannot fetch an invitation or disturb the other controller.
+  result <- runReaderT (runExceptT $ Remote.resumeRemoteCtrl 1) cc
+  result `shouldSatisfy` \case Left _ -> True; _ -> False
+  mobile <## "remote controller stopped"
+  readTVarIO (Controller.remoteCtrlSessions cc) >>= (\cs -> M.size cs `shouldBe` 1)
+
+multipleDesktopAdmissionTest :: HasCallStack => ((Bool, Bool), TestParams) -> IO ()
+multipleDesktopAdmissionTest = testRemote $ \_ mobile _ -> do
+  ownerCommand mobile Controller.CSLocal "/_ui enable 2" >>= expectOwnerOK
+  let cc = chatController mobile
+      attempt action = runReaderT (runExceptT action) cc
+      busy result = result `shouldSatisfy` \case Left (Controller.ChatErrorRemoteCtrl Controller.RCEBusy) -> True; _ -> False
+  first <- runRemote mobile $ Remote.startRemoteCtrlSessionFor (Just 1)
+  attempt (Remote.startRemoteCtrlSessionFor $ Just 1) >>= busy
+  mapM_ (runRemote mobile . Remote.startRemoteCtrlSessionFor . Just) [2 .. 8]
+  attempt (Remote.startRemoteCtrlSessionFor $ Just 9) >>= busy
+  runRemote mobile $ Remote.abortRemoteCtrl first
+  readTVarIO (Controller.remoteCtrlSessions cc) >>= (\cs -> M.size cs `shouldBe` 7)
+  replacement <- runRemote mobile $ Remote.startRemoteCtrlSessionFor (Just 1)
+  replacement `shouldNotBe` first
+  runRemote mobile $ Remote.abortRemoteCtrl first
+  readTVarIO (Controller.remoteCtrlSessions cc) >>= (\cs -> M.size cs `shouldBe` 8)

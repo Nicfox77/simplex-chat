@@ -461,3 +461,9 @@ See [connection, security, limits, and validation](../../../docs/tailscale-devic
 Enabled trusted links also reconnect after application restart and database
 unlock, using fresh signed invitations. Ephemeral session keys are never persisted.
 LAN and iOS peers do not opt into this capability.
+
+Concurrent desktop sessions use a phone-side registry keyed by native session
+sequence (UI protocol 2), with a maximum of eight admitted sessions. Each
+controller has its own authenticated transport, event buffer and retry owner.
+Pairing commit, disconnect and unlink change only that controller's recovery
+row. Profile selection waits for all sessions and command leases to drain.

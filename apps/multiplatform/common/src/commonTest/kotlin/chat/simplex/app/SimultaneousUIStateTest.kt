@@ -41,7 +41,7 @@ class SimultaneousUIStateTest {
   }
 
   private fun snapshot(chat: Chat = conversation, revision: Long = 1) = CR.UIState(
-    1, revision, user, listOf(UserInfo(user, chat.chatStats.unreadCount)), listOf(chat), chat, emptyList()
+    2, revision, user, listOf(UserInfo(user, chat.chatStats.unreadCount)), listOf(chat), chat, emptyList()
   )
 
   @Test
@@ -71,7 +71,7 @@ class SimultaneousUIStateTest {
   @Test
   fun snapshotClosesDeletedChatAndRejectsAnOldProfile() {
     chatModel.applyUIState(null, snapshot(), conversation.id)
-    val empty = CR.UIState(1, 2, user, listOf(UserInfo(user, 0)), emptyList(), null, emptyList())
+    val empty = CR.UIState(2, 2, user, listOf(UserInfo(user, 0)), emptyList(), null, emptyList())
     chatModel.applyUIState(null, empty, conversation.id)
     assertNull(chatModel.chatId.value)
     chatModel.currentUser.value = user.copy(userId = 99)
@@ -138,7 +138,7 @@ class SimultaneousUIStateTest {
 
   @Test
   fun wireFormatDecodesInvalidationAndSnapshotWithoutLocalRoutingFields() {
-    val event = json.decodeFromString<API>("""{"result":{"type":"uiStateChanged","uiVersion":1,"revision":12,"origin":"remote"}}""")
+    val event = json.decodeFromString<API>("""{"result":{"type":"uiStateChanged","uiVersion":2,"revision":12,"origin":"remote"}}""")
     assertEquals("remote", (event.result as CR.UIStateChanged).origin)
     val encoded = json.encodeToString<API>(API.Result(null, snapshot()))
     val decoded = json.decodeFromString<API>(encoded)

@@ -57,7 +57,7 @@ fun ConnectDesktopView(close: () -> Unit) {
       platform.androidServiceStart(remoteSession = true)
     }
     onDispose {
-      if (!ntfModeService && chatModel.remoteCtrlSession.value == null) platform.androidServiceSafeStop()
+      if (!ntfModeService && !chatModel.hasHostedSession()) platform.androidServiceSafeStop()
     }
   }
 }
@@ -89,7 +89,12 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
           }
         }
 
-        is UIRemoteCtrlSessionState.Connected -> ActiveSession(session, session.sessionState.remoteCtrl, close)
+        is UIRemoteCtrlSessionState.Connected -> {
+          ActiveSession(session, session.sessionState.remoteCtrl, close)
+          SettingsActionItem(painterResource(MR.images.ic_add), stringResource(MR.strings.link_another_desktop), click = {
+            chatModel.remoteCtrlSession.value = null
+          })
+        }
       }
     } else {
       ConnectDesktop(deviceName, remoteCtrls, sessionAddress)
@@ -102,7 +107,7 @@ private fun ConnectDesktopLayout(deviceName: String, close: () -> Unit) {
     val useMulticast = useMulticast(remoteCtrls)
     showConnectScreen.value = !useMulticast
     // Opening the session controls must not tear down an existing connection.
-    if (chatModel.remoteCtrlSession.value == null && useMulticast) {
+    if (!chatModel.hasHostedSession() && useMulticast) {
       findKnownDesktop(showConnectScreen)
     }
   }
@@ -406,9 +411,17 @@ private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>) {
     SectionView(stringResource(MR.strings.desktop_devices)) {
       remoteCtrls.forEach { rc ->
         val showMenu = rememberSaveable { mutableStateOf(false) }
-        SectionItemViewLongClickable(click = {}, longClick = { showMenu.value = true }) {
+        SectionItemViewLongClickable(click = {
+          chatModel.remoteCtrlSessions[rc.remoteCtrlId]?.let { chatModel.remoteCtrlSession.value = it }
+        }, longClick = { showMenu.value = true }) {
           RemoteCtrl(rc)
           DefaultDropdownMenu(showMenu) {
+            if (chatModel.remoteCtrlSessions[rc.remoteCtrlId] != null || rc.sessionState != null) {
+              ItemAction(stringResource(MR.strings.disconnect_remote_host), painterResource(MR.images.ic_close)) {
+                showMenu.value = false
+                withBGApi { controller.stopRemoteCtrl(rc.remoteCtrlId); updateRemoteCtrls(remoteCtrls) }
+              }
+            }
             if (rc.recoveryEnabled) {
               ItemAction(stringResource(MR.strings.remote_link_recovery_address), painterResource(MR.images.ic_edit)) {
                 showMenu.value = false
@@ -489,14 +502,7 @@ private suspend fun updateRemoteCtrls(remoteCtrls: SnapshotStateList<RemoteCtrlI
 
 private fun findKnownDesktop(showConnectScreen: MutableState<Boolean>) {
   withBGApi {
-    if (controller.findKnownRemoteCtrl()) {
-      chatModel.remoteCtrlSession.value = RemoteCtrlSession(
-        ctrlAppInfo = null,
-        appVersion = "",
-        sessionState = UIRemoteCtrlSessionState.Searching
-      )
-      showConnectScreen.value = true
-    }
+    if (controller.findKnownRemoteCtrl()) showConnectScreen.value = true
   }
 }
 
@@ -519,13 +525,7 @@ private suspend fun connectDesktopAddress(sessionAddress: MutableState<String>, 
 private suspend fun connectDesktop(sessionAddress: MutableState<String>, connect: suspend () -> Pair<SomeRemoteCtrl?, ChatError?>): Boolean {
   val res = connect()
   if (res.first != null) {
-    val (rc_, ctrlAppInfo, v) = res.first!!
     sessionAddress.value = ""
-    chatModel.remoteCtrlSession.value = RemoteCtrlSession(
-      ctrlAppInfo = ctrlAppInfo,
-      appVersion = v,
-      sessionState = UIRemoteCtrlSessionState.Connecting(remoteCtrl_ = rc_)
-    )
   } else {
     val e = res.second ?: return false
     when {

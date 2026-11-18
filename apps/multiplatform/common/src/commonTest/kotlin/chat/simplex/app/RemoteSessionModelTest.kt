@@ -2,6 +2,7 @@ package chat.simplex.app
 
 import chat.simplex.common.model.*
 import chat.simplex.common.platform.chatModel
+import kotlinx.serialization.decodeFromString
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -11,11 +12,14 @@ import kotlin.test.assertTrue
 class RemoteSessionModelTest {
   private var previousHost: RemoteHostInfo? = null
   private var previousController: RemoteCtrlSession? = null
+  private var previousControllers: Map<Long, RemoteCtrlSession> = emptyMap()
 
   @BeforeTest
   fun saveSession() {
     previousHost = chatModel.currentRemoteHost.value
     previousController = chatModel.remoteCtrlSession.value
+    previousControllers = chatModel.remoteCtrlSessions.toMap()
+    chatModel.remoteCtrlSessions.clear()
     chatModel.currentRemoteHost.value = null
     chatModel.remoteCtrlSession.value = null
   }
@@ -24,6 +28,8 @@ class RemoteSessionModelTest {
   fun restoreSession() {
     chatModel.currentRemoteHost.value = previousHost
     chatModel.remoteCtrlSession.value = previousController
+    chatModel.remoteCtrlSessions.clear()
+    chatModel.remoteCtrlSessions.putAll(previousControllers)
   }
 
   @Test
@@ -62,5 +68,31 @@ class RemoteSessionModelTest {
       sessionState = null
     )
     assertTrue(chatModel.connectedToRemote())
+  }
+  @Test
+  fun closingOneDesktopKeepsOtherHostedSessionsActive() {
+    val first = RemoteCtrlInfo(1, "Laptop", RemoteCtrlSessionState.Connected("first"))
+    val second = RemoteCtrlInfo(2, "Workstation", RemoteCtrlSessionState.Connected("second"))
+    chatModel.remoteCtrlSessions[1] = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connected(first, "first"))
+    chatModel.remoteCtrlSessions[2] = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connected(second, "second"))
+    assertTrue(chatModel.hasHostedSession())
+    assertTrue(chatModel.hasActiveHostedSession())
+    chatModel.remoteCtrlSessions.remove(1)
+    assertTrue(chatModel.hasHostedSession())
+    assertTrue(chatModel.hasActiveHostedSession())
+    assertFalse(chatModel.connectedToRemote())
+    chatModel.remoteCtrlSessions[2] = RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Connecting(second))
+    assertTrue(chatModel.hasHostedSession())
+    assertFalse(chatModel.hasActiveHostedSession())
+    chatModel.remoteCtrlSessions.clear()
+    assertFalse(chatModel.hasHostedSession())
+  }
+
+  @Test
+  fun stoppedEventsIdentifyOnlyTheirOwnDesktop() {
+    val api = json.decodeFromString<API>("""{"result":{"type":"remoteCtrlStopped","rcsState":{"type":"connected","sessionCode":"code"},"rcStopReason":{"type":"disconnected"},"sessionSeq":7,"remoteCtrlId_":2}}""")
+    val event = api.result as CR.RemoteCtrlStopped
+    kotlin.test.assertEquals(2L, event.remoteCtrlId_)
+    kotlin.test.assertEquals(7, event.sessionSeq)
   }
 }

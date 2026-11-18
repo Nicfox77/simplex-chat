@@ -12,9 +12,9 @@ with the new version. iOS application code and LAN multicast behavior are unchan
 
 ## Scope and testing
 
-The phone owns the chat store and messaging connections. Android and one Linux
-desktop can send and view messages concurrently. Multiple active desktops and
-iOS hosting of the concurrent UI protocol are not implemented. Both applications
+The phone owns the chat store and messaging connections. Android and up to eight Linux
+desktops can send and view messages concurrently. iOS hosting of the concurrent
+UI protocol is not implemented. Both applications
 must use matching native and Kotlin sources.
 
 After pairing, send messages from both devices, then edit, react, delete and
@@ -67,8 +67,9 @@ CA pin is loaded before listening. Only restored, previously authorized listener
 wait indefinitely for their phone; an ordinary unpaired invitation still expires.
 
 Android startup reads the main database after unlock and starts the retry owner
-for its enabled pairing. Only one controller can be enabled by verification. An
-ambiguous database with multiple enabled controllers is not resolved by guessing.
+for its enabled pairing. Each verified desktop has independent recovery authorization and a separate
+retry owner. All enabled pairings are restored; stopping one does not disable
+any other pairing.
 The retry target contains a database pairing ID, not an old invitation.
 
 Each recovery attempt performs:
@@ -103,6 +104,22 @@ after cancellation. Protocol/identity failures terminate automatic authorization
 ordinary network loss retains it. The desktop event poll and phone idle watchdog
 also detect silent TCP blackholes. Old transport workers are closed and joined
 before a replacement is admitted; stale releases cannot close a newer session.
+
+## Several computers
+
+Pair every computer separately, selecting that computer's tailnet address in its
+invitation. Each keeps a separate listener, pairing and session. The phone fans
+out events to independently bounded streams and takes all snapshots from its
+single database. An overflowing or disconnected stream closes only its session.
+Profile switching remains blocked until all sessions and admitted commands have
+drained. Concurrent uploads reserve distinct file names before receiving bytes.
+
+UI protocol 2 identifies lifecycle events by pairing ID and session sequence.
+Early events are buffered until their connection response assigns an owner.
+Known desktops reconnect independently, including when another desktop is
+unreachable. **Disconnect** and unlink apply only to the selected computer;
+explicitly stopping the whole chat engine disables recovery for every pairing.
+Matching phone and desktop native/UI builds are required.
 
 ## Stop, unlink, and process lifecycle
 

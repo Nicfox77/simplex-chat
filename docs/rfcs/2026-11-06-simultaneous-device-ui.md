@@ -1,23 +1,23 @@
 # Simultaneous Android phone and Linux desktop UI
 
-Status: implemented behind negotiated UI protocol 1, enabled by the Kotlin
-apps at core startup. Android hosting and one Linux desktop are supported;
-iOS hosting and multiple simultaneous desktops are outside this change.
+Status: implemented behind negotiated UI protocol 2, enabled by the Kotlin
+apps at core startup. Android hosting and up to eight Linux desktops are supported;
+iOS hosting is outside this change.
 
 The Android phone is the only owner of the database, ratchets, agent and network
 connections. The Linux desktop uses authenticated, encrypted XRCP commands,
 events and file transfer. There is no second synchronized database, shared
 SQLite file, new cryptographic scheme, or server-side synchronization.
 Both devices need the core and Kotlin code from this branch. An old native
-library fails the startup capability check; a peer without UI protocol 1 fails
+library fails the startup capability check; a peer without UI protocol 2 fails
 pairing. Updating just the APK/JAR sources with release native libraries is not
 sufficient.
 
 ## Delivery and reconciliation
 
-The phone's local receiver and the authenticated desktop session have independent
+The phone's local receiver and each authenticated desktop session have independent
 bounded event queues. Eligible asynchronous events are fanned out atomically to
-both; they never compete to read the same queue. Platform-store callbacks,
+all subscribers; they never compete to read the same queue. Platform-store callbacks,
 pairing/lifecycle events and call signalling stay on the phone. Command replies
 and errors return only through the initiating request. Successful send, edit,
 delete, read/unread, reaction, contact/group and file acceptance mutations publish
@@ -25,7 +25,7 @@ delete, read/unread, reaction, contact/group and file acceptance mutations publi
 `local`/`remote` origin. Both frontends reconcile their projections; the reply
 payload is never broadcast as an unsolicited notification.
 
-`/_ui enable` opts a Kotlin frontend into protocol 1 before pairing. Legacy
+`/_ui enable` opts a Kotlin frontend into protocol 2 before pairing. Legacy
 terminal sessions without this capability retain exclusive event routing.
 `/_ui snapshot [chat-ref] count=N` returns the active user, users and unread
 counts, chat previews and read/manual-unread counters, tags and optional loaded
@@ -107,7 +107,7 @@ profile. Existing per-chat/entity/store locking remains in use.
 ## Recovery and validation
 
 Recovery retains authenticated persisted authorization and sequence ownership.
-A replacement session creates a fresh protocol-1 buffer and the viewer takes an
+A replacement session creates a fresh protocol-2 buffer and the viewer takes an
 authoritative snapshot before resuming deltas. Explicit stop/unlink revokes
 admission and authorization, and Android service retention covers both hosted
 sessions and authorized retries. Lost requests are cancelled with the old

@@ -341,7 +341,7 @@ class SimplexService: Service() {
       // A verified desktop is served by this phone's sole core. Keep the
       // foreground service alive after leaving connection settings, including
       // when the normal notification mode does not run a persistent service.
-      if (ChatController.chatModel.remoteCtrlSession.value != null) return
+      if (ChatController.chatModel.hasHostedSession()) return
       if (isServiceStarted) {
         androidAppContext.stopService(Intent(androidAppContext, SimplexService::class.java))
       } else if (isServiceStarting) {

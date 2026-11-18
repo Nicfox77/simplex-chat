@@ -281,6 +281,10 @@ object ChatModel {
   fun remoteHostId(): Long? = currentRemoteHost.value?.remoteHostId
   val remoteHostPairing = mutableStateOf<Pair<RemoteHostInfo?, RemoteHostSessionState>?>(null)
   val remoteCtrlSession = mutableStateOf<RemoteCtrlSession?>(null)
+  val remoteCtrlSessions = mutableStateMapOf<Long, RemoteCtrlSession>()
+  fun hasHostedSession(): Boolean = remoteCtrlSession.value != null || remoteCtrlSessions.isNotEmpty()
+  fun hasActiveHostedSession(): Boolean = remoteCtrlSession.value?.active == true || remoteCtrlSessions.values.any { it.active }
+
 
   val processedCriticalError: ProcessedErrors<AgentErrorType.CRITICAL> = ProcessedErrors(60_000)
   val processedInternalError: ProcessedErrors<AgentErrorType.INTERNAL> = ProcessedErrors(20_000)
@@ -326,7 +330,7 @@ object ChatModel {
   }
 
   internal fun applyUIState(rhId: Long?, state: CR.UIState, requestedChatId: String?, generation: Long = uiStateGeneration): Boolean {
-    require(state.uiVersion == 1)
+    require(state.uiVersion == 2)
     // Reject an in-flight snapshot after navigating to another host/profile.
     if (generation != uiStateGeneration || state.revision < uiStateRevision ||
       rhId != remoteHostId() || currentUser.value?.userId != state.user.userId) return false

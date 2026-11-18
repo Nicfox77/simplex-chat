@@ -98,6 +98,29 @@ not resend automatically. After reconnecting, check the conversation on the
 mobile before sending again, because an interrupted send may already have
 reached it.
 
+## Several desktops at once
+
+On Android, you can use the phone and up to eight desktops at the same time.
+Pair each desktop separately. While viewing an active desktop connection on the
+phone, choose **Link another desktop** to scan or paste the next invitation.
+The existing connections stay active. Each desktop views the same phone profile,
+messages and read state; the phone owns the database and messaging connections.
+
+In **Linked desktops**, select a desktop to view its session. Its long-press menu
+can **Disconnect** or **Delete** that desktop independently. Disconnect disables
+its automatic recovery. Delete also removes its pairing. Other desktops and the
+phone continue working. Disconnect every desktop before switching phone profiles.
+
+For Tailscale, select each computer's Tailscale IPv4 address when creating its
+invitation. The computers can use the same port number because they have
+different addresses. Each must allow the phone to reach its selected TCP port;
+SimpleX does not modify Tailscale access policies or host firewalls. No public
+port forwarding is required. A saved **Recovery address** can use a Tailscale IP
+or MagicDNS name; the verified SimpleX identity pins still authenticate the peer.
+
+Update the phone and all desktops together: this feature requires UI protocol 2
+and matching native libraries. Earlier protocol-1 test builds cannot participate.
+
 ## Local network discovery
 
 When the desktop shows the QR code for a linked mobile and **Discoverable via

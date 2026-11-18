@@ -187,6 +187,7 @@ newChatController
         uiRevision <- newTVarIO 0
         remoteCommandLeases <- newTVarIO 0
         profileCreationGate <- liftIO newCommandGate
+        remoteFileNameGate <- liftIO newCommandGate
         subscriptionMode <- newTVarIO SMSubscribe
         processServiceRequests <- newTVarIO False
         chatLock <- newEmptyTMVarIO
@@ -199,7 +200,7 @@ newChatController
         remoteSessionSeq <- newTVarIO 0
         remoteHostSessions <- TM.emptyIO
         remoteHostsFolder <- newTVarIO Nothing
-        remoteCtrlSession <- newTVarIO Nothing
+        remoteCtrlSessions <- newTVarIO M.empty
         filesFolder <- newTVarIO optFilesFolder
         chatStoreChanged <- newTVarIO False
         deliveryTaskWorkers <- TM.emptyIO
@@ -240,6 +241,7 @@ newChatController
               uiRevision,
               remoteCommandLeases,
               profileCreationGate,
+              remoteFileNameGate,
               subscriptionMode,
               processServiceRequests,
               chatLock,
@@ -252,7 +254,7 @@ newChatController
               remoteSessionSeq,
               remoteHostSessions,
               remoteHostsFolder,
-              remoteCtrlSession,
+              remoteCtrlSessions,
               config,
               filesFolder,
               deliveryTaskWorkers,
