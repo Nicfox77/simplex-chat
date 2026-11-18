@@ -121,6 +121,12 @@ unreachable. **Disconnect** and unlink apply only to the selected computer;
 explicitly stopping the whole chat engine disables recovery for every pairing.
 Matching phone and desktop native/UI builds are required.
 
+For testing two desktop instances on one Linux computer, give each instance a
+separate `XDG_CONFIG_HOME` and `XDG_DATA_HOME` before starting it. Pair both
+instances separately and choose distinct device names. They may use the same
+tailnet IP, but their listening ports must differ. Automatic port selection
+allocates separate ports; if selecting ports manually, use two unused ports.
+
 ## Stop, unlink, and process lifecycle
 
 **Disconnect**, unlink, and explicitly stopping chat revoke saved recovery

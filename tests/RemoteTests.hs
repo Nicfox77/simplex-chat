@@ -1756,6 +1756,11 @@ testMultipleDesktops test params@((_, compression), ps) =
           mobile <## "bob (Bob): contact is connected"
           second <## "bob (Bob): contact is connected"
           test compress mobile desktop second bob
+          sessions <- readTVarIO $ Controller.remoteCtrlSessions $ chatController mobile
+          let connected = [remoteCtrlId | Controller.RCSessionConnected {Controller.remoteCtrlId} <- M.elems sessions]
+          runRemote mobile Remote.stopRemoteCtrl
+          forM_ [(1, desktop), (2, second)] $ \(rcId, client) ->
+            when (rcId `elem` connected) $ client <## "remote host 1 stopped"
     )
     params
 
@@ -1774,6 +1779,7 @@ multipleDesktopMessagesTest = testMultipleDesktops $ \_ mobile desktop second bo
     forM_ (zip ids ["phone", "first desktop", "second desktop"]) $ \(chatItemId, text) -> lookup chatItemId items `shouldBe` Just text
   first ("/_update item @2 " <> show (head ids) <> " text edited on desktop") >>= \r ->
     r `shouldSatisfy` \case Right Controller.CRChatItemUpdated {} -> True; _ -> False
+  bob <# "alice> [edited] edited on desktop"
   other ("/_delete item @2 " <> show (ids !! 1) <> " internal") >>= \r ->
     r `shouldSatisfy` \case Right Controller.CRChatItemsDeleted {} -> True; _ -> False
   forM_ [local, first, other] $ \command -> do
