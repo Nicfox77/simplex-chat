@@ -53,10 +53,10 @@ fun ConnectDesktopView(close: () -> Unit) {
   LaunchedEffect(sessions) { updateRemoteCtrls(remoteCtrls) }
 }
 
-private fun openDesktopSession(session: RemoteCtrlSession? = null) {
+private fun openDesktopSession(session: RemoteCtrlSession? = null, linking: Boolean = session == null) {
   chatModel.remoteCtrlSession.value = session
   ModalManager.start.showCustomModal { close ->
-    DesktopSessionView(close, linking = session == null)
+    DesktopSessionView(close, linking)
   }
 }
 
@@ -68,7 +68,7 @@ private fun DesktopSessionView(close: () -> Unit, linking: Boolean) {
   }
   val sessionState = chatModel.remoteCtrlSession.value?.sessionState
   LaunchedEffect(sessionState) {
-    if (linking && sessionState is UIRemoteCtrlSessionState.Connected || !linking && sessionState == null) close()
+    if ((linking && sessionState is UIRemoteCtrlSessionState.Connected) || (!linking && sessionState == null)) close()
   }
   val ntfModeService = remember { chatModel.controller.appPrefs.notificationsMode.get() == NotificationsMode.SERVICE }
   DisposableEffect(Unit) {
@@ -410,6 +410,7 @@ private fun DesktopAddressView(sessionAddress: MutableState<String>) {
 @Composable
 private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, deviceName: String? = null) {
   val desktops = linkedDesktopRows(remoteCtrls, chatModel.remoteCtrlSessions.toMap())
+  val pendingSession = chatModel.remoteCtrlSession.value?.takeIf { it.recoveryCtrl == null }
   ColumnWithScrollBar {
     AppBarTitle(stringResource(MR.strings.linked_desktops))
     if (deviceName != null) {
@@ -424,6 +425,13 @@ private fun LinkedDesktopsView(remoteCtrls: SnapshotStateList<RemoteCtrlInfo>, d
       SectionDividerSpaced()
     }
     SectionView(stringResource(MR.strings.desktop_devices)) {
+      if (pendingSession != null) {
+        SettingsActionItem(
+          painterResource(MR.images.ic_desktop),
+          stringResource(if (pendingSession.sessionCode == null) MR.strings.connect_to_desktop else MR.strings.verify_connection),
+          click = { openDesktopSession(pendingSession, linking = true) },
+        )
+      }
       if (desktops.isEmpty()) SectionTextFooter(stringResource(MR.strings.no_linked_desktops))
       desktops.forEach { desktop ->
         key(desktop.remoteCtrl.remoteCtrlId) {
