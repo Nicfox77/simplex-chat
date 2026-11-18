@@ -75,7 +75,7 @@ chatEventsDocsData =
       ],
       [ ("CEvtChatItemReaction", "Received message reaction."),
         ("CEvtChatItemsDeleted", "Message was deleted by another user."),
-        ("CEvtChatItemUpdated", "Message was updated by another user."),
+        ("CEvtChatItemUpdated", "Message was updated by another user.\n\n`chatItemUpdate` has `prevChatItem`, the message before the update. When the bot deleted the message locally, the update creates it again, and it is sent in [NewChatItems](#newchatitems) event."),
         ("CEvtGroupChatItemsDeleted", "Group messages are deleted or moderated."),
         ("CEvtChatItemsStatusesUpdated", "Message delivery status updates.")
       ]
@@ -206,6 +206,7 @@ undocumentedEvents =
     "CEvtGroupMemberRatchetSync",
     "CEvtGroupMemberSwitch",
     "CEvtServiceSubStatus",
+    "CEvtNameMoved",
     "CEvtNewRemoteHost",
     "CEvtNoMemberContactCreating",
     "CEvtNtfMessage",
