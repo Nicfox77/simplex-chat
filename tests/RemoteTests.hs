@@ -99,7 +99,8 @@ remoteTests = describe "Remote" $ do
             Controller.CEvtRemoteCtrlStopped
               { Controller.rcsState = Controller.RCSConnected "verified",
                 Controller.rcStopReason = Controller.RCSRStopped,
-                Controller.sessionSeq = 7
+                Controller.sessionSeq = 7,
+                Controller.remoteCtrlId_ = Just 1
               }
         closeEventBuffer events EBDetached
       admitted <- withRemoteSession events $ pure ()
