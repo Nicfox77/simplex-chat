@@ -546,6 +546,7 @@ profileLifecycleCommand = \case
   DeleteUser {} -> True
   ConnectRemoteCtrl {} -> True
   ResumeRemoteCtrl {} -> True
+  APIFindKnownRemoteCtrl -> True
   FindKnownRemoteCtrl -> True
   ConfirmRemoteCtrl {} -> True
   _ -> False
@@ -3897,6 +3898,7 @@ processChatCommand cxt nm = \case
     (remoteCtrl_, ctrlAppInfo, sessionSeq) <- connectRemoteCtrlURI inv
     pure CRRemoteCtrlConnecting {remoteCtrl_, ctrlAppInfo, appVersion = currentAppVersion, sessionSeq}
   APIAbortRemoteCtrl sseq -> abortRemoteCtrl sseq >> ok_
+  APIFindKnownRemoteCtrl -> withUser_ $ CRRemoteCtrlSearching <$> findKnownRemoteCtrl
   FindKnownRemoteCtrl -> withUser_ $ findKnownRemoteCtrl >> ok_
   ConfirmRemoteCtrl rcId -> withUser_ $ do
     (rc, ctrlAppInfo, sessionSeq) <- confirmRemoteCtrl rcId
@@ -7334,6 +7336,7 @@ chatCommandP =
       "/_resume remote ctrl " *> (ResumeRemoteCtrl <$> A.decimal),
       ("/connect remote ctrl " <|> "/crc ") *> (ConnectRemoteCtrl <$> strP),
       "/_abort remote ctrl " *> (APIAbortRemoteCtrl <$> A.decimal),
+      "/_find remote ctrl" $> APIFindKnownRemoteCtrl,
       "/find remote ctrl" $> FindKnownRemoteCtrl,
       "/confirm remote ctrl " *> (ConfirmRemoteCtrl <$> A.decimal),
       "/verify remote ctrl " *> (VerifyRemoteCtrlSession <$> textP),

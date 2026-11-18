@@ -2785,6 +2785,7 @@ object ChatController {
   private val directOwners = mutableMapOf<Long, DirectOwner>()
   @Volatile private var pairingOwner: DirectOwner? = null
   private val retiredSequences = mutableSetOf<Int>()
+  private val pendingCtrlFound = linkedMapOf<Int, CR.RemoteCtrlFound>()
   private val pendingCtrlCodes = linkedMapOf<Int, CR.RemoteCtrlSessionCode>()
   private val pendingCtrlStops = linkedMapOf<Int, CR.RemoteCtrlStopped>()
 
@@ -2800,9 +2801,27 @@ object ChatController {
   private fun bindDirectSequence(owner: DirectOwner, sequence: Int) {
     if (owner.revoked || owner.coreGeneration != directCoreGeneration) return
     owner.sequence = sequence
+    val found = synchronized(directOwners) { pendingCtrlFound.remove(sequence) }
+    found?.let { handleDirectCtrlFound(it) }
     val pending = synchronized(directOwners) { pendingCtrlCodes.remove(sequence) to pendingCtrlStops.remove(sequence) }
     pending.first?.let { handleDirectCtrlCode(it) }
     pending.second?.let { handleDirectCtrlStopped(it) }
+  }
+
+  private fun handleDirectCtrlFound(event: CR.RemoteCtrlFound) {
+    val owner = directOwner(null, event.sessionSeq)
+    if (owner == null) {
+      synchronized(directOwners) {
+        if (event.sessionSeq !in retiredSequences) {
+          pendingCtrlFound[event.sessionSeq] = event
+          while (pendingCtrlFound.size > 32) pendingCtrlFound.remove(pendingCtrlFound.keys.first())
+        }
+      }
+      return
+    }
+    if (owner.session.sessionState is UIRemoteCtrlSessionState.Searching) {
+      publishDirectOwner(owner, RemoteCtrlSession(event.ctrlAppInfo_, event.appVersion, UIRemoteCtrlSessionState.Found(event.remoteCtrl, event.compatible)))
+    }
   }
 
   private fun handleDirectCtrlCode(event: CR.RemoteCtrlSessionCode) {
@@ -2852,7 +2871,7 @@ object ChatController {
     owners.distinct().forEach { forgetDirectOwner(it) }
     chatModel.remoteCtrlSessions.clear()
     chatModel.remoteCtrlSession.value = null
-    synchronized(directOwners) { directOwners.clear(); pendingCtrlCodes.clear(); pendingCtrlStops.clear() }
+    synchronized(directOwners) { directOwners.clear(); pendingCtrlCodes.clear(); pendingCtrlStops.clear(); pendingCtrlFound.clear() }
   }
 
   private fun newDirectOwner(remoteId: Long? = null): DirectOwner = DirectOwner(remoteId, directCoreGeneration).also { owner ->
@@ -2962,9 +2981,19 @@ object ChatController {
     }
   }
 
-  suspend fun findKnownRemoteCtrl(): Boolean = currentPairingOwner().retries.replace {
-    publishDirectOwner(currentPairingOwner(), RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Searching))
-    sendCommandOkResp(null, CC.FindKnownRemoteCtrl())
+  suspend fun findKnownRemoteCtrl(): Boolean {
+    val owner = currentPairingOwner()
+    return owner.retries.replace {
+      owner.nativeCtrl = getChatCtrl()
+      publishDirectOwner(owner, RemoteCtrlSession(null, "", UIRemoteCtrlSessionState.Searching))
+      val r = sendCmd(null, CC.FindKnownRemoteCtrl(), owner.nativeCtrl)
+      if (r is API.Result && r.res is CR.RemoteCtrlSearching) {
+        if (owner.revoked || owner.coreGeneration != directCoreGeneration) {
+          sendCmd(null, CC.AbortRemoteCtrl(r.res.sessionSeq), owner.nativeCtrl)
+          false
+        } else { bindDirectSequence(owner, r.res.sessionSeq); true }
+      } else { forgetDirectOwner(owner); apiErrorAlert("findKnownRemoteCtrl", generalGetString(MR.strings.error_alert_title), r); false }
+    }
   }
 
   suspend fun confirmRemoteCtrl(rcId: Long): Pair<SomeRemoteCtrl?, ChatError?> {
@@ -3911,17 +3940,8 @@ object ChatController {
           switchUIRemoteHost(null)
         }
       }
-      is CR.RemoteCtrlFound -> {
-        val sess = chatModel.remoteCtrlSession.value
-        if (sess != null && sess.sessionState is UIRemoteCtrlSessionState.Searching) {
-          val state = UIRemoteCtrlSessionState.Found(remoteCtrl = r.remoteCtrl, compatible = r.compatible)
-          chatModel.remoteCtrlSession.value = RemoteCtrlSession(
-            ctrlAppInfo = r.ctrlAppInfo_,
-            appVersion = r.appVersion,
-            sessionState = state
-          )
-        }
-      }
+      is CR.RemoteCtrlFound -> handleDirectCtrlFound(r)
+      is CR.RemoteCtrlSearching -> {}
       is CR.RemoteCtrlSessionCode -> handleDirectCtrlCode(r)
       is CR.RemoteCtrlConnected -> {
         // TODO currently it is returned in response to command, so it is redundant
@@ -4803,7 +4823,7 @@ sealed class CC {
     is SetRemoteCtrlAddress -> "/_remote ctrl address $remoteCtrlId $host"
     is ResumeRemoteCtrl -> "/_resume remote ctrl $remoteCtrlId"
     is ConnectRemoteCtrl -> "/connect remote ctrl $xrcpInvitation"
-    is FindKnownRemoteCtrl -> "/find remote ctrl"
+    is FindKnownRemoteCtrl -> "/_find remote ctrl"
     is ConfirmRemoteCtrl -> "/confirm remote ctrl $remoteCtrlId"
     is VerifyRemoteCtrlSession -> "/verify remote ctrl $sessionCode"
     is ListRemoteCtrls -> "/list remote ctrls"
@@ -7416,9 +7436,10 @@ sealed class CR {
   @Serializable @SerialName("remoteFileStored") class RemoteFileStored(val remoteHostId: Long, val remoteFileSource: CryptoFile): CR()
   // remote events (mobile)
   @Serializable @SerialName("remoteCtrlList") class RemoteCtrlList(val remoteCtrls: List<RemoteCtrlInfo>): CR()
-  @Serializable @SerialName("remoteCtrlFound") class RemoteCtrlFound(val remoteCtrl: RemoteCtrlInfo, val ctrlAppInfo_: CtrlAppInfo?, val appVersion: String, val compatible: Boolean): CR()
+  @Serializable @SerialName("remoteCtrlFound") class RemoteCtrlFound(val remoteCtrl: RemoteCtrlInfo, val ctrlAppInfo_: CtrlAppInfo?, val appVersion: String, val compatible: Boolean, val sessionSeq: Int = 0): CR()
   @Serializable @SerialName("remoteCtrlConnecting") class RemoteCtrlConnecting(val remoteCtrl_: RemoteCtrlInfo?, val ctrlAppInfo: CtrlAppInfo, val appVersion: String, val sessionSeq: Int = 0): CR()
   @Serializable @SerialName("remoteCtrlSessionCode") class RemoteCtrlSessionCode(val remoteCtrl_: RemoteCtrlInfo?, val sessionCode: String, val sessionSeq: Int = 0): CR()
+  @Serializable @SerialName("remoteCtrlSearching") class RemoteCtrlSearching(val sessionSeq: Int): CR()
   @Serializable @SerialName("remoteCtrlConnected") class RemoteCtrlConnected(val remoteCtrl: RemoteCtrlInfo): CR()
   @Serializable @SerialName("remoteCtrlStopped") class RemoteCtrlStopped(val rcsState: RemoteCtrlSessionState, val rcStopReason: RemoteCtrlStopReason, val sessionSeq: Int = 0, val remoteCtrlId_: Long? = null): CR()
   // pq
@@ -7620,6 +7641,7 @@ sealed class CR {
     is RemoteFileStored -> "remoteFileStored"
     is RemoteCtrlList -> "remoteCtrlList"
     is RemoteCtrlFound -> "remoteCtrlFound"
+    is RemoteCtrlSearching -> "remoteCtrlSearching"
     is RemoteCtrlConnecting -> "remoteCtrlConnecting"
     is RemoteCtrlSessionCode -> "remoteCtrlSessionCode"
     is RemoteCtrlConnected -> "remoteCtrlConnected"
@@ -7827,6 +7849,7 @@ sealed class CR {
         (if (ctrlAppInfo_ == null) "null" else json.encodeToString(ctrlAppInfo_)) +
         "\nappVersion: $appVersion" +
         "\ncompatible: $compatible"
+    is RemoteCtrlSearching -> "sessionSeq: $sessionSeq"
     is RemoteCtrlConnecting ->
       "remote ctrl: " +
           (if (remoteCtrl_ == null) "null" else json.encodeToString(remoteCtrl_)) +

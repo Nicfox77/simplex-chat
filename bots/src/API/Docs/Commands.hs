@@ -486,6 +486,7 @@ undocumentedCommands =
     "ExecChatStoreSQL",
     "ExportArchive",
     "FindKnownRemoteCtrl",
+    "APIFindKnownRemoteCtrl",
     "GetAgentQueuesInfo",
     "GetAgentServersSummary",
     "GetAgentSubs",

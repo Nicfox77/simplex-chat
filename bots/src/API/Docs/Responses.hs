@@ -197,6 +197,7 @@ undocumentedResponses =
     "CRRcvStandaloneFileCreated",
     "CRReactionMembers",
     "CRRemoteCtrlList",
+    "CRRemoteCtrlSearching",
     "CRRemoteFileStored",
     "CRRemoteHostList",
     "CRRemoteHostStarted",

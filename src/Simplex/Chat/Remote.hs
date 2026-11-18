@@ -638,7 +638,7 @@ validRecoveryHost _ = False
 
 -- ** Multicast
 
-findKnownRemoteCtrl :: CM ()
+findKnownRemoteCtrl :: CM SessionSeq
 findKnownRemoteCtrl = do
   knownCtrls <- withStore' getRemoteCtrls
   pairings <- case nonEmpty knownCtrls of
@@ -658,11 +658,12 @@ findKnownRemoteCtrl = do
         Just rc -> pure rc
     atomically $ putTMVar foundCtrl (rc, inv)
     let compatible = isJust $ compatibleAppVersion hostAppVersionRange . appVersionRange =<< ctrlAppInfo_
-    toView CEvtRemoteCtrlFound {remoteCtrl = remoteCtrlInfo rc (Just RCSSearching), ctrlAppInfo_, appVersion = currentAppVersion, compatible}
+    toView CEvtRemoteCtrlFound {remoteCtrl = remoteCtrlInfo rc (Just RCSSearching), ctrlAppInfo_, appVersion = currentAppVersion, compatible, sessionSeq = sseq}
   updateRemoteCtrlSession sseq $ \case
     RCSessionStarting {} -> Right RCSessionSearching {action, foundCtrl}
     _ -> Left $ ChatErrorRemoteCtrl RCEBadState
   atomically $ putTMVar cmdOk ()
+  pure sseq
 
 confirmRemoteCtrl :: RemoteCtrlId -> CM (RemoteCtrlInfo, CtrlAppInfo, SessionSeq)
 confirmRemoteCtrl rcId = do

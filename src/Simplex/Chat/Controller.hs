@@ -21,7 +21,7 @@ import Control.Concurrent (ThreadId)
 import Control.Concurrent.Async (Async)
 import Control.Exception (Exception)
 import qualified Control.Exception as E
-import Control.Monad (void, when)
+import Control.Monad (forM_, void, when)
 import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
@@ -712,6 +712,7 @@ data ChatCommand
   | ResumeRemoteCtrl RemoteCtrlId
   | ConnectRemoteCtrl {remoteInvitation :: RCSignedInvitation} -- Connect new or existing controller via OOB data
   | APIAbortRemoteCtrl SessionSeq -- Cancel only the matching local connection attempt
+  | APIFindKnownRemoteCtrl
   | FindKnownRemoteCtrl -- Start listening for announcements from all existing controllers
   | ConfirmRemoteCtrl RemoteCtrlId -- Confirm the connection with found controller
   | VerifyRemoteCtrlSession {sessionCode :: Text} -- Verify remote controller session
@@ -807,6 +808,7 @@ allowRemoteCommand = \case
   ConnectRemoteCtrl {} -> False
   APIAbortRemoteCtrl {} -> False
   FindKnownRemoteCtrl -> False
+  APIFindKnownRemoteCtrl -> False
   ConfirmRemoteCtrl _ -> False
   VerifyRemoteCtrlSession {} -> False
   ListRemoteCtrls -> False
@@ -1000,6 +1002,7 @@ data ChatResponse
   | CRRemoteFileStored {remoteHostId :: RemoteHostId, remoteFileSource :: CryptoFile}
   | CRRemoteCtrlList {remoteCtrls :: [RemoteCtrlInfo]}
   | CRRemoteCtrlConnecting {remoteCtrl_ :: Maybe RemoteCtrlInfo, ctrlAppInfo :: CtrlAppInfo, appVersion :: AppVersion, sessionSeq :: SessionSeq}
+  | CRRemoteCtrlSearching {sessionSeq :: SessionSeq}
   | CRRemoteCtrlConnected {remoteCtrl :: RemoteCtrlInfo, compression :: Bool}
   | CRSQLResult {rows :: [Text]}
 #if !defined(dbPostgres)
@@ -1118,7 +1121,7 @@ data ChatEvent
   | CEvtNewRemoteHost {remoteHost :: RemoteHostInfo}
   | CEvtRemoteHostConnected {remoteHost :: RemoteHostInfo, compression :: Bool}
   | CEvtRemoteHostStopped {remoteHostId_ :: Maybe RemoteHostId, rhsState :: RemoteHostSessionState, rhStopReason :: RemoteHostStopReason}
-  | CEvtRemoteCtrlFound {remoteCtrl :: RemoteCtrlInfo, ctrlAppInfo_ :: Maybe CtrlAppInfo, appVersion :: AppVersion, compatible :: Bool}
+  | CEvtRemoteCtrlFound {remoteCtrl :: RemoteCtrlInfo, ctrlAppInfo_ :: Maybe CtrlAppInfo, appVersion :: AppVersion, compatible :: Bool, sessionSeq :: SessionSeq}
   | CEvtRemoteCtrlSessionCode {remoteCtrl_ :: Maybe RemoteCtrlInfo, sessionCode :: Text, sessionSeq :: SessionSeq}
   | CEvtRemoteCtrlStopped {rcsState :: RemoteCtrlSessionState, rcStopReason :: RemoteCtrlStopReason, sessionSeq :: SessionSeq, remoteCtrlId_ :: Maybe RemoteCtrlId}
   | CEvtContactPQEnabled {user :: User, contact :: Contact, pqEnabled :: PQEncryption}
